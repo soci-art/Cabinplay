@@ -1,0 +1,272 @@
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: AGPL-3.0-only
+# Created by riko chen on 2026-10-17
+
+name: Release Android
+
+# A pushed tag android-vMAJOR.MINOR.PATCH[-PRERELEASE] publishes the Android app as a GitHub
+# Release. A manual run from a branch builds the same files and keeps them as workflow artifacts
+# only. The Linux relay is released separately by release-linux.yml.
+on:
+  push:
+    tags: ['android-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-android-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ANDROID_BUILD_TOOLS: 37.0.0
+  # Path components that must never ship: MFi identities, TLS secrets, offline MFi material.
+  IDENTITY_FILES: '(^|/)(offline-mfi[^/]*|tls\.password|[^/]*\.(pk8|p7b|p12|pfx))(/|$)'
+
+# The Android build references OpenXPlay-Stream and OpenXPlay-DiPlay by relative path, so the
+# jobs check the repositories out side by side, at the commits in stream.lock and diplay.lock.
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version-code: ${{ steps.version.outputs.code }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      stream-sha: ${{ steps.pin.outputs.stream }}
+      diplay-sha: ${{ steps.pin.outputs.diplay }}
+    steps:
+      - name: Check signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=()
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}. The release APK is never published unsigned or debug-signed."
+            exit 1
+          fi
+      - name: Derive version
+        id: version
+        run: |
+          # versionCode = MAJOR * 1000000 + MINOR * 1000 + PATCH; a pre-release shares its release's code.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            pattern='^android-v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+            if ! [[ $GITHUB_REF_NAME =~ $pattern ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME must be android-vMAJOR.MINOR.PATCH or android-vMAJOR.MINOR.PATCH-PRERELEASE, each number 0-999."
+              exit 1
+            fi
+            code=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3] ))
+            [ "$code" -gt 0 ] || { echo "::error::android-v0.0.0 has no valid versionCode."; exit 1; }
+            prerelease=false
+            [ -z "${BASH_REMATCH[4]}" ] || prerelease=true
+            { echo "version=${GITHUB_REF_NAME#android-v}"; echo "code=$code"; echo release=true; echo "prerelease=$prerelease"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "version=0.0.0-dev.${GITHUB_SHA::7}"; echo code=1; echo release=false; echo prerelease=false; } >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          path: OpenXPlay-Relay
+      # Every build of a Relay commit uses the same OpenXPlay-Stream and OpenXPlay-DiPlay commits, the ones in
+      # stream.lock and diplay.lock.
+      - name: Read the locked commits
+        id: pin
+        run: |
+          stream=$(OpenXPlay-Relay/scripts/sources.sh read stream)
+          diplay=$(OpenXPlay-Relay/scripts/sources.sh read diplay)
+          { echo "stream=$stream"; echo "diplay=$diplay"; } >> "$GITHUB_OUTPUT"
+      # The release notes link these commits as the sources, so they must stay reachable on main.
+      - name: Check that the locked commits are on main
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: OpenXPlay-Relay/scripts/sources.sh on-main stream diplay
+      - uses: actions/checkout@v4
+        with:
+          repository: OpenXPlay/OpenXPlay-Stream
+          ref: ${{ steps.pin.outputs.stream }}
+          path: OpenXPlay-Stream
+      - name: Check the Stream checkout
+        run: OpenXPlay-Relay/scripts/sources.sh verify stream OpenXPlay-Stream
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            OpenXPlay-Relay/admin-web/package-lock.json
+            OpenXPlay-Stream/kotlin/web-receiver/package-lock.json
+      - name: Build admin page
+        working-directory: OpenXPlay-Relay/admin-web
+        run: npm ci && npm run build
+      # The Android app ships the Kotlin stack's web receiver.
+      - name: Build web receiver
+        working-directory: OpenXPlay-Stream/kotlin/web-receiver
+        env:
+          OXP_APP_VERSION: ${{ steps.version.outputs.version }}
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: |
+            OpenXPlay-Relay/admin-web/dist
+            OpenXPlay-Stream/kotlin/web-receiver/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  android:
+    name: Android APK
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      certificate: ${{ steps.sign.outputs.certificate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: OpenXPlay-Relay
+      - uses: actions/checkout@v4
+        with:
+          repository: OpenXPlay/OpenXPlay-Stream
+          ref: ${{ needs.prepare.outputs.stream-sha }}
+          path: OpenXPlay-Stream
+      - uses: actions/checkout@v4
+        with:
+          repository: OpenXPlay/OpenXPlay-DiPlay
+          ref: ${{ needs.prepare.outputs.diplay-sha }}
+          path: OpenXPlay-DiPlay
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;${{ env.ANDROID_BUILD_TOOLS }} ndk;28.2.13676358
+      - uses: gradle/actions/setup-gradle@v4
+      # The build never sees the signing secrets; it produces an unsigned APK that is signed below.
+      # strictSources stops it unless both sibling checkouts are their locked commits, unchanged.
+      - name: Build release APK
+        working-directory: OpenXPlay-Relay/android
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.version-code }}
+        run: ./gradlew :app:assembleRelease -Prelay.versionName="$VERSION" -Prelay.versionCode="$VERSION_CODE" -Prelay.strictSources=true
+      - name: Sign APK
+        id: sign
+        working-directory: OpenXPlay-Relay/android/app/build/outputs/apk/release
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          : "${ANDROID_KEYSTORE_BASE64:?Missing signing secrets}" "${ANDROID_KEY_ALIAS:?Missing signing secrets}"
+          tools="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
+          keystore="$RUNNER_TEMP/release.keystore"
+          trap 'rm -f "$keystore"' EXIT
+          base64 -d <<<"$ANDROID_KEYSTORE_BASE64" > "$keystore"
+          # AGP already aligns the APK (native libraries to 16 KB pages); signing must keep that.
+          "$tools/zipalign" -c -P 16 4 app-release-unsigned.apk
+          mkdir -p "$RUNNER_TEMP/dist"
+          apk="$RUNNER_TEMP/dist/openxplay-relay-$VERSION.apk"
+          # v4 signing would add an .idsig file that only adb incremental installs use.
+          "$tools/apksigner" sign --ks "$keystore" --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" --key-pass env:ANDROID_KEY_PASSWORD \
+            --v4-signing-enabled false --out "$apk" app-release-unsigned.apk
+          certs=$("$tools/apksigner" verify --verbose --print-certs "$apk")
+          if grep -q 'CN=Android Debug' <<<"$certs"; then
+            echo "::error::The APK is signed with a debug certificate."
+            exit 1
+          fi
+          grep -E 'Verified using|certificate (DN|SHA-256 digest)' <<<"$certs"
+          certificate=$(sed -n -E 's/^.*[Ss]igner.*certificate SHA-256 digest: ([0-9a-f]{64})$/\1/p' <<<"$certs" | head -n 1)
+          [ -n "$certificate" ] || { echo "::error::Cannot read the signing certificate digest."; exit 1; }
+          echo "certificate=$certificate" >> "$GITHUB_OUTPUT"
+      - name: Check APK contents
+        working-directory: ${{ runner.temp }}/dist
+        run: |
+          entries=$(unzip -Z1 openxplay-relay-*.apk)
+          if found=$(grep -E -i "$IDENTITY_FILES" <<<"$entries"); then
+            echo "::error::The APK contains identity files:"
+            echo "$found"
+            exit 1
+          fi
+          for required in assets/admin/index.html assets/web/receiver/index.html; do
+            grep -qxF "$required" <<<"$entries" || { echo "::error::The APK is missing $required."; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, android]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-android
+          path: dist
+      # An unversioned copy keeps .../releases/latest/download/openxplay-relay.apk pointing at the newest app.
+      - name: Write checksums
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: cp "openxplay-relay-$VERSION.apk" openxplay-relay.apk && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          STREAM_SHA: ${{ needs.prepare.outputs.stream-sha }}
+          DIPLAY_SHA: ${{ needs.prepare.outputs.diplay-sha }}
+          CERTIFICATE: ${{ needs.android.outputs.certificate }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+          # An annotated tag's message is the changelog and opens the notes; a lightweight tag has none.
+          changelog=""
+          read -r type sha < <(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          if [ "$type" = tag ]; then
+            # A signed tag's message ends with its signature block, which is not part of the changelog.
+            changelog="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq .message | sed '/^-----BEGIN [A-Z]* SIGNATURE-----$/,$d')"
+          fi
+          # The rest of the notes record the exact sources of every file in the release.
+          server="$GITHUB_SERVER_URL/OpenXPlay"
+          notes="${changelog:+$changelog
+
+          ---
+
+          }Built from [OpenXPlay-Relay@${GITHUB_SHA::12}]($server/OpenXPlay-Relay/commit/$GITHUB_SHA), [OpenXPlay-Stream@${STREAM_SHA::12}]($server/OpenXPlay-Stream/commit/$STREAM_SHA) and [OpenXPlay-DiPlay@${DIPLAY_SHA::12}]($server/OpenXPlay-DiPlay/commit/$DIPLAY_SHA).
+
+          - \`openxplay-relay-$VERSION.apk\`: the Android app. Signing certificate SHA-256: \`$CERTIFICATE\`
+          - \`openxplay-relay.apk\`: the same app under a fixed name, for the latest-download link.
+          - \`SHA256SUMS\`: SHA-256 checksums of these files.
+
+          Setup: https://openxplay.org/quick-start · 设置：https://openxplay.org/zh/quick-start. No build contains an Apple accessory (MFi) identity; supply your own."
+          # Only Android releases become Latest, so the latest-download link always finds the APK.
+          flags=()
+          [ "$PRERELEASE" != true ] || flags+=(--prerelease)
+          gh release create "$TAG" dist/* --verify-tag --title "OpenXPlay Relay for Android $VERSION" --notes "$notes" "${flags[@]}"

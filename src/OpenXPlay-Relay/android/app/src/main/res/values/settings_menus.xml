@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 OpenXPlay.org -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Created by riko chen on 2026-10-21 -->
+<resources>
+    <string name="menu_expanded">Expanded</string>
+    <string name="menu_collapsed">Collapsed</string>
+    <string name="menu_access">Head-unit access</string>
+    <string name="menu_diagnostics">Diagnostics</string>
+    <string name="menu_video">Video</string>
+    <string name="menu_connection_outputs">Connection and outputs</string>
+    <string name="menu_identity">Identity and certificates</string>
+    <string name="menu_on">On</string>
+    <string name="menu_off">Off</string>
+    <string name="menu_audio_summary">Car Bluetooth: %1$s</string>
+    <string name="menu_startup_summary">Automatic: %1$s · Boot: %2$s</string>
+    <string name="menu_access_summary">Admin: %1$s · Trusted HTTPS: %2$s</string>
+    <string name="menu_selected_summary">Selected · %1$s</string>
+    <string name="menu_outputs_summary">%1$s · Web port: %2$s</string>
+    <string name="menu_diagnostics_summary">%1$d runtime values · %2$d URLs</string>
+    <string name="option_wireless_display_hint">The car shows the picture through its DLNA or Miracast receiver; operate CarPlay on this phone.</string>
+    <string name="output_multiple">Several outputs</string>
+    <string name="output_multiple_hint">Set in Developer settings. Choosing an output above replaces them.</string>
+    <string name="dev_outputs_combine">Combine outputs</string>
+    <string name="dev_outputs_combine_hint">Every output that is on runs at once. One must stay on.</string>
+</resources>

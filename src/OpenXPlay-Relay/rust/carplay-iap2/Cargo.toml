@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: DiPlay and xcertplay contributors
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: GPL-3.0-only
+# Derived from DiPlay (https://github.com/shihabal3amri/DiPlay), based on xcertplay (https://github.com/shilapi/xcertplay). Modified by OpenXPlay.org on 2026-10-15.
+
+[package]
+name = "carplay-iap2"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+x509-cert.workspace = true
+cms.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+der.workspace = true
+serde_json.workspace = true
+base64ct.workspace = true
+rsa.workspace = true
+sha1.workspace = true
+plist = { workspace = true, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
+rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

@@ -1,0 +1,171 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-18
+
+import { expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { DisplayDebounce, DisplaySettingsGate, pictureSize, StableScreen } from '../receiver/display';
+import { strings } from '../receiver/ui';
+import { parseMessage, type Hello } from '../protocol/json';
+const vector = (name: string) => JSON.parse(readFileSync(new URL('../spec/vectors/web/' + name + '.json', import.meta.url), 'utf8'));
+const display = (vector('hello-viewport') as Hello).displays[0];
+function screenStore() {
+  const values = new Map<string, string>();
+  return { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); } };
+}
+it('keeps the largest screen through the Samsung fullscreen cutout change and reloads', () => {
+  const saved = screenStore(), screen = new StableScreen(() => saved);
+  expect(screen.measure(2402 / 3, 1080 / 3, 3)).toEqual({ width: 2402, height: 1080, dpr: 3 });
+  expect(screen.measure(2328 / 3, 1080 / 3, 3)).toEqual({ width: 2402, height: 1080, dpr: 3 });
+  expect(new StableScreen(() => saved).measure(2328 / 3, 1080 / 3, 3)).toEqual({ width: 2402, height: 1080, dpr: 3 });
+});
+it('retains independent orientation and DPR maxima across round trips and reloads', () => {
+  const saved = screenStore(), screen = new StableScreen(() => saved);
+  screen.measure(2402, 1080, 1);
+  expect(screen.measure(1080, 2328, 1)).toEqual({ width: 1080, height: 2328, dpr: 1 });
+  expect(screen.measure(1000, 500, 2)).toEqual({ width: 2000, height: 1000, dpr: 2 });
+  const reload = new StableScreen(() => saved);
+  expect(reload.measure(2328, 1080, 1)).toEqual({ width: 2402, height: 1080, dpr: 1 });
+  expect(reload.measure(1000, 2200, 1)).toEqual({ width: 1080, height: 2328, dpr: 1 });
+  expect(reload.measure(900, 480, 2)).toEqual({ width: 2000, height: 1000, dpr: 2 });
+});
+it('keeps in-memory maxima with denied storage and ignores corrupt or mismatched saved sizes', () => {
+  for (const storage of [() => { throw Error('denied'); }, () => ({ getItem() { throw Error('read'); }, setItem() { throw Error('write'); } }),
+    () => ({ getItem: () => null, setItem() { throw Error('quota'); } })]) {
+    const screen = new StableScreen(storage);
+    screen.measure(2402, 1080, 1);
+    expect(screen.measure(2328, 1080, 1)).toEqual({ width: 2402, height: 1080, dpr: 1 });
+  }
+  for (const saved of ['broken', 'null', '{}', '{"width":-1,"height":1080,"dpr":1}', '{"width":2402.5,"height":1080,"dpr":1}',
+    '{"width":2402,"height":1080,"dpr":2}', '{"width":1080,"height":2402,"dpr":1}']) {
+    const screen = new StableScreen(() => ({ getItem: () => saved, setItem() {} }));
+    expect(screen.measure(800, 480, 1)).toEqual({ width: 800, height: 480, dpr: 1 });
+  }
+});
+it('reports only geometry stable for 500 ms, cancels reversion and ignores preference changes', () => {
+  const gate = new DisplayDebounce(); gate.seed(display);
+  const next = { ...display, viewport: { width: 1800, height: 900 } };
+  expect(gate.observe(next, 0)).toBe(false);
+  expect(gate.observe(next, 499)).toBe(false);
+  expect(gate.observe(next, 500)).toBe(true);
+  expect(gate.observe(next, 1000)).toBe(false);
+  expect(gate.observe(display, 1100)).toBe(false);
+  expect(gate.observe(next, 1500)).toBe(false);
+  expect(gate.observe(display, 1501)).toBe(false);
+  expect(gate.observe(display, 2000)).toBe(false);
+  expect(gate.observe(display, 2001)).toBe(true);
+  expect(gate.observe({ ...display, frameRate: 'FPS_30' }, 3000)).toBe(false);
+  expect(gate.observe({ ...display, frameRate: 'FPS_30' }, 4000)).toBe(false);
+});
+it('observes fullscreen, DPR, safe area and screen changes independently of the CSS viewport', () => {
+  for (const next of [{ ...display, fullscreen: true }, { ...display, dpr: 2 },
+    { ...display, width: display.width + 1 }, { ...display, height: display.height + 1 },
+    { ...display, safeArea: { ...display.safeArea, left: 10 } }]) {
+    const gate = new DisplayDebounce(); gate.seed(display);
+    expect(gate.observe(next, 0)).toBe(false); expect(gate.observe(next, 500)).toBe(true);
+  }
+});
+it('requires a welcome feature and clears it on legacy welcome or disconnect', () => {
+  const gate = new DisplaySettingsGate();
+  expect(gate.supported).toBe(false); expect(gate.message('auto', 125)).toBeUndefined();
+  gate.welcome(['unrelated']); expect(gate.message('auto', 125)).toBeUndefined();
+  gate.welcome(['display-settings']);
+  expect(gate.message('720p', 125, 'h265')).toEqual(vector('display-settings-client-codec'));
+  expect(gate.message('native', 200)).toEqual(vector('display-settings-native'));
+  expect(gate.message('720p', 125, 'h265', 'FPS_45')).toEqual(vector('display-settings-client-frame-rate'));
+  gate.welcome(); expect(gate.supported).toBe(false);
+});
+it('accepts the exact vectors and rejects malformed viewport, feature and setting fields', () => {
+  parseMessage(vector('hello-viewport'), 'client-to-relay');
+  parseMessage(vector('welcome-display-settings'), 'relay-to-client');
+  for (const name of ['display-settings-client-codec', 'display-settings-relay', 'display-settings-native'])
+    for (const direction of ['client-to-relay', 'relay-to-client'] as const) expect(parseMessage(vector(name), direction)).toEqual(vector(name));
+  for (const viewport of [{ width: 0, height: 1 }, { width: 1.5, height: 2 }, { width: 1 }, null, { width: 1, height: 2, extra: 0 }])
+    expect(() => parseMessage({ ...vector('hello-viewport'), displays: [{ ...display, viewport }] })).toThrow();
+  for (const fullscreen of [null, 1, 'false'])
+    expect(() => parseMessage({ ...vector('hello-viewport'), displays: [{ ...display, fullscreen }] })).toThrow();
+  for (const features of [null, 'display-settings', [1]])
+    expect(() => parseMessage({ ...vector('welcome-display-settings'), features })).toThrow();
+  for (const patch of [{ resolution: 'AUTO' }, { screenWidth: 150 }, { screenWidth: '200' }, { screenWidth: null }, { extra: 1 }])
+    expect(() => parseMessage({ ...vector('display-settings-client'), ...patch })).toThrow();
+});
+it('provides hidden settings rows, bilingual labels and canvas/window ratios', () => {
+  const html = readFileSync(new URL('../receiver/index.html', import.meta.url), 'utf8');
+  expect(html).toContain('id="display-settings" hidden');
+  const options = [...html.matchAll(/data-choice="resolution" data-value="([^"]+)"/g)].map(match => match[1]);
+  expect(options).toEqual(['auto', 'native', '1080p', '720p', 'screen']);
+  expect(html).toContain('data-text="native"');
+  expect(html).toContain('data-text="nativeHint"');
+  expect(strings.en.native).toBe('Native'); expect(strings['zh-CN'].native).toBe('原画');
+  expect(strings.en.nativeHint).toContain('sharpest'); expect(strings.en.nativeHint).toContain('Wi-Fi bandwidth');
+  expect(strings['zh-CN'].nativeHint).toContain('最清晰'); expect(strings['zh-CN'].nativeHint).toContain('Wi-Fi 带宽');
+  for (const id of ['resolution', 'screen-width', 'picture-size', 'relay-video-codec', 'video-codec-current']) expect(html).toContain('id="' + id + '"');
+  const widths = [...html.matchAll(/data-choice="screen-width" data-value="(125|200|250|300)"/g)].map(match => Number(match[1]));
+  expect(widths).toEqual([125, 200, 250, 300]);
+  expect(html).toContain('data-text="screenWidthHint"');
+  expect(strings.en.screenWidth).toBe('CarPlay screen width');
+  expect(strings['zh-CN'].screenWidth).toBe('CarPlay 屏幕宽度');
+  expect(strings.en.screenWidthHint).toContain('more icons on one page');
+  expect(strings['zh-CN'].screenWidthHint).toContain('一页显示的图标越多');
+  expect(pictureSize(1920, 960)).toBe('1920×960 (2.00:1)');
+  expect(pictureSize(1533, 906)).toBe('1533×906 (1.69:1)');
+  expect(pictureSize(0, 0)).toBe('—');
+});
+
+it('reports fullscreen intent changes through the display debounce even without a resize', () => {
+  const gate = new DisplayDebounce(); gate.seed({ ...display, fullscreenPreferred: true });
+  const next = { ...display, fullscreenPreferred: false };
+  expect(gate.observe(next, 0)).toBe(false); expect(gate.observe(next, 499)).toBe(false);
+  expect(gate.observe(next, 500)).toBe(true); expect(gate.observe(next, 1000)).toBe(false);
+  expect(gate.observe({ ...next, fullscreenPreferred: true }, 1100)).toBe(false);
+  expect(gate.observe({ ...next, fullscreenPreferred: true }, 1600)).toBe(true);
+  const main = readFileSync(new URL('../receiver/main.ts', import.meta.url), 'utf8');
+  expect(main).toContain('fullscreenPreferred: fullscreen.intent');
+});
+it('accepts optional boolean fullscreen preference and rejects other types', () => {
+  for (const fullscreenPreferred of [true, false])
+    parseMessage({ ...vector('hello-viewport'), displays: [{ ...display, fullscreenPreferred }] }, 'client-to-relay');
+  for (const fullscreenPreferred of [null, 0, 'true', {}])
+    expect(() => parseMessage({ ...vector('hello-viewport'), displays: [{ ...display, fullscreenPreferred }] })).toThrow();
+  parseMessage(vector('hello-viewport'), 'client-to-relay');
+});
+
+it('accepts every numeric screen width in both directions and rejects missing or invalid presets', () => {
+  for (const direction of ['client-to-relay', 'relay-to-client'] as const) {
+    for (const screenWidth of [125, 200, 250, 300]) {
+      const message = { ...vector('display-settings-relay'), screenWidth };
+      expect(parseMessage(message, direction)).toEqual(message);
+    }
+    for (const screenWidth of [undefined, 100, 400, 200.5, '125', null, true])
+      expect(() => parseMessage({ ...vector('display-settings-client'), screenWidth }, direction)).toThrow();
+  }
+});
+
+it('requires codec in relay settings, accepts old clients and validates every codec', () => {
+  const legacy = vector('display-settings-client');
+  expect(parseMessage(legacy, 'client-to-relay')).toEqual(legacy);
+  expect(() => parseMessage(legacy, 'relay-to-client')).toThrow();
+  for (const videoCodec of ['auto', 'h265', 'h264'])
+    for (const direction of ['client-to-relay', 'relay-to-client'] as const)
+      expect(parseMessage({ ...legacy, videoCodec }, direction)).toEqual({ ...legacy, videoCodec });
+  for (const videoCodec of [null, 'AUTO', 'H265', 1, true])
+    expect(() => parseMessage({ ...legacy, videoCodec })).toThrow();
+  const html = readFileSync(new URL('../receiver/index.html', import.meta.url), 'utf8');
+  expect(html).not.toContain('id="video-codec"');
+  expect(html.slice(html.indexOf('id="display-settings"'), html.indexOf('id="frame-rate"'))).toContain('id="relay-video-codec"');
+});
+
+it('accepts every optional frame rate in both directions and rejects invalid literals', () => {
+  const legacy = vector('display-settings-relay');
+  for (const direction of ['client-to-relay', 'relay-to-client'] as const) {
+    expect(parseMessage(legacy, direction)).toEqual(legacy);
+    for (const frameRate of ['AUTO', 'FPS_30', 'FPS_35', 'FPS_40', 'FPS_45', 'FPS_50', 'FPS_55', 'FPS_60']) {
+      const message = { ...legacy, frameRate };
+      expect(parseMessage(message, direction)).toEqual(message);
+    }
+    for (const frameRate of [null, 'auto', 'FPS_120', '60', 30, true])
+      expect(() => parseMessage({ ...legacy, frameRate }, direction)).toThrow();
+  }
+  expect(strings.en.applying).toBe('Applying. CarPlay reconnects in a few seconds');
+  expect(strings['zh-CN'].applying).toBe('正在应用，CarPlay 将在几秒后重新连接');
+});

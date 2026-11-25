@@ -1,0 +1,282 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-14
+
+use crate::{
+    model::*,
+    protocol::json_object,
+    require,
+    trace::{now_nanos, ClinkTrace, ClinkTraceEvent},
+    Result,
+};
+use std::{collections::BTreeMap, sync::Arc};
+/// Android track IDs retain stable slots 0 and 1; insertion order is significant.
+pub struct UibcDecoder {
+    origin: Origin,
+    trace: Option<Arc<dyn ClinkTrace>>,
+    session: u64,
+    active: Vec<(u32, u8, (f64, f64))>,
+    last_view_size: Option<(u32, u32)>,
+    on_view_size: Option<Box<dyn Fn(u32, u32) + Send + Sync>>,
+}
+impl UibcDecoder {
+    pub fn new(origin: Origin) -> Self {
+        Self {
+            origin,
+            trace: None,
+            session: 0,
+            active: Vec::new(),
+            last_view_size: None,
+            on_view_size: None,
+        }
+    }
+    pub fn with_trace(mut self, trace: Arc<dyn ClinkTrace>, session: u64) -> Self {
+        self.trace = Some(trace);
+        self.session = session;
+        self
+    }
+    fn input(
+        &self,
+        kind: &str,
+        coordinates: Vec<(f64, f64)>,
+        raw_coordinates: Vec<(i64, i64)>,
+        stream_size: (u32, u32),
+        view_size: Option<(u32, u32)>,
+    ) {
+        if let Some(trace) = &self.trace {
+            trace.record(ClinkTraceEvent::Input {
+                at_nanos: now_nanos(),
+                session: self.session,
+                kind: kind.into(),
+                coordinates,
+                raw_coordinates,
+                stream_size: Some(stream_size),
+                view_size,
+            });
+        }
+    }
+    pub fn with_view_size(
+        mut self,
+        on_view_size: impl Fn(u32, u32) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_view_size = Some(Box::new(on_view_size));
+        self
+    }
+    fn report_view_size(&mut self, size: Option<(u32, u32)>) {
+        if size.is_none() || size == self.last_view_size {
+            return;
+        }
+        self.last_view_size = size;
+        if let Some(trace) = &self.trace {
+            let (w, h) = size.unwrap();
+            trace.record(ClinkTraceEvent::Link {
+                at_nanos: now_nanos(),
+                session: self.session,
+                stage: "view_size".into(),
+                fields: BTreeMap::from([
+                    ("width".into(), w.to_string()),
+                    ("height".into(), h.to_string()),
+                ]),
+            });
+        }
+        if let Some(report) = &self.on_view_size {
+            let (width, height) = size.unwrap();
+            report(width, height);
+        }
+    }
+    pub fn release(&mut self) -> ControlEvent {
+        self.active.clear();
+        ControlEvent::Touch {
+            screen: 0,
+            contacts: Vec::new(),
+            origin: self.origin.clone(),
+        }
+    }
+    pub fn decode(
+        &mut self,
+        bytes: &[u8],
+        stream_size: (u32, u32),
+    ) -> Result<Option<ControlEvent>> {
+        require(bytes.len() <= 65536, "invalid_uibc")?;
+        let obj = json_object(bytes)?;
+        require(obj.len() <= 128, "invalid_uibc")?;
+        let number = |k: &str, default: Option<i64>| -> Result<i64> {
+            match obj.get(k) {
+                None => default.ok_or_else(|| format!("missing_{k}").into()),
+                Some(v) => v.as_i64().ok_or_else(|| format!("invalid_{k}").into()),
+            }
+        };
+        match number("type", None)? {
+            2 => {
+                let action = number("action", Some(0))?;
+                let meta = number("metaState", Some(0))?;
+                let code = number("keycode", None)?;
+                require(
+                    (0..=65535).contains(&code)
+                        && (0..=2).contains(&action)
+                        && (0..=0xffffffff).contains(&meta),
+                    "invalid_uibc",
+                )?;
+                if self.trace.is_some() {
+                    let dimension = |key: &str| {
+                        obj.get(key)?
+                            .as_i64()
+                            .filter(|n| (1..=i32::MAX as i64).contains(n))
+                            .map(|n| n as u32)
+                    };
+                    self.input(
+                        match action {
+                            0 => "key_down",
+                            1 => "key_up",
+                            _ => "key_multiple",
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        stream_size,
+                        dimension("width").zip(dimension("height")),
+                    );
+                }
+                return key(code as u16, action as u8, self.origin.clone());
+            }
+            1 => {}
+            _ => return Ok(None),
+        }
+        let dimension = |key: &str| {
+            obj.get(key)?
+                .as_i64()
+                .filter(|n| (1..=i32::MAX as i64).contains(n))
+                .map(|n| n as u32)
+        };
+        let view_size = dimension("width").zip(dimension("height"));
+        let count = number("count", None)?;
+        let action = number("action", None)?;
+        require(
+            (0..=16).contains(&count) && (0..=65535).contains(&action),
+            "invalid_uibc",
+        )?;
+        let masked = action & 255;
+        let index = ((action >> 8) & 255) as usize;
+        if masked == 3 {
+            self.report_view_size(view_size);
+            if self.trace.is_some() {
+                self.input(
+                    "touch_cancel",
+                    Vec::new(),
+                    Vec::new(),
+                    stream_size,
+                    view_size,
+                );
+            }
+            return Ok(Some(self.release()));
+        }
+        require(
+            count > 0 && index < count as usize && [0, 1, 2, 5, 6].contains(&masked),
+            "invalid_uibc",
+        )?;
+        let (w, h) = stream_size;
+        require(w > 0 && h > 0, "invalid_video_size")?;
+        let mut points = Vec::new();
+        for n in 0..count {
+            let track = number(&format!("trackID{n}"), None)?;
+            require(
+                (0..=0xffffffff).contains(&track)
+                    && !points.iter().any(|(t, _)| *t == track as u32),
+                "invalid_uibc_track",
+            )?;
+            let x = (number(&format!("x{n}"), None)? as f64 / w as f64).clamp(0.0, 1.0);
+            let y = (number(&format!("y{n}"), None)? as f64 / h as f64).clamp(0.0, 1.0);
+            points.push((track as u32, (x, y)));
+        }
+        let trace_points = if self.trace.is_some() {
+            Some((
+                points.iter().map(|(_, p)| *p).collect(),
+                (0..count)
+                    .map(|n| {
+                        Ok((
+                            number(&format!("x{n}"), None)?,
+                            number(&format!("y{n}"), None)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        } else {
+            None
+        };
+        let lifted = if masked == 1 || masked == 6 {
+            Some(points[index].0)
+        } else {
+            None
+        };
+        let mut contacts = Vec::new();
+        let mut occupied: Vec<u8> = self.active.iter().map(|(_, s, _)| *s).collect();
+        let old = std::mem::take(&mut self.active);
+        for (track, slot, previous) in old {
+            let p = points.iter().find(|(t, _)| *t == track).map(|(_, p)| *p);
+            let pressed = Some(track) != lifted && p.is_some() && masked != 1;
+            let p = p.unwrap_or(previous);
+            contacts.push(TouchContact::new(slot, p.0, p.1, pressed)?);
+            if pressed {
+                self.active.push((track, slot, p));
+            }
+        }
+        for (track, p) in points {
+            if Some(track) != lifted
+                && masked != 1
+                && !self.active.iter().any(|(t, _, _)| *t == track)
+            {
+                if let Some(slot) = (0..=1).find(|s| !occupied.contains(s)) {
+                    occupied.push(slot);
+                    self.active.push((track, slot, p));
+                    contacts.push(TouchContact::new(slot, p.0, p.1, true)?);
+                }
+            }
+        }
+        self.report_view_size(view_size);
+        if let Some((points, raw)) = trace_points {
+            self.input(
+                match masked {
+                    0 => "touch_down",
+                    1 => "touch_up",
+                    2 => "touch_move",
+                    5 => "pointer_down",
+                    _ => "pointer_up",
+                },
+                points,
+                raw,
+                stream_size,
+                view_size,
+            );
+        }
+        Ok(Some(ControlEvent::Touch {
+            screen: 0,
+            contacts,
+            origin: self.origin.clone(),
+        }))
+    }
+}
+pub fn key(android_code: u16, action: u8, origin: Origin) -> Result<Option<ControlEvent>> {
+    require(action <= 2, "invalid_key_action")?;
+    let code = match android_code {
+        3 => KeyCode::Home,
+        4 => KeyCode::Back,
+        23 | 66 => KeyCode::Select,
+        19 => KeyCode::KnobUp,
+        20 => KeyCode::KnobDown,
+        21 => KeyCode::KnobLeft,
+        22 => KeyCode::KnobRight,
+        85 => KeyCode::PlayPause,
+        87 => KeyCode::Next,
+        88 => KeyCode::Previous,
+        231 => KeyCode::Voice,
+        _ => return Ok(None),
+    };
+    Ok(if action == 2 {
+        None
+    } else {
+        Some(ControlEvent::Key {
+            code,
+            down: action == 0,
+            origin,
+        })
+    })
+}

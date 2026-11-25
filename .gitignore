@@ -1,0 +1,11 @@
+# Rust build output (rebuilt in CI)
+**/target/
+# Generated iOS core (rebuilt by scripts/build-rust-ios.sh in CI)
+OpenXPlay-iOS/generated/liboxp_ios.a
+OpenXPlay-iOS/generated/oxp_ios.h
+# Xcode build output
+OpenXPlay-iOS/build/
+OpenXPlay-iOS/OpenXPlay.xcodeproj/
+Payload/
+*.ipa
+.DS_Store

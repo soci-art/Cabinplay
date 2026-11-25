@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: AGPL-3.0-only
+# Created by riko chen on 2026-10-16
+
+name: Test
+
+# Pull requests run the checks that main requires; push runs only for main itself.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # A pull request skips a slow job when every changed file belongs only to the other side. A skipped job still
+  # passes its required check, so a job runs unless this one says false (also when it fails).
+  # The Rust tests read Kotlin resources, so those count as shared.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      kotlin: ${{ steps.filter.outputs.kotlin }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: filter
+        run: |
+          rust=true kotlin=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            files=$(git diff --name-only HEAD^1 HEAD)
+            only() { ! grep -qvE "$1" <<<"$files"; }
+            if only '^(rust/|README)'; then kotlin=false; fi
+            if only '^(kotlin/|README)' && ! grep -qE '/src/(main|test)/resources/' <<<"$files"; then rust=false; fi
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "kotlin=$kotlin" >> "$GITHUB_OUTPUT"
+
+  rust:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy && rustup default 1.99.1
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Test
+        run: cargo test --workspace --locked --offline
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+
+  web:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Separate code: the Android relay ships the first, the Linux relay the second.
+        receiver: [kotlin/web-receiver, rust/web-receiver]
+    defaults:
+      run:
+        working-directory: ${{ matrix.receiver }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ matrix.receiver }}/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  kotlin:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.kotlin != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kotlin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew test

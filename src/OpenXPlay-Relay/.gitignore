@@ -1,0 +1,10 @@
+.DS_Store
+.gradle/
+.kotlin/
+build/
+/android/local.properties
+node_modules
+dist/
+*.iml
+.idea/
+__pycache__/

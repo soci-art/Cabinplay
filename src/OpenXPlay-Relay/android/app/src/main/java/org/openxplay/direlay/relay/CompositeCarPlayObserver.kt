@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-22
+package org.openxplay.direlay.relay
+
+import com.shilapi.xcertplay.iap2.wire.Iap2Frame
+import com.shilapi.xcertplay.orchestration.CarPlayEventObserver
+import com.shilapi.xcertplay.orchestration.CarPlayStatus
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+
+/** Each observer receives the same events independently of the others. */
+internal class CompositeCarPlayObserver(private val diagnostics: CarPlayEventObserver,
+    private val plugins: CarPlayEventObserver? = null,
+    private val stage: CarPlayEventObserver? = null,
+    private val link: CarPlayEventObserver? = null,
+    private val startup: CarPlayEventObserver? = null) : CarPlayEventObserver {
+    private inline fun forward(call: CarPlayEventObserver.() -> Unit) {
+        runCatching { diagnostics.call() }
+        runCatching { stage?.call() }
+        runCatching { link?.call() }
+        runCatching { plugins?.call() }
+        runCatching { startup?.call() }
+    }
+    override fun onStartupMilestone(name: String) = forward { onStartupMilestone(name) }
+    override fun onLinkEnded(end: CarPlayLinkEnd) = forward { onLinkEnded(end) }
+    override fun onStatus(status: CarPlayStatus) = forward { onStatus(status) }
+    override fun onProgress(message: String) = forward { onProgress(message) }
+    override fun onSessionActive() = forward { onSessionActive() }
+    override fun onSessionEnded() = forward { onSessionEnded() }
+    override fun onIap2Frame(frame: Iap2Frame) = forward { onIap2Frame(frame) }
+    override fun onCommand(type: String, params: Map<String, Any?>) = forward { onCommand(type, params) }
+}

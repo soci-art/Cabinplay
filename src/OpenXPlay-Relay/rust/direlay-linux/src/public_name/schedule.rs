@@ -1,0 +1,216 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-20
+
+//! When to retry, when to order and when to renew: pure decisions over wall-clock seconds.
+
+pub const DAY: u64 = 86_400;
+/// Network or provider failures wait 1, 5 and 30 minutes, 2 and 6 hours, then every 24 hours.
+const BACKOFF: [u64; 6] = [60, 300, 1_800, 7_200, 21_600, DAY];
+/// At most this many new orders per name in 24 hours.
+pub const ORDERS_PER_DAY: usize = 3;
+/// A certificate with more than this left is never replaced unless renewal is due.
+pub const KEEP_VALID: u64 = 7 * DAY;
+/// The certificate is checked this often while the relay runs.
+pub const CHECK_EVERY: u64 = 12 * 3600;
+/// An unchanged address is published again after this long.
+pub const REPUBLISH_AFTER: u64 = DAY;
+/// The head-unit page switches certificates at once, even during a session, when the one it
+/// serves expires within this time.
+pub const URGENT: u64 = 3 * DAY;
+/// The longest `Retry-After` obeyed; longer values are taken as this.
+pub const MAX_RETRY_AFTER: u64 = 30 * DAY;
+
+/// Android polls ARI after Retry-After, bounded to one hour through one day.
+pub fn ari_poll_delay(retry_after: Option<u64>) -> u64 {
+    retry_after.unwrap_or(CHECK_EVERY).clamp(3600, DAY)
+}
+/// Check at renewal or the next ARI poll, with the normal 12-hour check as an upper bound.
+pub fn next_check(
+    now: u64,
+    not_before: Option<u64>,
+    not_after: Option<u64>,
+    renew_at: Option<u64>,
+    ari_next_poll: Option<u64>,
+) -> Option<u64> {
+    let renewal = renew_at.or_else(|| Some(planned_renewal(not_before?, not_after?, None)));
+    Some(
+        [Some(now + CHECK_EVERY), renewal, ari_next_poll]
+            .into_iter()
+            .flatten()
+            .min()?
+            .max(now),
+    )
+}
+
+/// The wait after the `failures`-th consecutive failure (counting from 1).
+pub fn backoff(failures: u32) -> u64 {
+    let index = (failures.max(1) as usize - 1).min(BACKOFF.len() - 1);
+    BACKOFF[index]
+}
+/// The wait after a failure: the backoff, or the server's `Retry-After` when that is longer.
+pub fn retry_delay(failures: u32, retry_after: Option<u64>) -> u64 {
+    backoff(failures).max(retry_after.unwrap_or(0).min(MAX_RETRY_AFTER))
+}
+
+/// The earliest time the local guard allows another new order for a name, given when its
+/// earlier orders were made. Orders dated after `now` (the clock went back) count as recent.
+pub fn next_order_allowed(orders: &[u64], now: u64) -> u64 {
+    let mut recent: Vec<u64> = orders.iter().copied().filter(|t| t + DAY > now).collect();
+    if recent.len() < ORDERS_PER_DAY {
+        return now;
+    }
+    recent.sort_unstable();
+    (recent[recent.len() - ORDERS_PER_DAY] + DAY).max(now)
+}
+
+/// The chosen ARI time, otherwise the time when a third of the lifetime remains.
+pub fn planned_renewal(not_before: u64, not_after: u64, renew_at: Option<u64>) -> u64 {
+    renew_at.unwrap_or_else(|| not_after.saturating_sub(not_after.saturating_sub(not_before) / 3))
+}
+/// A time inside the ARI suggested window (RFC 9773 section 4.2), from `random`.
+pub fn ari_time(start: u64, end: u64, random: u64) -> u64 {
+    if end <= start {
+        start
+    } else {
+        start + random % (end - start)
+    }
+}
+/// Due at the chosen ARI time when the CA suggested a window, else by the one-third rule.
+pub fn renewal_due(not_before: u64, not_after: u64, now: u64, renew_at: Option<u64>) -> bool {
+    now >= planned_renewal(not_before, not_after, renew_at)
+}
+/// Whether a valid certificate may be replaced by a new order now.
+pub fn may_replace(not_after: u64, now: u64, due: bool) -> bool {
+    due || not_after <= now + KEEP_VALID
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn checks_wake_at_renewal_or_ari_poll_and_bound_retry_after_like_android() {
+        let now = 1_800_000_000;
+        assert_eq!(ari_poll_delay(None), CHECK_EVERY);
+        assert_eq!(ari_poll_delay(Some(1)), 3600);
+        assert_eq!(ari_poll_delay(Some(30 * DAY)), DAY);
+        assert_eq!(
+            next_check(now, Some(now - 60), Some(now + 30), None, None),
+            Some(now)
+        );
+        assert_eq!(
+            next_check(
+                now,
+                Some(now),
+                Some(now + 90 * DAY),
+                Some(now + 17),
+                Some(now + 200)
+            ),
+            Some(now + 17)
+        );
+        assert_eq!(
+            next_check(
+                now,
+                Some(now),
+                Some(now + 90 * DAY),
+                Some(now + DAY),
+                Some(now + 42)
+            ),
+            Some(now + 42)
+        );
+        assert_eq!(
+            next_check(now, Some(now), Some(now + 90 * DAY), None, None),
+            Some(now + CHECK_EVERY)
+        );
+    }
+    #[test]
+    fn backoff_sequence_then_daily_and_retry_after_wins_when_longer() {
+        let waits: Vec<u64> = (1..=8).map(backoff).collect();
+        assert_eq!(waits, [60, 300, 1_800, 7_200, 21_600, DAY, DAY, DAY]);
+        assert_eq!(backoff(0), 60);
+        assert_eq!(retry_delay(1, Some(3_600)), 3_600);
+        assert_eq!(retry_delay(3, Some(30)), 1_800);
+        assert_eq!(retry_delay(1, Some(400 * DAY)), MAX_RETRY_AFTER);
+        assert_eq!(retry_delay(2, None), 300);
+    }
+    #[test]
+    fn local_order_guard_allows_three_orders_per_name_per_day() {
+        let now = 1_800_000_000;
+        assert_eq!(next_order_allowed(&[], now), now);
+        assert_eq!(next_order_allowed(&[now - 10, now - 5], now), now);
+        // The third order within 24 h is the last one until the oldest of them is a day old.
+        let three = [now - 7_200, now - 3_600, now - 60];
+        assert_eq!(next_order_allowed(&three, now), now - 7_200 + DAY);
+        assert_eq!(
+            next_order_allowed(&three, now - 7_200 + DAY),
+            now - 7_200 + DAY
+        );
+        assert_eq!(
+            next_order_allowed(&three, now - 7_200 + DAY + 1),
+            now - 7_200 + DAY + 1
+        );
+        // Older orders do not count; orders "in the future" do.
+        assert_eq!(
+            next_order_allowed(&[now - 2 * DAY, now - 60, now - 30], now),
+            now
+        );
+        assert_eq!(
+            next_order_allowed(&[now + 100, now + 200, now + 300], now),
+            now + 100 + DAY
+        );
+        // Four recent orders: wait until only two remain inside the day.
+        let four = [now - 4_000, now - 3_000, now - 2_000, now - 1_000];
+        assert_eq!(next_order_allowed(&four, now), now - 3_000 + DAY);
+    }
+    #[test]
+    fn shorter_certificates_use_their_lifetime_and_ari_and_wake_after_parking() {
+        let issued = 1_800_000_000;
+        for days in [64, 45] {
+            let expires = issued + days * DAY;
+            let at = expires - days * DAY / 3;
+            assert_eq!(planned_renewal(issued, expires, None), at);
+            assert!(!renewal_due(issued, expires, at - 1, None));
+            assert!(renewal_due(issued, expires, at, None));
+            assert!(may_replace(expires, at, true));
+            let ari = ari_time(issued + 10 * DAY, issued + 11 * DAY, 1234);
+            assert_eq!(planned_renewal(issued, expires, Some(ari)), ari);
+            assert!(renewal_due(issued, expires, ari, Some(ari)));
+            assert_eq!(
+                next_check(expires + DAY, Some(issued), Some(expires), None, None),
+                Some(expires + DAY)
+            );
+            assert!(!renewal_due(issued, expires, issued - 1, None));
+        }
+    }
+    #[test]
+    fn renewal_by_ari_window_or_one_third_of_the_lifetime() {
+        let (issued, expires) = (1_800_000_000, 1_800_000_000 + 90 * DAY);
+        assert_eq!(planned_renewal(issued, expires, None), issued + 60 * DAY);
+        assert_eq!(
+            planned_renewal(issued, expires, Some(issued + 17)),
+            issued + 17
+        );
+        assert!(renewal_due(issued, expires, issued + 60 * DAY, None));
+        assert!(!renewal_due(issued, expires, issued + 59 * DAY, None));
+        // A suggested window decides instead, also earlier than the one-third rule.
+        let (start, end) = (issued + 30 * DAY, issued + 32 * DAY);
+        for random in [0, 1, 12_345, u64::MAX] {
+            let at = ari_time(start, end, random);
+            assert!((start..end).contains(&at));
+        }
+        assert_eq!(ari_time(end, start, 7), end);
+        let at = ari_time(start, end, 5);
+        assert!(!renewal_due(issued, expires, at - 1, Some(at)));
+        assert!(renewal_due(issued, expires, at, Some(at)));
+        assert!(!renewal_due(
+            issued,
+            expires,
+            issued + 61 * DAY,
+            Some(issued + 70 * DAY)
+        ));
+        // More than 7 days left: kept unless due.
+        assert!(!may_replace(expires, expires - 8 * DAY, false));
+        assert!(may_replace(expires, expires - 8 * DAY, true));
+        assert!(may_replace(expires, expires - 7 * DAY, false));
+    }
+}

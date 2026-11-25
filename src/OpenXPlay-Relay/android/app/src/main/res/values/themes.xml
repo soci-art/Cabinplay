@@ -1,0 +1,21 @@
+<!-- SPDX-FileCopyrightText: 2026 OpenXPlay.org
+     SPDX-License-Identifier: AGPL-3.0-only
+     Created by riko chen on 2026-10-14 -->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.DiRelay" parent="Theme.Relay.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/design_window_accent</item>
+        <!-- A resource reference: Android 9 and older ignore a literal colour here. -->
+        <item name="android:windowBackground">@color/design_window_background</item>
+        <item name="android:statusBarColor">@color/design_window_background</item>
+        <item name="android:navigationBarColor">@color/design_window_background</item>
+        <item name="android:windowLightStatusBar">@bool/design_light_system_bars</item>
+        <item name="android:windowLightNavigationBar">@bool/design_light_system_bars</item>
+        <!-- Match the system appearance before Compose draws its first frame. -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/design_window_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/splash_mark</item>
+        <item name="android:windowSplashScreenAnimationDuration" tools:targetApi="31">600</item>
+    </style>
+</resources>
