@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-main
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust-tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustc -V
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - name: oxp-clink tests
+        run: cd src/OpenXPlay-Stream/rust && cargo test -p oxp-clink
+      - name: oxp-clink-ios build
+        run: cd src/OpenXPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
+      - name: oxp-ios build
+        run: cd src/OpenXPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
+
+  ios:
+    name: ios-simulator-build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustc -V
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          brew install xcodegen
+      - name: Rust libs for simulator
+        run: |
+          set -e
+          cd src/OpenXPlay-Relay/rust
+          cargo build -p oxp-ios --release --target aarch64-apple-ios-sim
+          cd ../../OpenXPlay-Stream/rust
+          cargo build -p oxp-clink-ios --release --target aarch64-apple-ios-sim
+          mkdir -p ../../OpenXPlay-iOS/generated
+          cp target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a ../../OpenXPlay-iOS/generated/
+          cp ../../OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a ../../OpenXPlay-iOS/generated/
+          cd ../../OpenXPlay-iOS/generated
+          libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
+          cp ../../src/OpenXPlay-Relay/rust/oxp-ios/include/oxp_ios.h .
+          cp ../../src/OpenXPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h .
+      - name: Generate Xcode project
+        run: cd OpenXPlay-iOS && xcodegen generate
+      - name: Build (no signing)
+        run: |
+          cd OpenXPlay-iOS
+          xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
