@@ -47,6 +47,9 @@ pub struct SessionOptions {
     pub work_modes: Option<u32>,
     /// AuthRequest field 11 (productName); None keeps the default "CabinPlay".
     pub product_name: Option<String>,
+    /// 按车触控校准的共享状态（宿主持有）：注入 UIBC 解码器，运行中
+    /// 改参数/开关捕获立刻生效。None 时触控行为与旧版逐位一致。
+    pub touch_cal_state: Option<Arc<Mutex<crate::uibc::TouchCalState>>>,
     /// Monotonic session clock, injectable for timeout and record-window tests.
     pub clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
@@ -65,6 +68,7 @@ impl Default for SessionOptions {
             device_name: "OpenXPlay".into(),
             work_modes: None,
             product_name: None,
+            touch_cal_state: None,
             clock: Arc::new(Instant::now),
         }
     }
@@ -904,6 +908,9 @@ impl ClinkSession {
         let mut touch = UibcDecoder::new(origin.clone())
             .with_view_size(move |width, height| listener.view_size(width, height))
             .with_diagnostic(move |message| diagnostic_listener.diagnostic(&message));
+        if let Some(cal_state) = &self.options.touch_cal_state {
+            touch = touch.with_cal_state(cal_state.clone());
+        }
         let mut audio_anchor: Option<bool> = None;
         let mut mode_anchor: Option<(u32, u32)> = None;
         if let Some(trace) = &self.options.trace {
@@ -1093,8 +1100,8 @@ impl ClinkSession {
                         {
                             mode_anchor = Some((wfd.mode.width, wfd.mode.height));
                             self.listener.diagnostic(&format!(
-                                "WFD 向车机声明画面尺寸 {}×{}（跟随所选输出分辨率，声明与实际出流一致触控才不偏）",
-                                wfd.mode.width, wfd.mode.height
+                                "协商定案：画面尺寸 {}×{} @{}fps（WFD 向车机声明、本机 CarPlay 会话请求、触控换算三处同尺寸同值，自动协商取车机能接受的最高档）",
+                                wfd.mode.width, wfd.mode.height, wfd.mode.fps
                             ));
                         }
                         owner.report(&wfd);

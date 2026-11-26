@@ -698,6 +698,7 @@ fn media_worker(
     let mut statistics = MediaStatistics::default();
     let mut reported_at = None;
     let mut mismatch_reported = None;
+    let mut placeholder_skip_reported = false;
     let mut path = RtpPath::default();
     let mut write: Option<(Arc<ClinkSession>, RtpWrite)> = None;
     // What the write still in flight after the sender's wait carries; its clocks restart when it lands.
@@ -884,11 +885,25 @@ fn media_worker(
             write = Some((session.clone(), to_session));
         }
         let write = &write.as_ref().unwrap().1;
-        require(
-            (snapshot.mode.width, snapshot.mode.height)
-                == (clip.format().width, clip.format().height),
-            "placeholder_timing_mismatch",
-        )?;
+        // 占位片是编译期写死的 1280×720/30fps 片子，协商尺寸与它不一
+        // 致时旧行为是直接报错终止整个媒体线程（placeholder_timing_
+        // mismatch）——2026-11-26 真机 1080p 三轮全灭就是死在这里：
+        // 核心自己杀掉会话、车机看起来像断开。现在改为：尺寸不符就
+        // 跳过占位帧、会话照常靠真实帧运行，只打一行诊断说明跳过原
+        // 因（每轮一行）。占位帧的节拍也不再用占位片自带的 fps，改
+        // 按会话协商帧率走（见下面占位写出块）。
+        let placeholder_compatible = (snapshot.mode.width, snapshot.mode.height)
+            == (clip.format().width, clip.format().height);
+        if !placeholder_compatible && !placeholder_skip_reported {
+            placeholder_skip_reported = true;
+            listener.diagnostic(&format!(
+                "占位片 {}×{} 与协商画面 {}×{} 尺寸不一致：跳过占位帧继续运行（不再终止会话），画面由本机 CarPlay 的真实帧直接驱动",
+                clip.format().width,
+                clip.format().height,
+                snapshot.mode.width,
+                snapshot.mode.height
+            ));
+        }
         let origin = Origin {
             output_id: id.into(),
             client_id: snapshot.head_unit_id.clone(),
@@ -1054,13 +1069,17 @@ fn media_worker(
             }
         }
         let now = Instant::now();
+        // 占位节拍按会话协商帧率走，不用占位片自带的 fps（片子恒 30，
+        // 会话已是 60）：pts 推进与写出间隔都用 snapshot.mode.fps。
+        let session_fps = snapshot.mode.fps.max(1);
         if writable
+            && placeholder_compatible
             && gate.placeholder()
             && now >= next_placeholder
             && video_clock.placeholder_due(now)
         {
             let data = &clip.frames()[placeholder_index];
-            let pts = (output_pts + 1_000_000 / clip.fps() as i64)
+            let pts = (output_pts + 1_000_000 / session_fps as i64)
                 .max(0)
                 .max(transport_pts + 1);
             let key = placeholder_index == 0;
@@ -1089,7 +1108,7 @@ fn media_worker(
                 writable = false;
                 late_video = true;
             }
-            next_placeholder = now + Duration::from_nanos(1_000_000_000 / clip.fps() as u64);
+            next_placeholder = now + Duration::from_nanos(1_000_000_000 / session_fps as u64);
         }
         if snapshot.media_audio {
             for _ in 0..4 {

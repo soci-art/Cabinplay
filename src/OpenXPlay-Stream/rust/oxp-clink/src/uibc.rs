@@ -9,7 +9,56 @@ use crate::{
     trace::{now_nanos, ClinkTrace, ClinkTraceEvent},
     Result,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+/// 按车校准出的画面区矩形：四边是触控面归一化坐标（原始触控点先按
+/// 触控面尺寸归一化），即 CarPlay 画面在车机触控面上的真实位置。协
+/// 议只报屏与画面区的尺寸、不报位置，居中假设对画面不居中的车（如
+/// 左侧留自家边栏的 UNI-V）必然偏——校准就是把这个矩形实测出来。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchCalibration {
+    pub left: f64,
+    pub right: f64,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+/// 校准参数的来源，定锚日志据此区分，方便对账是哪一路在生效。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchCalSource {
+    /// App 内置预置（目前只有车主本人的 UNI-V：实测照片＋车机声明
+    /// 尺寸推算，见 Swift 侧 TouchCalibrationStore 的注释）。
+    Preset,
+    /// 用户在设置里用描边法校准出的。
+    Manual,
+}
+
+impl TouchCalSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            TouchCalSource::Preset => "预置校准",
+            TouchCalSource::Manual => "手动校准",
+        }
+    }
+}
+
+/// 触控校准的共享状态：宿主（FFI）持有、建会话时注入解码器，运行
+/// 中可改（校准完成立刻生效，不必重开会话）。capture=true 是校准
+/// 捕获中：解码器只吐触控面归一化的原始坐标、不做任何校正，上层
+/// 据此记录用户点下的边；捕获期间不转发给 iOS 由上层自己拦。
+#[derive(Default)]
+pub struct TouchCalState {
+    pub calibration: Option<(TouchCalibration, TouchCalSource)>,
+    pub capture: bool,
+    /// 车机最近声明的几何（set_display_geometry 时回写）：宿主做校
+    /// 准自检（矩形宽高比 vs videoDisplay 比例）时读。
+    pub surface: Option<(u32, u32)>,
+    pub visible: Option<(u32, u32)>,
+}
+
 /// Android track IDs retain stable slots 0 and 1; insertion order is significant.
 pub struct UibcDecoder {
     origin: Origin,
@@ -25,6 +74,9 @@ pub struct UibcDecoder {
     display_visible: Option<(u32, u32)>,
     anchor_reported: bool,
     touch_anchor_reported: bool,
+    /// 按车校准的共享状态（宿主注入）；None 时行为与旧版逐位一致。
+    cal_state: Option<Arc<Mutex<TouchCalState>>>,
+    cal_anchor_signature: Option<String>,
 }
 impl UibcDecoder {
     pub fn new(origin: Origin) -> Self {
@@ -40,7 +92,13 @@ impl UibcDecoder {
             display_visible: None,
             anchor_reported: false,
             touch_anchor_reported: false,
+            cal_state: None,
+            cal_anchor_signature: None,
         }
+    }
+    pub fn with_cal_state(mut self, state: Arc<Mutex<TouchCalState>>) -> Self {
+        self.cal_state = Some(state);
+        self
     }
     pub fn with_trace(mut self, trace: Arc<dyn ClinkTrace>, session: u64) -> Self {
         self.trace = Some(trace);
@@ -104,6 +162,15 @@ impl UibcDecoder {
                 self.display_visible = Some(visible);
             }
         }
+        if let Some(state) = &self.cal_state {
+            let mut state = state.lock().unwrap();
+            if let Some(s) = self.display_surface {
+                state.surface = Some(s);
+            }
+            if let Some(v) = self.display_visible {
+                state.visible = Some(v);
+            }
+        }
         if !self.anchor_reported {
             if let (Some(s), Some(v)) = (self.display_surface, self.display_visible) {
                 self.anchor_reported = true;
@@ -115,6 +182,59 @@ impl UibcDecoder {
                 ));
             }
         }
+        self.report_calibration_anchor();
+    }
+    /// 校准来源定锚：几何已知后、校准状态（参数或捕获开关）一有变化
+    /// 就打一行，说明这一轮触控到底按哪一路换算——预置校准／手动校
+    /// 准（带矩形数值）／居中模型兜底，三种来源在日志里可区分。
+    fn report_calibration_anchor(&mut self) {
+        let Some(state) = &self.cal_state else { return };
+        let (calibration, capture) = {
+            let state = state.lock().unwrap();
+            (state.calibration, state.capture)
+        };
+        let signature = match (calibration, capture) {
+            (Some((cal, source)), capture) => format!(
+                "{source:?}|{:.4}|{:.4}|{:.4}|{:.4}|{capture}",
+                cal.left, cal.right, cal.top, cal.bottom
+            ),
+            (None, capture) => format!("none|{capture}"),
+        };
+        if self.cal_anchor_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        if self.display_surface.is_none() {
+            return;
+        }
+        self.cal_anchor_signature = Some(signature);
+        match calibration {
+            Some((cal, source)) => self.diagnostic(format!(
+                "触控定锚：校准来源={}，画面区矩形 left={:.4} right={:.4} top={:.4} bottom={:.4}（触控面归一化坐标），触控按此矩形换算",
+                source.label(),
+                cal.left,
+                cal.right,
+                cal.top,
+                cal.bottom
+            )),
+            None => self.diagnostic(
+                "触控定锚：校准来源=居中模型（这台车没有校准记录，按 screen 与 videoDisplay 的居中差换算）"
+                    .into(),
+            ),
+        }
+    }
+    /// 原始触控坐标按触控面归一化（触控面未知时用流尺寸兜底——捕获
+    /// 与应用走同一个归一化口径，校准结果自洽）。
+    fn raw_norm(raw: i64, surface: Option<u32>, stream: u32) -> f64 {
+        let denom = surface.filter(|s| *s > 0).unwrap_or(stream);
+        (raw as f64 / denom as f64).clamp(0.0, 1.0)
+    }
+    /// 校准矩形内一轴的换算：矩形边 → 0/1。矩形退化（宽高过小）时回
+    /// 落原值，绝不把整轴触控压到一条线上。
+    fn cal_apply(value: f64, lo: f64, hi: f64) -> f64 {
+        if hi - lo < 0.05 {
+            return value.clamp(0.0, 1.0);
+        }
+        ((value - lo) / (hi - lo)).clamp(0.0, 1.0)
     }
     /// Normalize one raw coordinate. CarWith (the head unit's reference
     /// host) corrects every touch as `(raw - drift) * scale` with
@@ -251,6 +371,12 @@ impl UibcDecoder {
         // report (see report_view_size); it never feeds the correction.
         let surface = self.display_surface;
         let visible = self.display_visible;
+        // 校准状态快照（每包读一次）：捕获中只吐原始坐标；有校准参数
+        // 按矩形换算；都没有才走居中 drift 模型（旧行为逐位不变）。
+        let cal_snapshot = self.cal_state.as_ref().map(|state| {
+            let state = state.lock().unwrap();
+            (state.calibration, state.capture)
+        });
         let mut points = Vec::new();
         for n in 0..count {
             let track = number(&format!("trackID{n}"), None)?;
@@ -261,12 +387,39 @@ impl UibcDecoder {
             )?;
             let raw_x = number(&format!("x{n}"), None)?;
             let raw_y = number(&format!("y{n}"), None)?;
-            let x = Self::correct(raw_x, w, surface.map(|s| s.0), visible.map(|v| v.0));
-            let y = Self::correct(raw_y, h, surface.map(|s| s.1), visible.map(|v| v.1));
+            let (x, y) = match cal_snapshot {
+                Some((_, true)) => (
+                    Self::raw_norm(raw_x, surface.map(|s| s.0), w),
+                    Self::raw_norm(raw_y, surface.map(|s| s.1), h),
+                ),
+                Some((Some((cal, _)), false)) => (
+                    Self::cal_apply(
+                        Self::raw_norm(raw_x, surface.map(|s| s.0), w),
+                        cal.left,
+                        cal.right,
+                    ),
+                    Self::cal_apply(
+                        Self::raw_norm(raw_y, surface.map(|s| s.1), h),
+                        cal.top,
+                        cal.bottom,
+                    ),
+                ),
+                _ => (
+                    Self::correct(raw_x, w, surface.map(|s| s.0), visible.map(|v| v.0)),
+                    Self::correct(raw_y, h, surface.map(|s| s.1), visible.map(|v| v.1)),
+                ),
+            };
             if n == 0 && !self.touch_anchor_reported {
                 self.touch_anchor_reported = true;
+                let model = match cal_snapshot {
+                    Some((_, true)) => "校准捕获中（原始坐标直出、不校正）".to_string(),
+                    Some((Some((_, source)), false)) => {
+                        format!("{}（按画面区矩形换算）", source.label())
+                    }
+                    _ => "居中模型".to_string(),
+                };
                 self.diagnostic(format!(
-                    "触控定锚：第一笔触控原始坐标 ({raw_x}, {raw_y})，校正后归一化 ({x:.4}, {y:.4})（触控面 {}，videoDisplay {}）",
+                    "触控定锚：第一笔触控原始坐标 ({raw_x}, {raw_y})，校正后归一化 ({x:.4}, {y:.4})（触控面 {}，videoDisplay {}，换算方式：{model}）",
                     surface
                         .map(|s| format!("{}×{}", s.0, s.1))
                         .unwrap_or_else(|| "未知".into()),
@@ -450,5 +603,73 @@ mod tests {
         let (x, y) = first_contact(decoder.decode(&body, (1280, 720)).unwrap());
         assert_eq!(x, 640.0 / 1280.0);
         assert_eq!(y, 360.0 / 720.0);
+    }
+
+    /// Per-car calibration (the UNI-V preset shape: picture flush right,
+    /// full height on a 1920×720 surface): the rect edges map to 0/1 and
+    /// the rect center maps to 0.5, replacing the centered drift model.
+    #[test]
+    fn calibration_rect_maps_edges_and_center() {
+        let state = Arc::new(Mutex::new(TouchCalState {
+            calibration: Some((
+                TouchCalibration {
+                    left: 120.0 / 1920.0,
+                    right: 1.0,
+                    top: 0.0,
+                    bottom: 1.0,
+                },
+                TouchCalSource::Preset,
+            )),
+            capture: false,
+            ..Default::default()
+        }));
+        let mut decoder = UibcDecoder::new(origin()).with_cal_state(state);
+        decoder.set_display_geometry((1920, 720), Some((1800, 720)));
+        let (x, y) = first_contact(
+            decoder
+                .decode(&touch_body(120, 360, None), (1800, 720))
+                .unwrap(),
+        );
+        assert_eq!((x, y), (0.0, 0.5));
+        let (x, y) = first_contact(
+            decoder
+                .decode(&touch_body(1020, 360, None), (1800, 720))
+                .unwrap(),
+        );
+        assert_eq!((x, y), (0.5, 0.5));
+        let (x, y) = first_contact(
+            decoder
+                .decode(&touch_body(1920, 720, None), (1800, 720))
+                .unwrap(),
+        );
+        assert_eq!((x, y), (1.0, 1.0));
+    }
+
+    /// Capture mode (calibration in progress): coordinates pass through
+    /// as raw surface-normalized values even when a calibration exists,
+    /// so the host records the user's actual edge taps.
+    #[test]
+    fn capture_mode_passes_raw_coordinates() {
+        let state = Arc::new(Mutex::new(TouchCalState {
+            calibration: Some((
+                TouchCalibration {
+                    left: 0.0625,
+                    right: 1.0,
+                    top: 0.0,
+                    bottom: 1.0,
+                },
+                TouchCalSource::Manual,
+            )),
+            capture: true,
+            ..Default::default()
+        }));
+        let mut decoder = UibcDecoder::new(origin()).with_cal_state(state);
+        decoder.set_display_geometry((1920, 720), Some((1800, 720)));
+        let (x, y) = first_contact(
+            decoder
+                .decode(&touch_body(480, 180, None), (1800, 720))
+                .unwrap(),
+        );
+        assert_eq!((x, y), (0.25, 0.25));
     }
 }

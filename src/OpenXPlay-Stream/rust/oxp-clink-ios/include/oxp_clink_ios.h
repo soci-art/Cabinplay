@@ -15,6 +15,9 @@ typedef struct ClinkCallbacks {
     void (*on_state)(void *context, uint16_t state);
     void (*on_error)(void *context, const uint8_t *bytes, size_t length);
     void (*on_touch)(void *context, uint32_t screen, double x, double y, uint8_t pressed);
+    /* Calibration capture: raw surface-normalized press coordinates,
+     * delivered instead of on_touch while capture mode is on. */
+    void (*on_touch_capture)(void *context, double x, double y);
     void (*on_key)(void *context, uint32_t code, uint8_t down);
     void (*on_log)(void *context, const uint8_t *bytes, size_t length);
 } ClinkCallbacks;
@@ -46,5 +49,17 @@ int32_t clink_push_audio_packet(uint32_t stream, const uint8_t *bytes,
                                 size_t length, int64_t pts_us);
 int32_t clink_stop(void);
 int32_t clink_is_running(void);
+
+/* Per-car touch calibration: picture rectangle in surface-normalized
+ * coordinates; source 1 = built-in preset, 2 = user manual calibration. */
+void clink_set_touch_calibration(double left, double right, double top,
+                                 double bottom, uint32_t source);
+void clink_clear_touch_calibration(void);
+/* Last declared geometry for the calibration self-check: fills
+ * [surface_w, surface_h, visible_w, visible_h]; 1 when surface known. */
+uint32_t clink_touch_geometry(uint32_t *out);
+/* While capture is on, touches report raw coordinates via
+ * on_touch_capture and are never forwarded as normal touches. */
+void clink_set_touch_capture(uint32_t enabled);
 
 #endif /* OXP_CLINK_IOS_H */

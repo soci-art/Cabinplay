@@ -43,6 +43,9 @@ pub struct ClinkCallbacks {
     pub on_error: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
     /// screen, x (0..1), y (0..1), pressed
     pub on_touch: Option<extern "C" fn(*mut c_void, u32, f64, f64, u8)>,
+    /// Touch-calibration capture: raw surface-normalized x/y of a press,
+    /// delivered instead of on_touch while capture mode is on.
+    pub on_touch_capture: Option<extern "C" fn(*mut c_void, f64, f64)>,
     /// head-unit key code, down
     pub on_key: Option<extern "C" fn(*mut c_void, u32, u8)>,
     pub on_log: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
@@ -271,6 +274,17 @@ impl OutputHost for Sink {
     fn control(&self, event: ControlEvent) {
         match event {
             ControlEvent::Touch { screen, contacts, .. } => {
+                // 校准捕获中：触控只报原始坐标给捕获回调，不走正常触控
+                // 通道——上层据此记录用户点下的边，绝不转发给 iOS。
+                if touch_cal_state().lock().unwrap().capture {
+                    if let (Some(first), Some(f)) = (
+                        contacts.iter().find(|c| c.pressed),
+                        self.cb.on_touch_capture,
+                    ) {
+                        f(self.cb.context, first.x, first.y);
+                    }
+                    return;
+                }
                 if let (Some(first), Some(f)) = (contacts.first(), self.cb.on_touch) {
                     f(self.cb.context, screen, first.x, first.y, if first.pressed { 1 } else { 0 });
                 }
@@ -309,6 +323,94 @@ fn cstr(ptr: *const c_char) -> Option<String> {
         return None;
     }
     unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(str::to_owned)
+}
+
+// ---------------------------------------------------------------------------
+// Per-car touch calibration (shared state injected into every session)
+// ---------------------------------------------------------------------------
+
+static TOUCH_CAL_STATE: OnceLock<Arc<Mutex<oxp_clink::uibc::TouchCalState>>> = OnceLock::new();
+
+fn touch_cal_state() -> Arc<Mutex<oxp_clink::uibc::TouchCalState>> {
+    TOUCH_CAL_STATE
+        .get_or_init(|| Arc::new(Mutex::new(oxp_clink::uibc::TouchCalState::default())))
+        .clone()
+}
+
+/// Set (or replace) the touch calibration applied by the UIBC decoder:
+/// the picture rectangle in surface-normalized coordinates. `source`:
+/// 1 = built-in preset, 2 = user manual calibration. Takes effect
+/// immediately, including for a session already running.
+#[no_mangle]
+pub extern "C" fn clink_set_touch_calibration(
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    source: u32,
+) {
+    let source = if source == 1 {
+        oxp_clink::uibc::TouchCalSource::Preset
+    } else {
+        oxp_clink::uibc::TouchCalSource::Manual
+    };
+    touch_cal_state().lock().unwrap().calibration = Some((
+        oxp_clink::uibc::TouchCalibration {
+            left,
+            right,
+            top,
+            bottom,
+        },
+        source,
+    ));
+    log(&format!(
+        "触控校准已生效（来源：{}）：画面区 left={left:.4} right={right:.4} top={top:.4} bottom={bottom:.4}（触控面归一化坐标）",
+        source.label()
+    ));
+}
+
+/// Drop the calibration: touch falls back to the centered drift model.
+#[no_mangle]
+pub extern "C" fn clink_clear_touch_calibration() {
+    touch_cal_state().lock().unwrap().calibration = None;
+    log("触控校准已清除：回到居中模型换算");
+}
+
+/// Read the head unit's last declared geometry for the calibration
+/// self-check: writes [surface_w, surface_h, visible_w, visible_h]
+/// into `out` (zeros when unknown). Returns 1 when a surface is known.
+#[no_mangle]
+pub extern "C" fn clink_touch_geometry(out: *mut u32) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let state = touch_cal_state();
+    let state = state.lock().unwrap();
+    let (sw, sh) = state.surface.unwrap_or((0, 0));
+    let (vw, vh) = state.visible.unwrap_or((0, 0));
+    unsafe {
+        *out = sw;
+        *out.add(1) = sh;
+        *out.add(2) = vw;
+        *out.add(3) = vh;
+    }
+    if sw > 0 && sh > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Toggle calibration capture mode. While on, touches are reported raw
+/// through on_touch_capture and never reach the normal touch channel.
+#[no_mangle]
+pub extern "C" fn clink_set_touch_capture(enabled: u32) {
+    touch_cal_state().lock().unwrap().capture = enabled != 0;
+    log(if enabled != 0 {
+        "触控校准捕获已开启：接下来车机屏上的点击只记录原始坐标、不转发"
+    } else {
+        "触控校准捕获已关闭：触控恢复正常转发"
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +519,7 @@ pub extern "C" fn clink_start(
     let identity = phone_identity().lock().unwrap();
     let options = SessionOptions {
         picture_size: Some((width.max(320), height.max(240))),
+        touch_cal_state: Some(touch_cal_state()),
         device_id: identity.device_id.clone(),
         device_name: identity.model.clone(),
         work_modes: Some(781),
