@@ -15,10 +15,8 @@ struct OpenXPlayApp: App {
         WindowGroup {
             ContentView()
                 .onAppear {
-                UIApplication.shared.isIdleTimerDisabled = true
-                if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
-                pipReady = pip.setup(layer: decoder.layer)
-            }
+                    UIApplication.shared.isIdleTimerDisabled = true
+                }
         }
     }
 }
@@ -158,6 +156,10 @@ struct ContentView: View {
                 case .failure(let error):
                     appendLog("导入失败：\(error.localizedDescription)")
                 }
+            }
+            .onAppear {
+                if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
+                pipReady = pip.setup(layer: decoder.layer)
             }
         }
     }

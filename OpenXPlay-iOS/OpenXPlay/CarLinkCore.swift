@@ -57,13 +57,13 @@ final class CarLinkCore {
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
             core.onTouch?(screen, x, y, pressed != 0)
             // 车机触摸直接回灌给当前 CarPlay 会话
-            _ = oxp_touch(screen, x, y, pressed)
+            _ = oxp_touch(screen, x, y, UInt32(pressed))
         }
         callbacks.on_key = { context, code, down in
             guard let context else { return }
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
             core.onKey?(code, down != 0)
-            _ = oxp_key(code, down)
+            _ = oxp_key(code, UInt32(down))
         }
         callbacks.on_log = { context, bytes, length in
             guard let context, let bytes else { return }
@@ -115,7 +115,7 @@ enum LocalNetwork {
             if let address = interface.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
                 if name.hasPrefix("en") || name.hasPrefix("bridge") {
-                    var raw = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                    let raw = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
                     var text = in_addr()
                     text.s_addr = raw.s_addr
                     let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: 16)
