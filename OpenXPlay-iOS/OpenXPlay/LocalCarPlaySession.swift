@@ -14,6 +14,7 @@
 
 import Foundation
 import Combine
+import CoreLocation
 
 final class LocalCarPlaySession: ObservableObject {
     enum Phase: Equatable {
@@ -67,6 +68,9 @@ final class LocalCarPlaySession: ObservableObject {
     private var identity: AccessoryIdentity?
     private var configuration: ReceiverConfiguration?
     private var startParams: (width: Int, height: Int, fps: Int)?
+    /// 因等定位授权而挂起的本次启动：授权结果回来后自动续启，不让
+    /// 用户再点一次。stop() 会把它清掉，清掉后授权回调不再续启。
+    private var pendingSSIDStart: (address: String, identity: AccessoryIdentity)?
     private var addressWatch: DispatchWorkItem?
     private var previewSets: VideoParameterSets?
 
@@ -130,6 +134,16 @@ final class LocalCarPlaySession: ObservableObject {
     private static var lastInfraPassword: String {
         get { UserDefaults.standard.string(forKey: "cabinplay.lastInfraPassword") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "cabinplay.lastInfraPassword") }
+    }
+
+    /// 设置页展示记住的 Wi-Fi 名时读这个。
+    static var rememberedInfraSSID: String { lastInfraSSID }
+
+    /// 设置页手填兜底：用户拒绝定位授权时，把当前 Wi-Fi 名手填进来
+    /// 写进同一个记住槽，本机 CarPlay 就能用它启动。手填没有密码。
+    static func rememberInfraSSIDManually(_ ssid: String) {
+        lastInfraSSID = ssid
+        lastInfraPassword = ""
     }
 
     /// 选本机 CarPlay 启动时报给系统的 Wi-Fi 身份，来源按可信度排序，
@@ -196,11 +210,22 @@ final class LocalCarPlaySession: ObservableObject {
         // 刚带回的新鲜凭据才许用车机 DIRECT- 名；其余情况一律用当前网
         // 络身份，绝不拿失效的旧 DIRECT- 名启动（系统会去连那个早已消
         // 失的网络、把当前 Wi-Fi 顶掉）。
-        guard let wifi = pickWiFiIdentity() else {
-            phase = .failed("没有可用的 Wi-Fi 名称")
-            onLog?("本机 CarPlay：启动中止——存下的只有已失效的车机临时网络名，当前网络名又读不到。先连上一个 Wi-Fi，或先走一次车机连接流程再启动")
+        if let wifi = pickWiFiIdentity() {
+            beginStart(address: address, identity: loadedIdentity, wifi: wifi)
             return
         }
+        // 一个可用名字都没有：多半是卡在「读当前网络名」这一步——iOS
+        // 没有定位授权时 CNCopy/fetchCurrent 都读不到当前 SSID（真机
+        // 实证：在家 Wi-Fi 连着也报无名可启）。按授权状态分流：未决
+        // 定就先要授权、授权后自动续启；已被拒绝就说人话拒启。
+        resolveWiFiIdentityThenStart(address: address, identity: loadedIdentity)
+    }
+
+    /// 身份选定后真正拉起接收端（start 直启与授权续启共用）。
+    private func beginStart(address: String, identity loadedIdentity: AccessoryIdentity,
+                            wifi: (ssid: String, password: String, source: String)) {
+        let params = startParams ?? (1280, 720, 30)
+        let width = params.width, height = params.height, fps = params.fps
         var config = ReceiverConfiguration(
             name: "CabinPlay",
             address: address,
@@ -232,8 +257,70 @@ final class LocalCarPlaySession: ObservableObject {
         watchStartupAddress(expected: address)
     }
 
+    /// 可信度链一个可用 Wi-Fi 名都没选出来时的分流处理：
+    /// - 未决定：先打一句大白话说明，再请求定位授权；授权通过后立刻
+    ///   fetchCurrent 读名、记下（非 DIRECT- 才记），自动续启本次启动，
+    ///   不让用户再点一次；
+    /// - 已拒绝/受限制：用一句话说清原因拒启，并指路设置页手填兜底；
+    /// - 已授权却仍读不到：保留原拒启口径（多半是真没连 Wi-Fi）。
+    private func resolveWiFiIdentityThenStart(address: String, identity loadedIdentity: AccessoryIdentity) {
+        switch WiFiNameAccess.authorizationStatus {
+        case .notDetermined:
+            pendingSSIDStart = (address, loadedIdentity)
+            phase = .starting
+            onLog?("本机 CarPlay：读不到当前 Wi-Fi 的名字——iOS 规定读这个名字要先拿到定位权限。接下来系统会弹框问你，这个权限只用来读当前连着的 Wi-Fi 叫什么名字，不记录你的位置。点「允许」后会自动继续启动，不用再点一次")
+            WiFiNameAccess.shared.requestAuthorization { [weak self] status in
+                self?.handleAuthorizationResult(status)
+            }
+        case .denied, .restricted:
+            phase = .failed("没拿到定位授权，读不到当前 Wi-Fi 的名字")
+            onLog?("本机 CarPlay：启动中止——定位授权没开，读不到当前 Wi-Fi 的名字。可以去系统设置给 CabinPlay 开定位权限，或在设置页手填当前 Wi-Fi 名称，填了就能启动")
+        default:
+            phase = .failed("没有可用的 Wi-Fi 名称")
+            onLog?("本机 CarPlay：启动中止——定位授权已拿到，但当前网络名还是读不到，存下的又只有已失效的车机临时网络名。先连上一个 Wi-Fi，或在设置页手填当前 Wi-Fi 名称")
+        }
+    }
+
+    /// 定位授权结果回来：通过就读名续启，没通过就说人话拒启。
+    /// 期间用户若已点停（pendingSSIDStart 被 stop 清掉），不再续启。
+    private func handleAuthorizationResult(_ status: CLAuthorizationStatus) {
+        guard pendingSSIDStart != nil else { return }
+        switch status {
+        case .authorizedWhenInUse, .authorizedAlways:
+            onLog?("本机 CarPlay：定位授权已允许，正在读当前 Wi-Fi 的名字…")
+            WiFiNameAccess.fetchCurrentSSID { [weak self] fetched in
+                guard let self, let pending = self.pendingSSIDStart else { return }
+                self.pendingSSIDStart = nil
+                if let fetched {
+                    self.onLog?("本机 CarPlay：读到当前 Wi-Fi 名「\(fetched)」")
+                    if !fetched.hasPrefix("DIRECT-") {
+                        Self.lastInfraSSID = fetched
+                        if fetched == Self.savedSSID { Self.lastInfraPassword = Self.savedPassword }
+                    }
+                } else {
+                    self.onLog?("本机 CarPlay：授权拿到了，但 fetchCurrent 还是没读到当前 Wi-Fi 名（可能暂时没连上 Wi-Fi）")
+                }
+                if let wifi = self.pickWiFiIdentity() {
+                    self.beginStart(address: pending.address, identity: pending.identity, wifi: wifi)
+                } else if let fetched {
+                    let password = fetched == Self.savedSSID ? Self.savedPassword : ""
+                    self.beginStart(address: pending.address, identity: pending.identity,
+                                    wifi: (fetched, password, "定位授权后读到的当前网络"))
+                } else {
+                    self.phase = .failed("没有可用的 Wi-Fi 名称")
+                    self.onLog?("本机 CarPlay：启动中止——授权后仍读不到当前 Wi-Fi 名，也没有别的可用名字。在设置页手填当前 Wi-Fi 名称就能启动")
+                }
+            }
+        default:
+            pendingSSIDStart = nil
+            phase = .failed("没拿到定位授权，读不到当前 Wi-Fi 的名字")
+            onLog?("本机 CarPlay：定位授权没给，读不到当前 Wi-Fi 的名字，本次启动中止。可以去系统设置给 CabinPlay 开定位权限，或在设置页手填当前 Wi-Fi 名称，填了就能启动")
+        }
+    }
+
     /// 所有停止路径统一走这里并打明原因，别再出现无原因的「已停止」。
     func stop(reason: String = "用户手动停止") {
+        pendingSSIDStart = nil
         addressWatch?.cancel()
         addressWatch = nil
         sameDevice.stop()

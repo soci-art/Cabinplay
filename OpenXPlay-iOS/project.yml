@@ -33,6 +33,7 @@ targets:
     dependencies:
       - sdk: Network.framework
       - sdk: NetworkExtension.framework
+      - sdk: CoreLocation.framework
       - sdk: CoreBluetooth.framework
       - sdk: VideoToolbox.framework
       - sdk: CoreMedia.framework
