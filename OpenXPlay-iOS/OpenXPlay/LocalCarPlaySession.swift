@@ -44,6 +44,8 @@ final class LocalCarPlaySession: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
+    /// 本轮会话启动时绑定的本机地址（入网切网后上层据此判断要不要重开会话）。
+    private(set) var boundAddress: String?
     /// 首个画面样本真正送入本机显示层的时刻（「已出画」的判定点，原版口径）。
     @Published private(set) var firstDisplayedAt: Date?
 
@@ -120,6 +122,7 @@ final class LocalCarPlaySession: ObservableObject {
             return
         }
         configuration = config
+        boundAddress = address
         wireCallbacks()
         phase = .starting
         onLog?("本机 CarPlay：启动中——本机地址 \(address):7001，画面 \(width)×\(height) @\(fps)，Wi-Fi「\(Self.savedSSID)」")
@@ -134,6 +137,7 @@ final class LocalCarPlaySession: ObservableObject {
         receiver.stop()
         phase = .idle
         controlConnected = false
+        boundAddress = nil
         firstDisplayedAt = nil
         previewSets = nil
         onLog?("本机 CarPlay：已停止")

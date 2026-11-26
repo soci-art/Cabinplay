@@ -3,7 +3,10 @@
 //
 // The app shell: three tabs （驾驶舱 / 日志 / 设置）.
 // 主线：本机 CarPlay 会话（LocalCarPlaySession）出帧 → 蓝牙 UCar 配对 →
-// CarLink（clink）把帧送上车机、把车机触摸/按键回送本机会话。
+// 拿到 ServerInfo 后组网（UCarNetworkJoiner）→ CarLink（clink）把帧送上
+// 车机、把车机触摸/按键回送本机会话。全程没有手填表单：车机地址入网后
+// 取组主地址、本机 IP 按目标网段现取现验、配对码只用蓝牙卡那一个输入框、
+// 热点凭据由 ServerInfo 带回后静默存下。
 
 import SwiftUI
 import AVFoundation
@@ -21,19 +24,39 @@ struct OpenXPlayApp: App {
     }
 }
 
-struct VideoSurface: UIViewRepresentable {
-    let layer: AVSampleBufferDisplayLayer
+/// 预览宿主视图：显示层就是视图的后备层（layerClass），frame 由 UIKit
+/// 布局自动跟随视图——照 CarWithin 原版 H264Surface 的托管方式。之前用
+/// 游离 AVSampleBufferDisplayLayer 当子层、手写同步 frame，可能停在零
+/// 尺寸（enqueue 全成功、层无报错、肉眼纯黑，诊断 B1 头号嫌疑）。
+final class PreviewHostView: UIView {
+    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+    var onWindowChange: ((Bool) -> Void)?
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowChange?(window != nil)
+    }
+}
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+struct VideoSurface: UIViewRepresentable {
+    let decoder: VideoDecoder
+
+    func makeUIView(context: Context) -> PreviewHostView {
+        let view = PreviewHostView()
         view.backgroundColor = .black
-        layer.frame = view.bounds
-        view.layer.addSublayer(layer)
+        decoder.attachLayer(view.displayLayer)
+        view.onWindowChange = { [weak decoder] inWindow in
+            decoder?.logHostWindow(inWindow)
+        }
+        decoder.logHostGeometry(bounds: view.bounds)
         return view
     }
 
-    func updateUIView(_ view: UIView, context: Context) {
-        layer.frame = view.bounds
+    func updateUIView(_ view: PreviewHostView, context: Context) {
+        if decoder.layer !== view.displayLayer {
+            decoder.attachLayer(view.displayLayer)
+        }
+        decoder.logHostGeometry(bounds: view.bounds)
     }
 }
 
@@ -44,16 +67,21 @@ struct ContentView: View {
     @State private var log: [String] = []
     @State private var tab = 0
     @State private var hasVideo = false
-    @State private var headUnitIP = "192.168.49.1"
-    @State private var localIP = ""
-    @State private var pairingCode = ""
     @State private var blePin = ""
-    @State private var wifiSSID = LocalCarPlaySession.savedSSID
-    @State private var wifiPassword = LocalCarPlaySession.savedPassword
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
     @State private var targetSize: (Int, Int) = (1280, 720)
-    @State private var didAutoDetect = false
+
+    // UCar 后段流程状态（全部自动推导，不再有手填项）。
+    private enum JoinPhase: Equatable {
+        case idle, joining, failed(String)
+    }
+    @State private var joinPhase: JoinPhase = .idle
+    @State private var carLinkDetail = "先在蓝牙卡输配对码连接车机，后面的入网和 CarLink 都自动走"
+    @State private var flowCarIP = ""
+    @State private var flowLocalIP = ""
+    @State private var joiner = UCarNetworkJoiner()
+    @State private var joinGeneration = 0
 
     var body: some View {
         TabView(selection: $tab) {
@@ -64,24 +92,19 @@ struct ContentView: View {
                     localRunning: localSession.isRunning,
                     localStreaming: localSession.phase == .streaming,
                     hasVideo: hasVideo,
-                    videoLayer: decoder.layer,
+                    decoder: decoder,
                     carLinkState: carLinkState,
                     carLinkRunning: carLinkRunning,
-                    headUnitIP: headUnitIP,
+                    carLinkStatusText: carLinkStatusText,
+                    carLinkDetail: carLinkDetail,
                     bleScanning: bleProbe.scanning,
                     bleSummary: bleProbe.lastFoundSummary ?? "还没发现车机——在车里打开车机的 CarLink，再点开始探测",
                     bleFound: bleProbe.foundDeviceId != nil,
                     bleHasToken: bleProbe.hasStoredToken,
                     blePhaseText: bleStageText,
-                    headUnitIPField: $headUnitIP,
-                    localIPField: $localIP,
-                    pairingCodeField: $pairingCode,
                     blePinField: $blePin,
-                    wifiSSIDField: $wifiSSID,
-                    wifiPasswordField: $wifiPassword,
                     onToggleLocalSession: { localSession.isRunning ? stopLocalSession() : startLocalSession() },
                     onSelectSize: { setSize($0, $1) },
-                    onConnectCarLink: { startCarLink() },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
                     onConnectBle: { bleProbe.connect(pin: blePin) }
@@ -128,14 +151,8 @@ struct ContentView: View {
             localSession.onPreviewFrame = { data, _ in
                 decoder.append(data, ptsNanos: UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000))
             }
-            if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
-            autoDetectCarLink()
-        }
-        .onChange(of: wifiSSID) { _, newValue in
-            LocalCarPlaySession.savedSSID = newValue
-        }
-        .onChange(of: wifiPassword) { _, newValue in
-            LocalCarPlaySession.savedPassword = newValue
+            joiner.onLog = { appendLog($0) }
+            joiner.onStatus = { carLinkDetail = $0 }
         }
     }
 
@@ -174,6 +191,15 @@ struct ContentView: View {
         }
     }
 
+    /// CarLink 状态卡的大字状态：入网阶段优先，其次 CarLink 客户端状态。
+    private var carLinkStatusText: String {
+        switch joinPhase {
+        case .joining: return "入网中…"
+        case .failed(let reason): return "失败：\(reason)"
+        case .idle: return carLinkState.text
+        }
+    }
+
     // MARK: CarLink（clink）
 
     private var clinkStateDirectory: String {
@@ -183,22 +209,41 @@ struct ContentView: View {
         return dir.path
     }
 
+    /// 启 clink 前现取现验：车机/本机都必须是合法 IPv4，且本机地址必须
+    /// 是当前某个网卡上真实存在的地址（13:24 实测：空串/旧地址直达 Rust
+    /// 报 invalid IPv4 address syntax）。
     private func startCarLink() {
-        if localIP.isEmpty {
-            localIP = LocalNetwork.ipv4Addresses().first ?? ""
+        let carIP = flowCarIP
+        let localIP = flowLocalIP
+        guard UCarNetworkJoiner.isValidIPv4(carIP) else {
+            appendLog("CarLink 启动中止：车机地址「\(carIP)」不是合法 IPv4，不往下传")
+            carLinkDetail = "启动失败：车机地址不合法"
+            return
         }
+        let currentAddresses = ReceiverConfiguration.localIPv4Addresses()
+        guard UCarNetworkJoiner.isValidIPv4(localIP), currentAddresses.contains(localIP) else {
+            appendLog("CarLink 启动中止：本机地址「\(localIP.isEmpty ? "(空)" : localIP)」不是当前网卡上的真实地址（当前：\(currentAddresses.joined(separator: "、"))），不把空值/旧地址传给核心")
+            carLinkDetail = "启动失败：本机地址已失效，重新走一遍连接流程"
+            return
+        }
+        // 配对码只用蓝牙卡那一个输入框的值；令牌免码轮次字段为空就传空串，
+        // TCP 鉴权走已存配对（QUICK）。
+        let pin = blePin.trimmingCharacters(in: .whitespaces)
+        let clinkPin = pin.count == 6 ? pin : ""
         let core = CarLinkCore.shared
         core.onLog = { appendLog($0) }
         core.onState = { state in
             carLinkState = state
             carLinkRunning = (state != .idle && state != .ended)
             if state == .playing {
-                UserDefaults.standard.set(headUnitIP, forKey: "oxp.lastHeadUnitIP")
-                if !pairingCode.isEmpty {
-                    UserDefaults.standard.set(pairingCode, forKey: "oxp.lastPin")
-                }
-                // UCar 流程：鉴权成功后经 BLE …103 回告本机地址（失败不影响判定）。
+                carLinkDetail = "车机 \(carIP) · 本机 \(localIP) · 正在输出"
+                // UCar 顺序（CarWith 实证）：57209 鉴权成功之后才经 BLE
+                // …103 回告本机地址。BLE 若已被车机 30 秒看门狗断开，
+                // writeClientAddress 内部会打日志说明，不卡主流程。
                 bleProbe.writeClientAddress(localIP: localIP)
+            }
+            if state == .ended {
+                carLinkDetail = "会话已结束：车机 \(carIP) · 本机 \(localIP)"
             }
             // 帧桥：进入出画才推帧（补配置+请求关键帧），离开即停推。
             localSession.carLinkPlayingChanged(state == .playing)
@@ -209,80 +254,76 @@ struct ContentView: View {
         core.onKey = { code, down in
             localSession.keyFromCarLink(code: code, down: down)
         }
-        carLinkRunning = core.start(headUnit: headUnitIP, local: localIP,
-                                    pin: pairingCode, stateDir: clinkStateDirectory,
+        carLinkRunning = core.start(headUnit: carIP, local: localIP,
+                                    pin: clinkPin, stateDir: clinkStateDirectory,
                                     width: UInt32(targetSize.0), height: UInt32(targetSize.1),
                                     deviceID: BleProbe.persistentPhoneId(),
                                     model: BleProbe.deviceMarketName())
-        appendLog(carLinkRunning ? "CarLink 已启动，等待车机画面" : "CarLink 启动失败")
+        appendLog(carLinkRunning
+            ? "CarLink 已启动：车机 \(carIP)，本机 \(localIP)，配对码 \(clinkPin.isEmpty ? "走已存配对（免码）" : "用蓝牙卡输的码")"
+            : "CarLink 启动失败")
+        if !carLinkRunning {
+            carLinkDetail = "启动失败：车机 \(carIP) · 本机 \(localIP)"
+        }
     }
 
     private func stopCarLink() {
+        joiner.cancel()
+        joinGeneration += 1
+        joinPhase = .idle
         CarLinkCore.shared.stop()
         carLinkRunning = false
         carLinkState = .idle
         localSession.carLinkPlayingChanged(false)
+        carLinkDetail = "已断开"
         appendLog("CarLink 已断开")
     }
 
-    /// 配对过的车机会在状态目录里留下 peer-*.key。
-    private var hasPairedBefore: Bool {
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: clinkStateDirectory)) ?? []
-        return files.contains { $0.hasPrefix("peer-") && $0.hasSuffix(".key") }
-    }
-
-    /// 打开 App 时自动探车机：探到就填好地址；配对过的直接自动连上。
-    private func autoDetectCarLink() {
-        guard !didAutoDetect, !carLinkRunning else { return }
-        didAutoDetect = true
-        let lastUsed = UserDefaults.standard.string(forKey: "oxp.lastHeadUnitIP")
-        let candidates = HeadUnitProbe.candidates(localIPs: LocalNetwork.ipv4Addresses(),
-                                                  lastUsed: lastUsed)
-        HeadUnitProbe.probeFirst(candidates: candidates) { found in
-            guard let found, !carLinkRunning else { return }
-            headUnitIP = found
-            appendLog("已自动找到车机 \(found)")
-            if hasPairedBefore {
-                if pairingCode.isEmpty {
-                    pairingCode = UserDefaults.standard.string(forKey: "oxp.lastPin") ?? ""
-                }
-                startCarLink()
-            }
-        }
-    }
-
-    /// UCar：BLE 拿到 ServerInfo 后——存下车机热点凭据（本机 CarPlay 用），
-    /// 裸探一次 57209，再把地址和配对码交给 CarLink 客户端走鉴权流程。
+    /// UCar：BLE 拿到 ServerInfo 后的整段自动流程——静默存凭据 → 组网
+    /// （UCarNetworkJoiner）→ 入网后本机 CarPlay 会话按新地址重开 →
+    /// 现取现验启 clink 鉴权。用户不再需要点任何东西。
     private func handleUCarServerInfo(_ info: UCarServerInfo) {
-        guard let ip = info.ipAddress, !ip.isEmpty else { return }
-        if localIP.isEmpty {
-            localIP = LocalNetwork.ipv4Addresses().first ?? ""
-        }
+        // 热点凭据静默存下供本机 CarPlay 会话用（不再有手填界面）。
         if let ssid = info.ssid, !ssid.isEmpty {
-            wifiSSID = ssid
             LocalCarPlaySession.savedSSID = ssid
             if let psk = info.psk {
-                wifiPassword = psk
                 LocalCarPlaySession.savedPassword = psk
             }
-            appendLog("UCar 连接：车机热点「\(ssid)」的凭据已存下，本机 CarPlay 启动时用它告诉系统走哪个网络")
+            appendLog("UCar 连接：车机网络「\(ssid)」的凭据已静默存下，本机 CarPlay 启动时用它告诉系统走哪个网络")
         }
-        appendLog("UCar 连接：拿到车机地址 \(ip)（热点「\(info.ssid ?? "?")」），本机地址 \(localIP.isEmpty ? "未知" : localIP)，先裸连一次 \(ip):57209 探测")
-        DispatchQueue.global(qos: .userInitiated).async {
-            let probe = HeadUnitProbe.probeOnce(ip, port: HeadUnitProbe.carLinkAuthPort)
-            DispatchQueue.main.async {
-                if probe.ok {
-                    appendLog("UCar 连接：裸 TCP 探测 \(ip):57209 —— 通（\(probe.detail)），车机的鉴权端口已经亮起来了")
-                } else {
-                    appendLog("UCar 连接：裸 TCP 探测 \(ip):57209 —— 不通（\(probe.detail)）。先确认手机连的是车机热点「\(info.ssid ?? "?")」；接着仍让 CarLink 客户端自己试一次，看它走到哪一步")
-                }
-                headUnitIP = ip
-                pairingCode = blePin
-                if blePin.isEmpty {
-                    appendLog("UCar 连接：本轮是令牌免码连接，TCP 鉴权走已存配对（QUICK）；要是车机不认，会报需要配对码，到时输码再连一次")
-                }
-                startCarLink()
+        if carLinkRunning {
+            appendLog("UCar 连接：CarLink 已在跑，这份 ServerInfo 不重复启流程")
+            return
+        }
+        if joinPhase == .joining {
+            appendLog("UCar 连接：组网已在进行中，这份 ServerInfo 不重复触发")
+            return
+        }
+        joinPhase = .joining
+        carLinkDetail = "入网中：加入车机网络「\(info.ssid ?? "?")」"
+        joinGeneration += 1
+        let generation = joinGeneration
+        joiner.join(ssid: info.ssid, psk: info.psk, bleCarIP: info.ipAddress) { result in
+            guard generation == joinGeneration else {
+                appendLog("UCar 入网：这一轮组网结果已过期（流程被新一轮接管），丢弃")
+                return
             }
+            guard let result else {
+                joinPhase = .failed("入网失败")
+                return
+            }
+            joinPhase = .idle
+            flowCarIP = result.carIP
+            flowLocalIP = result.localIP
+            carLinkDetail = "车机 \(result.carIP) · 本机 \(result.localIP) · 正在鉴权"
+            // 入网换了本机 IP：本机 CarPlay 会话还绑在旧地址上就重开一次
+            // （单 Wi-Fi 接口的必经之路，不是故障）。
+            if localSession.isRunning, localSession.boundAddress != result.localIP {
+                appendLog("本机 CarPlay：入网后本机地址从 \(localSession.boundAddress ?? "?") 变成了 \(result.localIP)，用新地址重开会话")
+                stopLocalSession()
+                startLocalSession()
+            }
+            startCarLink()
         }
     }
 

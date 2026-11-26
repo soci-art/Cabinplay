@@ -37,7 +37,8 @@ final class BleProbe: NSObject, ObservableObject {
     @Published private(set) var flowPhaseText = "未开始"
 
     var onLog: ((String) -> Void)?
-    /// 收到 ServerInfo 且解析出车机地址后回调（主线程）。
+    /// 收到 ServerInfo 后回调（主线程）。不要求带 ipAddress——组网与
+    /// 车机地址推导在上层（UCarNetworkJoiner + ContentView）完成。
     var onServerInfo: ((UCarServerInfo) -> Void)?
 
     private var central: CBCentralManager?
@@ -67,7 +68,7 @@ final class BleProbe: NSObject, ObservableObject {
         case .connecting: return "正在连车机蓝牙…"
         case .writingClientInfo: return "正在写 ClientInfo…"
         case .waitingServerInfo: return "已写 ClientInfo，等车机回 ServerInfo…"
-        case .gotServerInfo: return "已拿到车机地址，正在走 TCP 鉴权"
+        case .gotServerInfo: return "已拿到 ServerInfo，正在入网并走 TCP 鉴权"
         case .failed(let reason): return "连接流程失败：\(reason)"
         }
     }
@@ -593,14 +594,17 @@ final class BleProbe: NSObject, ObservableObject {
             UserDefaults.standard.set(auth, forKey: "ucar.authToken.\(deviceId)")
             hasStoredToken = true
         }
-        if let ip = info.ipAddress, !ip.isEmpty {
-            if flowCredential != nil {
-                onServerInfo?(info)
-            } else {
-                log("UCar 连接：这条 ServerInfo 不是本轮输码流程触发的，只记录不往下走")
-            }
+        // 不再等 ipAddress：CarWith 实证安卓根本不用这个字段（只打日志），
+        // 车机 IP 来自组网结果（组主地址）。本车 ServerInfo 就没这个字段，
+        // 在这儿停住等于永远走不下去（13:24 实测卡死点）。拿到 ssid/psk
+        // 就回调上层走组网步；ipAddress 有就带上，上层优先采用。
+        if info.ipAddress?.isEmpty != false {
+            log("UCar 连接：ServerInfo 没有 ipAddress（常态，安卓也不用它）——车机地址等入网后取组主地址，上层继续走组网")
+        }
+        if flowCredential != nil {
+            onServerInfo?(info)
         } else {
-            log("UCar 连接：ServerInfo 里没有 ipAddress，没法往下连 57209；把这份日志发回来看")
+            log("UCar 连接：这条 ServerInfo 不是本轮输码流程触发的，只记录不往下走")
         }
     }
 

@@ -19,7 +19,11 @@ import UIKit
 import VideoToolbox
 
 final class VideoDecoder {
-    let layer = AVSampleBufferDisplayLayer()
+    /// 显示层。默认先自建一个占位层；预览视图出现时经 attachLayer 换成
+    /// 视图的后备层（layerClass 托管，照 CarWithin 原版 H264Surface——
+    /// 后备层的 frame 由 UIKit 布局自动跟随视图，游离层手写同步 frame
+    /// 可能停在零尺寸：enqueue 全成功、层无报错、肉眼纯黑，见诊断 B1）。
+    private(set) var layer = AVSampleBufferDisplayLayer()
 
     var onLog: ((String) -> Void)?
     /// 显示层丢帧、只能在新关键帧恢复时回调（上层接接收端 requestKeyFrame）。
@@ -43,13 +47,89 @@ final class VideoDecoder {
         layer.requiresFlushToResumeDecoding || layer.status == .failed
     }
 
+    // B2 定点日志：帧流计数（每个心跳周期汇总一次）与层状态心跳。
+    private var statAppends = 0
+    private var statEnqueues = 0
+    private var statDrops = 0
+    private var heartbeat: Timer?
+    private var lastHostGeometryLog = ""
+
     init() {
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = UIColor.black.cgColor
+        observe(layer)
+    }
+
+    private func observe(_ target: AVSampleBufferDisplayLayer) {
         NotificationCenter.default.addObserver(self, selector: #selector(decodeFailed(_:)),
-            name: .AVSampleBufferDisplayLayerFailedToDecode, object: layer)
+            name: .AVSampleBufferDisplayLayerFailedToDecode, object: target)
         NotificationCenter.default.addObserver(self, selector: #selector(rendererFlushChanged),
+            name: .AVSampleBufferDisplayLayerRequiresFlushToResumeDecodingDidChange, object: target)
+    }
+
+    /// 预览视图（后备层托管）出现时把它的显示层接管过来：之后的解码、
+    /// 恢复、入队全走这一层。换层时旧层的失败监听摘掉、新层重挂。
+    func attachLayer(_ newLayer: AVSampleBufferDisplayLayer) {
+        guard newLayer !== layer else { return }
+        NotificationCenter.default.removeObserver(self,
+            name: .AVSampleBufferDisplayLayerFailedToDecode, object: layer)
+        NotificationCenter.default.removeObserver(self,
             name: .AVSampleBufferDisplayLayerRequiresFlushToResumeDecodingDidChange, object: layer)
+        layer.stopRequestingMediaData()
+        requesting = false
+        layer = newLayer
+        layer.videoGravity = .resizeAspect
+        layer.backgroundColor = UIColor.black.cgColor
+        layer.flushAndRemoveImage()
+        observe(layer)
+        onLog?("本机预览：显示层已改为预览视图的后备层托管（layerClass），frame \(Self.describe(layer.frame))，superlayer \(layer.superlayer != nil ? "在" : "不在")")
+    }
+
+    /// B2 托管几何日志：宿主视图 bounds 变化时才打，避免刷屏。
+    func logHostGeometry(bounds: CGRect) {
+        let line = "宿主视图 bounds \(Self.describe(bounds))，显示层 frame \(Self.describe(layer.frame))，superlayer \(layer.superlayer != nil ? "在" : "不在")"
+        guard line != lastHostGeometryLog else { return }
+        lastHostGeometryLog = line
+        onLog?("本机预览：\(line)")
+    }
+
+    /// B2 窗口在场日志：宿主视图进/出窗口时打。
+    func logHostWindow(_ inWindow: Bool) {
+        onLog?("本机预览：宿主视图\(inWindow ? "已进入窗口" : "不在窗口里")（window \(inWindow ? "非空" : "为空")）")
+    }
+
+    private static func describe(_ rect: CGRect) -> String {
+        "\(Int(rect.width))×\(Int(rect.height))@(\(Int(rect.origin.x)),\(Int(rect.origin.y)))"
+    }
+
+    // MARK: B2 层状态心跳 + 帧流计数
+
+    private func startHeartbeatIfNeeded() {
+        guard heartbeat == nil else { return }
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.heartbeatTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        heartbeat = timer
+    }
+
+    private func stopHeartbeat() {
+        heartbeat?.invalidate()
+        heartbeat = nil
+        statAppends = 0
+        statEnqueues = 0
+        statDrops = 0
+    }
+
+    private func heartbeatTick() {
+        guard format != nil else { return }
+        let appends = statAppends, enqueues = statEnqueues, drops = statDrops
+        statAppends = 0
+        statEnqueues = 0
+        statDrops = 0
+        // 帧流全静默且层自认在显示时不打，避免日志刷屏；其余情况都打。
+        guard appends > 0 || drops > 0 || !layer.isReadyForDisplay else { return }
+        onLog?("本机预览心跳：近 2 秒 append \(appends) 次、enqueue \(enqueues) 次、丢弃 \(drops) 次、待入队 \(pending.count) 帧；层状态 status=\(layer.status.rawValue)\(layer.error.map { " error=\($0.localizedDescription)" } ?? "") isReadyForDisplay=\(layer.isReadyForDisplay) isReadyForMoreMediaData=\(layer.isReadyForMoreMediaData) 层 frame \(Self.describe(layer.frame))")
     }
 
     @objc private func decodeFailed(_ note: Notification) {
@@ -72,6 +152,7 @@ final class VideoDecoder {
     /// 显示层恢复：清积压、flush、只等新关键帧，并向上层要关键帧。
     private func recover(reason: String) {
         layer.stopRequestingMediaData(); requesting = false
+        statDrops += pending.count
         pending.removeAll(); pendingBytes = 0
         layer.flush()
         hasEnqueuedFrame = false
@@ -85,6 +166,7 @@ final class VideoDecoder {
     }
 
     func reset() {
+        stopHeartbeat()
         checkingDisplaySince = nil
         lastRecovery = -.infinity
         layer.stopRequestingMediaData(); requesting = false
@@ -113,7 +195,9 @@ final class VideoDecoder {
 
     func append(_ annexB: Data, ptsNanos: UInt64) {
         guard !annexB.isEmpty else { return }
+        statAppends += 1
         guard let units = try? AnnexB.units(in: annexB), !units.isEmpty else {
+            statDrops += 1
             onLog?("本机预览：收到拆不开的画面数据（\(annexB.count) 字节），已丢弃")
             return
         }
@@ -149,7 +233,7 @@ final class VideoDecoder {
             }
         }
         if awaitingKeyframe {
-            guard keyframe else { return }
+            guard keyframe else { statDrops += 1; return }
             awaitingKeyframe = false
         }
         guard let bytes = try? AnnexB.lengthPrefixed(picture) else {
@@ -223,8 +307,15 @@ final class VideoDecoder {
             let (sample, bytes) = pending.removeFirst()
             pendingBytes -= bytes
             layer.enqueue(sample)
+            statEnqueues += 1
             if !hasEnqueuedFrame {
                 hasEnqueuedFrame = true
+                // B2 首帧样本信息：format 像素尺寸 + 样本字节数，排除尺寸为 0/错位。
+                if let format {
+                    let dims = CMVideoFormatDescriptionGetDimensions(format)
+                    onLog?("本机预览：首个样本已入队显示层（format 尺寸 \(dims.width)×\(dims.height)，样本 \(bytes) 字节，层 frame \(Self.describe(layer.frame)))")
+                }
+                startHeartbeatIfNeeded()
                 onFirstFrameEnqueued?()
             }
         }

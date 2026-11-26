@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // 驾驶舱（主页）：一条主线——本机 CarPlay（启动/停止 + 预览）→ 蓝牙连接
-// 车机 → 连接车机 CarLink → 上车状态汇总。输入项收进连接 sheet。
+// 车机 → 连接车机 CarLink（纯状态卡）→ 上车状态汇总。CarLink 没有任何
+// 手填表单：车机地址入网后自动推导、本机 IP 实测、配对码只用蓝牙卡的
+// 输入框、热点凭据由蓝牙 ServerInfo 带回静默存下。
 
 import SwiftUI
 import AVFoundation
@@ -14,11 +16,12 @@ struct DashboardView: View {
     let localRunning: Bool
     let localStreaming: Bool
     let hasVideo: Bool
-    let videoLayer: AVSampleBufferDisplayLayer
-    // CarLink
+    let decoder: VideoDecoder
+    // CarLink（纯状态）
     let carLinkState: CarLinkCore.State
     let carLinkRunning: Bool
-    let headUnitIP: String
+    let carLinkStatusText: String
+    let carLinkDetail: String
     // 蓝牙
     let bleScanning: Bool
     let bleSummary: String
@@ -26,21 +29,14 @@ struct DashboardView: View {
     let bleHasToken: Bool
     let blePhaseText: String
 
-    @Binding var headUnitIPField: String
-    @Binding var localIPField: String
-    @Binding var pairingCodeField: String
     @Binding var blePinField: String
-    @Binding var wifiSSIDField: String
-    @Binding var wifiPasswordField: String
 
     let onToggleLocalSession: () -> Void
     let onSelectSize: (Int, Int) -> Void
-    let onConnectCarLink: () -> Void
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
     let onConnectBle: () -> Void
 
-    @State private var showingCarLinkSheet = false
     @FocusState private var blePinFocused: Bool
 
     var body: some View {
@@ -61,9 +57,6 @@ struct DashboardView: View {
                 Button("完成") { blePinFocused = false }
             }
         }
-        .sheet(isPresented: $showingCarLinkSheet) {
-            carLinkSheet
-        }
     }
 
     // MARK: 第一步：本机 CarPlay
@@ -82,7 +75,7 @@ struct DashboardView: View {
             }
 
             ZStack {
-                VideoSurface(layer: videoLayer)
+                VideoSurface(decoder: decoder)
                     .aspectRatio(16.0 / 9.0, contentMode: .fit)
                     .background(Color.black)
 
@@ -210,7 +203,7 @@ struct DashboardView: View {
         .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
     }
 
-    // MARK: 第三步：连接车机 CarLink 摘要卡 + 连接 sheet
+    // MARK: 第三步：连接车机 CarLink（纯状态卡，没有表单、点不开任何东西）
 
     private var carLinkCard: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -221,82 +214,30 @@ struct DashboardView: View {
                     Circle()
                         .fill(carLinkState == .playing ? Color.green : Color.secondary.opacity(0.5))
                         .frame(width: 7, height: 7)
-                    Text(carLinkState.text).font(.caption).foregroundStyle(.secondary)
+                    Text(carLinkStatusText).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            Text("车机 \(headUnitIP) · 把本机 CarPlay 画面送到车机")
+            Text(carLinkDetail)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button {
-                Haptics.tap()
-                if carLinkRunning {
+            Text("全自动：蓝牙连上车机后，入网、鉴权、出画都自己走，不用在这里填任何东西")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if carLinkRunning {
+                Button {
+                    Haptics.tap()
                     onDisconnectCarLink()
-                } else {
-                    showingCarLinkSheet = true
+                } label: {
+                    Text("断开 CarLink")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
                 }
-            } label: {
-                Text(carLinkRunning ? "断开 CarLink" : "连接车机")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 2)
+                .buttonStyle(.bordered)
+                .tint(Color.sunsetAccent)
             }
-            .buttonStyle(.bordered)
-            .tint(Color.sunsetAccent)
         }
         .padding()
         .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
-    }
-
-    private var carLinkSheet: some View {
-        NavigationStack {
-            Form {
-                Section("车机地址") {
-                    TextField("车机 IP", text: $headUnitIPField)
-                        .keyboardType(.numbersAndPunctuation)
-                        .autocorrectionDisabled()
-                    TextField("本机 IP", text: $localIPField)
-                        .keyboardType(.numbersAndPunctuation)
-                        .autocorrectionDisabled()
-                }
-                Section("配对码") {
-                    TextField("车机屏幕上的配对码", text: $pairingCodeField)
-                        .keyboardType(.numberPad)
-                        .font(.title3.monospaced())
-                }
-                Section {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("车机热点（本机 CarPlay 用）")
-                            .font(.footnote.weight(.medium))
-                        TextField("热点名称（蓝牙连上后会自动填）", text: $wifiSSIDField)
-                            .autocorrectionDisabled()
-                        TextField("热点密码", text: $wifiPasswordField)
-                            .autocorrectionDisabled()
-                        Text("蓝牙连接成功后会自动带回并存下，一般不用手填；本机 CarPlay 启动时要用它告诉系统走哪个网络。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Section {
-                    Button {
-                        showingCarLinkSheet = false
-                        onConnectCarLink()
-                    } label: {
-                        Text("连接车机").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color.sunsetAccent)
-                }
-            }
-            .scrollContentBackground(.hidden)
-            .background(Color.pageBackground)
-            .navigationTitle("连接车机 CarLink")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { showingCarLinkSheet = false }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
     }
 
     // MARK: 上车状态汇总
