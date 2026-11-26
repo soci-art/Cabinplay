@@ -105,6 +105,9 @@ struct ContentView: View {
     /// 本轮连接内是否已用过身份轮换（同身份重试用尽后的第二道杠杆）：
     /// 每轮 arm 时复位，轮换后新身份再走一遍同样的 3 次重试上限。
     @State private var localRotatedThisFlow = false
+    /// 无回连重试是否正挂着（arm 置真、收手/取消/用尽置假）：车机会
+    /// 话在出画前结束时，靠它判定要不要连待发重试一并止损。
+    @State private var localRetryArmed = false
 
     /// 画中画保活（与静音音频保活并存的第二条腿）：懒创建——控制器要在
     /// 预览托管层接管完成后（首帧时）建，建早了内容源会指着占位层。
@@ -310,31 +313,36 @@ struct ContentView: View {
 
     // MARK: 本机 CarPlay 无回连自动重试（连接车机流程专用）
 
-    /// 接续/启动后挂上：第一轮等 8 秒、之后每轮等 12 秒仍无控制回连，
-    /// 就停掉以同凭据同地址重新发起，最多共 3 次尝试。首轮缩到 8 秒是
-    /// 因为历史成功回连都在 6 秒内到（1 秒/1 秒/6 秒，ROTATION-MARKER
-    /// -DIFF 第 4 节），8 秒留有余量又不空等；不能再缩到 6 秒——会和
-    /// 第 6 秒才到的回连赛跑、把即将连上的会话停掉重开。只重发从没回连过的发起——没回连过的发起
-    /// 不占「重启后第一次机会」；一旦回连（controlConnected）立刻收手，
-    /// 之后绝不再碰这个会话的生命周期（帧桥汇合、clink 重连都不许动
-    /// 它）。3 次都无回连就停手并打人话日志：这个系统一轮里只要有会话
-    /// 真正跑过又结束，新的就再也发起不起来，非重启手机不可。
+    /// 接续/启动后挂上：每轮等 20 秒仍无控制回连，就停掉以同凭据同
+    /// 地址重新发起，最多共 3 次尝试。检查窗从 8/12 秒改长到统一 20
+    /// 秒（2026-11-26 晚定版）：1731/1649 两轮真机回连分别在发起后
+    /// 约 30/31 秒才到（中间隔着重开），8/12 秒的短窗只会把等待切成
+    /// 一次次全量重开、平白扰动系统；而等待期车机那头有占位帧喂着
+    /// （每档都有同尺寸占位片），干等不会把车机会话等死——1824 轮车
+    /// 机 10 秒关通道的真因是 1080p 没占位片可喂、不是等太久。只重
+    /// 发从没回连过的发起——没回连过的发起不占「重启后第一次机
+    /// 会」；一旦回连（controlConnected）立刻收手，之后绝不再碰这个
+    /// 会话的生命周期（帧桥汇合、clink 重连都不许动它）。3 次都无回
+    /// 连就停手并打人话日志：这个系统一轮里只要有会话真正跑过又结
+    /// 束，新的就再也发起不起来，非重启手机不可。
     private func armLocalCallbackRetry() {
         localRetryGeneration += 1
         localAttemptCount = 1
         localRotatedThisFlow = false
+        localRetryArmed = true
         scheduleLocalCallbackCheck(generation: localRetryGeneration)
     }
 
     private func scheduleLocalCallbackCheck(generation: Int) {
         localRetryWork?.cancel()
-        // 本轮检查窗：每个身份的第一轮 8 秒，第二轮起 12 秒（定版依据
-        // 见 armLocalCallbackRetry 的注释）。在排期这一刻按当前尝试次
-        // 数定格，日志里如实打出本轮等了多少秒，方便对账。
-        let waitSeconds = localAttemptCount == 1 ? 8 : 12
+        // 本轮检查窗：统一 20 秒（定版依据见 armLocalCallbackRetry 的
+        // 注释）。在排期这一刻定格，日志里如实打出本轮等了多少秒，
+        // 方便对账。
+        let waitSeconds = 20
         let item = DispatchWorkItem {
             guard generation == localRetryGeneration else { return }
             if localSession.controlConnected || localSession.phase == .streaming {
+                localRetryArmed = false
                 appendLog("本机 CarPlay：已回连，自动重试收手——会话就此跑下去，流程内不再动它")
                 return
             }
@@ -352,6 +360,7 @@ struct ContentView: View {
                     appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录），用新身份重新发起")
                     startLocalSessionAfterAddressWait(generation: generation)
                 } else {
+                    localRetryArmed = false
                     appendLog("本机 CarPlay：换了新设备标识也重试满 3 次，还是没有回连——这一轮已经换身份重试过了，仍不行就只能重启手机后再点一次「连接车机」")
                 }
                 return
@@ -369,6 +378,7 @@ struct ContentView: View {
         localRetryGeneration += 1
         localRetryWork?.cancel()
         localRetryWork = nil
+        localRetryArmed = false
     }
 
     /// 无回连重开的前半：停掉会话，再走等地址启动（轮换分支自己已
@@ -520,6 +530,22 @@ struct ContentView: View {
                     if LocalCarPlaySession.carCredentialsFresh {
                         LocalCarPlaySession.invalidateCarCredentials()
                         appendLog("UCar 连接：车机会话已结束，本轮车机网络凭据已作废（下次启动本机 CarPlay 不再用这个网络名）")
+                    }
+                    // 止损：车机会话在出画前就结束、而无回连重试还挂着
+                    // 时，待发的重试必须一并取消——1824 实证：车机会
+                    // 话 :24 已结束，第 3 次重试还拖到 :46 拿已存凭据
+                    // （陈旧的「WDNMD」）兜底启动，对着已经关掉通道的
+                    // 车机空发。取消后 generation 守卫会让正在等地址
+                    // 的兜底启动也自行作废。已出画的会话结束不走这
+                    // 里（那是正常断开，凭据作废就够了）；用户主动断
+                    // 开时 stopCarLink 已先取消重试，armed 为假、不会
+                    // 误报。
+                    if localRetryArmed, !localSession.controlConnected,
+                       localSession.phase != .streaming {
+                        cancelLocalCallbackRetry()
+                        carLinkDetail = "车机会话已结束，请重新连接"
+                        appendLog("UCar 连接：车机会话在出画前已结束，待发的本机 CarPlay 重试已取消（不再用已存凭据兜底启动）")
+                        appendLog("车机会话已结束，请重新连接")
                     }
                 }
             }
@@ -846,8 +872,8 @@ struct ContentView: View {
                 appendLog("本机 CarPlay：入网完成，会话没在跑，兜底现在发起（用本轮车机凭据）")
                 startLocalSession()
             }
-            // 无回连自动重试挂上：接续后约 12 秒仍无回连就同凭据同地
-            // 址重新发起，最多共 3 次；回连即收手。
+            // 无回连自动重试挂上：接续后每轮等 20 秒仍无回连就同凭
+            // 据同地址重新发起，最多共 3 次；回连即收手。
             armLocalCallbackRetry()
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
             // 与本机 CarPlay 接续并行，两边靠帧桥汇合。
