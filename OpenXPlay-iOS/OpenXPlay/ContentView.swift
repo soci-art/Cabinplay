@@ -605,7 +605,10 @@ struct ContentView: View {
         // 配对码只用蓝牙卡那一个输入框的值；令牌免码轮次字段为空就传空串，
         // TCP 鉴权走已存配对（QUICK）。
         let pin = blePin.trimmingCharacters(in: .whitespaces)
-        let clinkPin = pin.count == 6 ? pin : ""
+        // 车机的配对码不一定是 6 位（见过 4/8 位）：只取数字，4–8 位都认，
+        // 不在范围才走「已存配对免码」。
+        let digits = pin.filter { $0.isNumber }
+        let clinkPin = (4...8).contains(digits.count) ? digits : ""
         let started = CarLinkCore.shared.start(headUnit: carIP, local: localIP,
                                     pin: clinkPin, stateDir: clinkStateDirectory,
                                     width: UInt32(targetSize.0), height: UInt32(targetSize.1),

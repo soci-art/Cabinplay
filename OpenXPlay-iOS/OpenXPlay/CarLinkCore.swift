@@ -64,13 +64,13 @@ final class CarLinkCore {
             guard let context, let bytes else { return }
             let text = String(decoding: Data(bytes: bytes, count: length), as: UTF8.self)
             Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
-                .onLog?("CarLink 错误：\(text)")
+                .emitLog("CarLink 错误：\(text)")
         }
         callbacks.on_touch = { context, screen, x, y, pressed in
             guard let context else { return }
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
             // 车机触摸回送本机 CarPlay 会话（由 ContentView 接到 LocalCarPlaySession）。
-            core.onTouch?(screen, x, y, pressed != 0)
+            core.onMain { core.onTouch?(screen, x, y, pressed != 0) }
         }
         callbacks.on_touch_capture = { context, x, y in
             guard let context else { return }
@@ -85,7 +85,7 @@ final class CarLinkCore {
         callbacks.on_log = { context, bytes, length in
             guard let context, let bytes else { return }
             let text = String(decoding: Data(bytes: bytes, count: length), as: UTF8.self)
-            Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue().onLog?(text)
+            Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue().emitLog(text)
         }
 
         let code = headUnit.withCString { head in
@@ -181,11 +181,27 @@ final class CarLinkCore {
         return code == 0
     }
 
+    /// UI 回调统一回主线程：核心的回调来自 Rust 线程，直接写 SwiftUI
+    /// 的 @State 属于跨线程改 UI，出画瞬间回调最密集，最容易炸。
+    private func onMain(_ body: @escaping () -> Void) {
+        if Thread.isMainThread {
+            body()
+        } else {
+            DispatchQueue.main.async(execute: body)
+        }
+    }
+
+    fileprivate func emitLog(_ text: String) {
+        onMain { [weak self] in self?.onLog?(text) }
+    }
+
     private func handleState(_ value: UInt16) {
         let state = State(rawValue: value) ?? .ended
         if state == .ended || state == .idle { running = false }
-        onState?(state)
-        onLog?("CarLink 状态：\(state.text)")
+        onMain { [weak self] in
+            self?.onState?(state)
+            self?.onLog?("CarLink 状态：\(state.text)")
+        }
     }
 }
 

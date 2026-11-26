@@ -194,16 +194,12 @@ final class LocalCarPlayBridge {
             if self.audioFormatKey != key {
                 self.audioFormatKey = key
                 // 解码 cookie 与 CarPlayAudio 解码器用的是同一组值；核心
-                // 的硬门槛是 48k 的 [0x11, 0x90]。
+                // 已放开采样率/声道门槛，cookie 只作记录用。
                 let cookie = Data(format.sampleRate == 44100 ? [0x12, 0x10] : [0x11, 0x90])
                 let ok = CarLinkCore.shared.pushAudioFormat(
                     stream: UInt32(stream), sampleRate: UInt32(format.sampleRate),
                     channels: UInt32(format.channels), config: cookie)
-                if format.sampleRate == 48000 {
-                    onLog?("音频桥：主流声音格式已登记给车机核心（AAC-LC 48000 Hz / \(format.channels) 声道），声音开始多喂一份去车机")
-                } else {
-                    onLog?("音频桥：主流声音是 \(format.sampleRate) Hz，核心只收 48000 Hz——这轮声音多半送不到车机（核心会报 unsupported_media_audio）")
-                }
+                onLog?("音频桥：主流声音格式已登记给车机核心（AAC-LC \(format.sampleRate) Hz / \(format.channels) 声道）；核心按这个采样率现算 ADTS 头")
                 if !ok {
                     onLog?("音频桥：音频格式登记被拒（CarLink 没在跑？），后续声音包继续试")
                 }
