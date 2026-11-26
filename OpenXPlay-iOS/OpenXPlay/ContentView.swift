@@ -39,6 +39,7 @@ struct VideoSurface: UIViewRepresentable {
 
 struct ContentView: View {
     @StateObject private var identity = IdentityStore()
+    @StateObject private var bleProbe = BleProbe()
     @State private var decoder = VideoDecoder()
     @State private var advertiser = BonjourAdvertiser()
     @State private var log: [String] = []
@@ -96,6 +97,8 @@ struct ContentView: View {
                     carLinkState: carLinkState,
                     carLinkRunning: carLinkRunning,
                     headUnitIP: headUnitIP,
+                    bleScanning: bleProbe.scanning,
+                    bleSummary: bleProbe.lastFoundSummary ?? "还没发现车机——在车里打开车机的 CarLink，再点开始探测",
                     headUnitIPField: $headUnitIP,
                     localIPField: $localIP,
                     pairingCodeField: $pairingCode,
@@ -106,6 +109,7 @@ struct ContentView: View {
                     onSelectSize: { setSize($0, $1) },
                     onConnectCarLink: { startCarLink() },
                     onDisconnectCarLink: { stopCarLink() },
+                    onToggleBleProbe: { bleProbe.toggle() },
                     onImportIdentity: { showingImporter = true },
                     onOpenSettings: { tab = 2 }
                 )
@@ -146,6 +150,7 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            bleProbe.onLog = { appendLog($0) }
             if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
             pipReady = pip.setup(layer: decoder.layer)
             autoDetectCarLink()

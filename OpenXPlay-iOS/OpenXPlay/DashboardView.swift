@@ -22,6 +22,8 @@ struct DashboardView: View {
     let carLinkState: CarLinkCore.State
     let carLinkRunning: Bool
     let headUnitIP: String
+    let bleScanning: Bool
+    let bleSummary: String
 
     @Binding var headUnitIPField: String
     @Binding var localIPField: String
@@ -32,6 +34,7 @@ struct DashboardView: View {
     let onSelectSize: (Int, Int) -> Void
     let onConnectCarLink: () -> Void
     let onDisconnectCarLink: () -> Void
+    let onToggleBleProbe: () -> Void
     let onImportIdentity: () -> Void
     let onOpenSettings: () -> Void
 
@@ -72,6 +75,8 @@ struct DashboardView: View {
                 .accessibilityLabel(running ? "停止接收" : "启动接收端")
 
                 carLinkCard
+
+                bleProbeCard
             }
             .padding()
         }
@@ -243,6 +248,38 @@ struct DashboardView: View {
                 }
             } label: {
                 Text(carLinkRunning ? "断开 CarLink" : "连接车机")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.sunsetAccent)
+        }
+        .padding()
+        .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: 蓝牙探针卡
+
+    private var bleProbeCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("探测车机蓝牙").font(.cardTitle)
+                Spacer()
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(bleScanning ? Color.green : Color.secondary.opacity(0.5))
+                        .frame(width: 7, height: 7)
+                    Text(bleScanning ? "正在探测" : "未开始").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text(bleSummary)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button {
+                Haptics.tap()
+                onToggleBleProbe()
+            } label: {
+                Text(bleScanning ? "停止探测" : "开始探测")
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 2)
             }

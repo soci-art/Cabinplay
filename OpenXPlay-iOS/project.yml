@@ -31,6 +31,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
     dependencies:
       - sdk: Network.framework
+      - sdk: CoreBluetooth.framework
       - sdk: VideoToolbox.framework
       - sdk: CoreMedia.framework
       - sdk: AVFoundation.framework
