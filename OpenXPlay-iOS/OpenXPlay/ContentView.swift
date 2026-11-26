@@ -62,6 +62,7 @@ struct ContentView: View {
     @State private var receiverError: String?
     @State private var startedAt: Date?
     @State private var targetSize: (Int, Int) = (1280, 720)
+    @State private var didAutoDetect = false
 
     private var core: CarPlayCore { .shared }
 
@@ -147,6 +148,7 @@ struct ContentView: View {
         .onAppear {
             if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
             pipReady = pip.setup(layer: decoder.layer)
+            autoDetectCarLink()
         }
     }
 
@@ -166,6 +168,12 @@ struct ContentView: View {
         core.onState = { state in
             carLinkState = state
             carLinkRunning = (state != .idle && state != .ended)
+            if state == .playing {
+                UserDefaults.standard.set(headUnitIP, forKey: "oxp.lastHeadUnitIP")
+                if !pairingCode.isEmpty {
+                    UserDefaults.standard.set(pairingCode, forKey: "oxp.lastPin")
+                }
+            }
         }
         core.onTouch = { screen, x, y, pressed in
             appendLog("车机触摸 \(screen) (\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) \(pressed ? "按下" : "抬起")")
@@ -174,6 +182,32 @@ struct ContentView: View {
                                     pin: pairingCode, stateDir: clinkStateDirectory,
                                     width: 1280, height: 720)
         appendLog(carLinkRunning ? "CarLink 已启动，等待车机画面" : "CarLink 启动失败")
+    }
+
+    /// 配对过的车机会在状态目录里留下 peer-*.key。
+    private var hasPairedBefore: Bool {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: clinkStateDirectory)) ?? []
+        return files.contains { $0.hasPrefix("peer-") && $0.hasSuffix(".key") }
+    }
+
+    /// 打开 App 时自动探车机：探到就填好地址；配对过的直接自动连上。
+    private func autoDetectCarLink() {
+        guard !didAutoDetect, !carLinkRunning else { return }
+        didAutoDetect = true
+        let lastUsed = UserDefaults.standard.string(forKey: "oxp.lastHeadUnitIP")
+        let candidates = HeadUnitProbe.candidates(localIPs: LocalNetwork.ipv4Addresses(),
+                                                  lastUsed: lastUsed)
+        HeadUnitProbe.probeFirst(candidates: candidates) { found in
+            guard let found, !carLinkRunning else { return }
+            headUnitIP = found
+            appendLog("已自动找到车机 \(found)")
+            if hasPairedBefore {
+                if pairingCode.isEmpty {
+                    pairingCode = UserDefaults.standard.string(forKey: "oxp.lastPin") ?? ""
+                }
+                startCarLink()
+            }
+        }
     }
 
     private func stopCarLink() {

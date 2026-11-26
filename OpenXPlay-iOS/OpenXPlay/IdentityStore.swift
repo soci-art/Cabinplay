@@ -95,28 +95,28 @@ final class IdentityStore: ObservableObject {
 
     // MARK: - Certificate CN parsing
 
-    /// Walk the DER looking for the UTF8String/PrintableString that starts with "IPA_".
+    /// Find the accessory id inside the certificate. The CN is a TeletexString
+    /// (tag 0x14) inside the PKCS#7 container, which a naive DER walk stepping
+    /// two bytes at a time never lands on — so scan the raw bytes for the
+    /// "IPA_" marker and read the hex digits that follow it.
     private static func ipaId(in der: Data) -> String? {
         let bytes = [UInt8](der)
-        var i = 0
-        while i + 2 < bytes.count {
-            let tag = bytes[i]
-            var length = Int(bytes[i + 1])
-            var start = i + 2
-            if length & 0x80 != 0 {
-                let count = length & 0x7F
-                guard count >= 1, count <= 3, i + 2 + count <= bytes.count else { break }
-                length = 0
-                for offset in 0..<count {
-                    length = (length << 8) | Int(bytes[i + 2 + offset])
-                }
-                start = i + 2 + count
+        let marker: [UInt8] = [0x49, 0x50, 0x41, 0x5F] // "IPA_"
+        guard bytes.count > marker.count else { return nil }
+        for start in 0...(bytes.count - marker.count) {
+            guard Array(bytes[start..<start + marker.count]) == marker else { continue }
+            var hex = ""
+            var index = start + marker.count
+            while index < bytes.count, hex.count < 32 {
+                let byte = bytes[index]
+                let isHex = (byte >= 0x30 && byte <= 0x39)
+                    || (byte >= 0x41 && byte <= 0x46)
+                    || (byte >= 0x61 && byte <= 0x66)
+                guard isHex else { break }
+                hex.append(Character(UnicodeScalar(byte)))
+                index += 1
             }
-            if (tag == 0x0C || tag == 0x13 || tag == 0x16), length > 4, start + length <= bytes.count {
-                let text = String(decoding: bytes[start..<start + length], as: UTF8.self)
-                if text.hasPrefix("IPA_") { return text }
-            }
-            i += 2
+            if hex.count >= 12 { return "IPA_" + hex }
         }
         return nil
     }

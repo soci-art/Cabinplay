@@ -191,12 +191,12 @@ struct DashboardView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(alignment: .bottomTrailing) {
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 Button {
                     onPiP()
                 } label: {
                     Image(systemName: "pip.enter")
-                        .frame(width: 40, height: 40)
+                        .frame(width: 38, height: 38)
                 }
                 .disabled(!pipReady)
                 .accessibilityLabel("画中画")
@@ -206,13 +206,14 @@ struct DashboardView: View {
                     Button("1280×720") { onSelectSize(1280, 720) }
                     Button("1920×1080") { onSelectSize(1920, 1080) }
                 } label: {
-                    Image(systemName: "rectangle.resize")
-                        .frame(width: 40, height: 40)
+                    Image(systemName: "aspectratio")
+                        .frame(width: 38, height: 38)
                 }
                 .accessibilityLabel("分辨率")
             }
+            .foregroundStyle(.primary)
             .background(.ultraThinMaterial, in: Capsule())
-            .padding(10)
+            .padding(8)
         }
     }
 
