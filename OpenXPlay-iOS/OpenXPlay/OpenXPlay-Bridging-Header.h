@@ -4,4 +4,6 @@
 #define OPENXPLAY_BRIDGING_HEADER_H
 #import "oxp_ios.h"
 #import "oxp_clink_ios.h"
+#import "DirectAccessoryTransport.h"
+#include "TDSCarKitCrypto.h"
 #endif

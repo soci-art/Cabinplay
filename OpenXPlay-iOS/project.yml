@@ -25,7 +25,7 @@ targets:
         INFOPLIST_FILE: OpenXPlay/Info.plist
         OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_all"]
         LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/generated"]
-        HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated"]
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated", "$(SRCROOT)/OpenXPlay/LocalCarPlay"]
         SWIFT_OBJC_BRIDGING_HEADER: OpenXPlay/OpenXPlay-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGN_STYLE: Automatic

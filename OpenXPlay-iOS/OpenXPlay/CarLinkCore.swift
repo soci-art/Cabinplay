@@ -66,15 +66,13 @@ final class CarLinkCore {
         callbacks.on_touch = { context, screen, x, y, pressed in
             guard let context else { return }
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
+            // 车机触摸回送本机 CarPlay 会话（由 ContentView 接到 LocalCarPlaySession）。
             core.onTouch?(screen, x, y, pressed != 0)
-            // 车机触摸直接回灌给当前 CarPlay 会话
-            _ = oxp_touch(screen, x, y, UInt32(pressed))
         }
         callbacks.on_key = { context, code, down in
             guard let context else { return }
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
             core.onKey?(code, down != 0)
-            _ = oxp_key(code, UInt32(down))
         }
         callbacks.on_log = { context, bytes, length in
             guard let context, let bytes else { return }
