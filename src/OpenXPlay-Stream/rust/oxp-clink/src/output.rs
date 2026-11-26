@@ -33,6 +33,7 @@ use std::{
 };
 struct Handoff {
     input_session: Option<i64>,
+    fence_dropped: u64,
     format: Option<Arc<VideoFormat>>,
     revision: u64,
     playing: bool,
@@ -103,6 +104,7 @@ impl Run {
             sink,
             handoff: Mutex::new(Handoff {
                 input_session: None,
+                fence_dropped: 0,
                 format: None,
                 revision: 0,
                 playing: false,
@@ -469,6 +471,25 @@ impl ClinkOutput {
                 || Some(frame.session) != h.input_session
                 || h.format.is_none()
             {
+                // 围栏丢帧必须可见：计数并节流写诊断（媒体线程会把诊断
+                // 转到宿主日志）。此前这里静默 return——iOS 整合漏喂
+                // on_session 时，每一帧都死在这里却毫无痕迹。
+                h.fence_dropped += 1;
+                if h.fence_dropped == 1 || h.fence_dropped % 300 == 0 {
+                    let reason = if !run.active.load(Ordering::Acquire) {
+                        "输出未激活"
+                    } else if !h.playing {
+                        "车机还没进入出画状态"
+                    } else if Some(frame.session) != h.input_session {
+                        "输入会话未对齐"
+                    } else {
+                        "视频格式还没推"
+                    };
+                    let total = h.fence_dropped;
+                    h.diagnostic(format!(
+                        "帧桥：核心入口围栏丢帧（{reason}），累计 {total} 帧"
+                    ));
+                }
                 return;
             }
             h.clock_mix.video(frame.pts_us, Instant::now());

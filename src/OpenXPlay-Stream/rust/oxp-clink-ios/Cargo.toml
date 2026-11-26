@@ -15,4 +15,5 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 oxp-clink = { path = "../oxp-clink" }
 oxp-core = { path = "../oxp-core" }
+oxp-media = { path = "../oxp-media" }
 libc = "0.2"

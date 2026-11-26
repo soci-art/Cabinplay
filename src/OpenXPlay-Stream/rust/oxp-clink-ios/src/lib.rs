@@ -21,13 +21,13 @@ use oxp_clink::{
     StaticClinkLink, TrustStore,
 };
 use oxp_core::model::{
-    ControlEvent, Origin, OutputCapabilities, OutputHost, OutputStats, VideoCodec, VideoFormat,
-    VideoFrame,
+    ControlEvent, Origin, OutputCapabilities, OutputHost, OutputStats, SessionPhase, SessionState,
+    VideoCodec, VideoFormat, VideoFrame,
 };
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,8 @@ impl OutputHost for Sink {
 struct Running {
     output: Arc<ClinkOutput>,
     format_pushed: AtomicBool,
+    session_fed: AtomicBool,
+    convert_errors: AtomicU64,
 }
 
 static RUNNING: OnceLock<Mutex<Option<Arc<Running>>>> = OnceLock::new();
@@ -442,6 +444,8 @@ pub extern "C" fn clink_start(
     *running().lock().unwrap() = Some(Arc::new(Running {
         output: Arc::new(output),
         format_pushed: AtomicBool::new(false),
+        session_fed: AtomicBool::new(false),
+        convert_errors: AtomicU64::new(0),
     }));
     log("CarLink 会话已建立");
     0
@@ -461,6 +465,21 @@ pub extern "C" fn clink_push_config(
         return -2;
     }
     let bytes = unsafe { std::slice::from_raw_parts(config, length) };
+    // 喂输入会话：原版宿主 oxp-bin 的契约是先 on_session(Active)、帧打
+    // 同一个 session id 才过核心入口围栏。iOS 整合此前把这一步漏了，
+    // FFI 又没有这个入口，核心的 input_session 永远是 None，每一帧都
+    // 在围栏处被静默丢弃。帧的 session 在 clink_push_frame 里写死 1，
+    // 这里对齐喂 1；推配置是帧流开始前的必经点（没推配置帧进不来），
+    // 在这里喂最贴近原版「会话先行」的顺序。on_session 在核心里对同
+    // id+Active 幂等，重复推配置不会反复重置队列。
+    if !running.session_fed.swap(true, Ordering::AcqRel) {
+        log("帧桥：已向核心喂输入会话（id 1，Active），帧的 session 与此对齐");
+    }
+    running.output.on_session(&SessionState {
+        id: 1,
+        phase: SessionPhase::Active,
+        reason: None,
+    });
     let codec = if codec == 2 { VideoCodec::H265 } else { VideoCodec::H264 };
     let format = match VideoFormat::create(
         screen,
@@ -481,7 +500,8 @@ pub extern "C" fn clink_push_config(
     0
 }
 
-/// Push one Annex-B frame.
+/// Push one Annex-B frame (converted to AVCC before it enters the core:
+/// the core muxer only accepts length-prefixed frames).
 #[no_mangle]
 pub extern "C" fn clink_push_frame(
     screen: u32,
@@ -495,10 +515,26 @@ pub extern "C" fn clink_push_frame(
         return -2;
     }
     let bytes = unsafe { std::slice::from_raw_parts(data, length) };
+    // 核心封装器只吃 AVCC（4 字节长度前缀），帧桥喂的是 Annex-B，进
+    // 核心前先转。转失败计数打日志并报错返回，绝不把坏帧静默塞进
+    // 去——未转的 Annex-B 会在封装器里触发 NAL 长度错误，经 mux()?
+    // 冒泡打死媒体线程整轮。
+    let avcc = match oxp_media::nal::annex_b_to_avcc(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let total = running.convert_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total % 300 == 0 {
+                log(&format!(
+                    "帧桥：Annex-B 转 AVCC 失败（{e}），累计 {total} 次，这一帧不送"
+                ));
+            }
+            return -4;
+        }
+    };
     running.output.on_video_frame(VideoFrame {
         screen,
         session: 1,
-        data: Arc::from(bytes.to_vec().into_boxed_slice()),
+        data: Arc::from(avcc.into_boxed_slice()),
         pts_us,
         key_frame: key_frame != 0,
         received_at_nanos: 0,

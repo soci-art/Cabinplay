@@ -407,6 +407,7 @@ dependencies = [
  "libc",
  "oxp-clink",
  "oxp-core",
+ "oxp-media",
 ]
 
 [[package]]

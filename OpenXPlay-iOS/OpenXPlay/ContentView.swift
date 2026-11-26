@@ -195,18 +195,18 @@ struct ContentView: View {
         hasVideo = false
     }
 
-    // MARK: 连接车机总流程（顺序：蓝牙先行，ServerInfo 后入网与本机 CarPlay 并行）
+    // MARK: 连接车机总流程（顺序：蓝牙先行 → 入网前停旧会话 → 入网 → 本机 CarPlay 一次启动 + clink 并行）
 
     /// 点「连接车机」的总入口：第一件事就是走蓝牙写 ClientInfo。车机
     /// 的 30 秒看门狗从蓝牙连上那刻起算，而蓝牙在扫描发现车机时就已
     /// 连上——先等本机 CarPlay 建立会把窗口吃光（14:56 实测：等满
     /// 15 秒才写 ClientInfo，写出后 8 秒无回执、蓝牙被车机断开；旧
     /// 流程连上立刻写、回执 <1 秒必成）。蓝牙这段只要一两秒，先走
-    /// 完；拿到 ServerInfo 后入网与本机 CarPlay 并行推进（见
-    /// handleUCarServerInfo），clink 试序在入网成功后即可开始、不等
-    /// 本机出画，两边靠帧桥兜底汇合。
+    /// 完；拿到 ServerInfo 后先在旧网络上把正在跑的本机 CarPlay 干净
+    /// 停掉、再入网，入网落稳后本机 CarPlay 一次启动到位、clink 试
+    /// 序同时开始（见 handleUCarServerInfo），两边靠帧桥兜底汇合。
     private func connectCarFlow() {
-        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后入网与本机 CarPlay 并行")
+        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先停旧会话再入网，入网后一次启动本机 CarPlay")
         bleProbe.connect(pin: blePin)
     }
 
@@ -460,10 +460,10 @@ struct ContentView: View {
         appendLog("CarLink 已断开")
     }
 
-    /// UCar：BLE 拿到 ServerInfo 后的整段自动流程——静默存凭据 → 组网
-    /// （UCarNetworkJoiner）与启动本机 CarPlay 并行推进 → 入网后本机
-    /// CarPlay 会话按新地址重开 → 现取现验启 clink 鉴权。用户不再
-    /// 需要点任何东西。
+    /// UCar：BLE 拿到 ServerInfo 后的整段自动流程——静默存凭据 → 还
+    /// 在旧网络上时先把正在跑的本机 CarPlay 干净停掉 → 组网
+    /// （UCarNetworkJoiner）→ 入网落稳后本机 CarPlay 一次启动到位、
+    /// 同时现取现验启 clink 鉴权。用户不再需要点任何东西。
     private func handleUCarServerInfo(_ info: UCarServerInfo) {
         // 热点凭据静默存下并标为本轮新鲜（打时间戳＋本进程标记）：只许
         // 本轮车机会话内、本机 CarPlay 重开时用；会话结束即作废，绝不
@@ -484,12 +484,17 @@ struct ContentView: View {
             appendLog("UCar 连接：组网已在进行中，这份 ServerInfo 不重复触发")
             return
         }
-        // 与入网并行：本机 CarPlay 现在就启动，不等入网结果。凭据刚
-        // 存下并标新鲜，可信度链会优先用本轮车机网络身份；入网换了
-        // 本机地址时，下面入网成功回调里有按 boundAddress 的重开接管。
-        if !localSession.isRunning {
-            appendLog("本机 CarPlay：拿到 ServerInfo，与入网同时启动本机 CarPlay（不等入网完成，两条线并行）")
-            startLocalSession()
+        // 入网切网会把旧网络上的连接整段掐断：本机 CarPlay 会话若正
+        // 在旧网络上跑（尤其已出画），被切网中途掐死后系统侧会把它
+        // 记成卡死——之后按新地址重开、乃至手动再开，iOS 都不回连
+        // （1532 实证）；而 1530 里首个会话还没建立就被换掉、重开即
+        // 成，差别就在旧会话是否已建立。所以顺序定死：入网之前，先
+        // 趁还在旧网络上把会话干净停掉（走既有 stop 路径、同步停
+        // 完）；没在跑也不在旧网络上先启——那等于再造一个跨网重开。
+        let stoppedForJoin = localSession.isRunning
+        if stoppedForJoin {
+            appendLog("本机 CarPlay：连接车机要先入网切网——趁还在旧网络上，先把正在跑的本机 CarPlay 干净停掉，入网后再一次启动到位")
+            stopLocalSession(reason: "连接车机：入网切网前先停掉")
         }
         joinPhase = .joining
         carLinkDetail = "入网中：加入车机网络「\(info.ssid ?? "?")」"
@@ -502,6 +507,9 @@ struct ContentView: View {
             }
             guard let result else {
                 joinPhase = .failed("入网失败")
+                if stoppedForJoin {
+                    appendLog("本机 CarPlay：入网失败，入网前停掉的会话保持停止（手动点「启动 CarPlay」可恢复）")
+                }
                 // 入网没成 = 这轮车机会话未成立，刚存的凭据一并作废。
                 if LocalCarPlaySession.carCredentialsFresh {
                     LocalCarPlaySession.invalidateCarCredentials()
@@ -512,22 +520,20 @@ struct ContentView: View {
             joinPhase = .idle
             flowLocalIP = result.localIP
             carLinkDetail = "本机 \(result.localIP) · 正在连接车机"
-            // 本机 CarPlay 若在 ServerInfo 时的并行启动没启起来（比如
-            // 当时没有可用的 Wi-Fi 名），入网后凭据已新鲜、地址已落
-            // 定，再补启一次作兜底。
-            if !localSession.isRunning {
-                appendLog("本机 CarPlay：并行启动没启起来，入网后用本轮新鲜凭据补启一次")
-                startLocalSession()
-            }
-            // 入网换了本机 IP：本机 CarPlay 会话还绑在旧地址上就重开一次
-            // （单 Wi-Fi 接口的必经之路，不是故障）。重开时用的是本轮刚
-            // 带回的新鲜车机凭据，与当前网络一致。
+            // 入网落稳，本机 CarPlay 现在一次启动到位：凭据是本轮刚带
+            // 回的新鲜车机凭据、地址就是入网后的地址，不存在跨网重
+            // 开。仅剩的兜底：入网期间用户手动启动过、且还绑在旧地址
+            // 上，才重开一次对齐新地址。
             if localSession.isRunning, localSession.boundAddress != result.localIP {
-                appendLog("本机 CarPlay：因地址变化重开：旧 \(localSession.boundAddress ?? "?") → 新 \(result.localIP)（入网换了本机地址）")
-                stopLocalSession(reason: "入网换地址重开")
+                appendLog("本机 CarPlay：入网期间被手动启动且还绑在旧地址 \(localSession.boundAddress ?? "?") 上，重开一次对齐新地址 \(result.localIP)")
+                stopLocalSession(reason: "入网后对齐新地址重开")
+                startLocalSession()
+            } else if !localSession.isRunning {
+                appendLog("本机 CarPlay：入网完成，现在启动本机 CarPlay（一次到位，不再跨网重开）")
                 startLocalSession()
             }
-            // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选）。
+            // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
+            // 与本机 CarPlay 启动并行，两边靠帧桥汇合。
             beginClinkAttempts(candidates: result.candidates, localIP: result.localIP)
         }
     }
