@@ -2,6 +2,13 @@
 
 按优先级排列，每一项都标了要改的文件。
 
+## 0. 已完成
+
+- CarLink 输出客户端：`oxp-clink-ios`（PIN、持久化信任库、回调、帧推送、UIBC 触摸、按键），接在 `IosMediaSink` 后。
+- 触摸/按键回灌：`OutputHost::control(Touch|Key)` → Swift → `oxp_touch()` / `oxp_key()`。
+- 音频：AAC-LC / LPCM → AVAudioEngine（`AudioPipeline.swift`）。
+- 画中画：`AVPictureInPictureController` + `AVSampleBufferDisplayLayer`。
+
 ## 1. 车机浏览器输出（决定能不能在车上看到）
 
 - 目标：把 Swift 侧解出的 NAL 再推给车机浏览器，页面用 WebCodecs 解码，和 OpenXPlay-Stream 的网页接收端一致。
@@ -11,12 +18,10 @@
 - 文件：新增 `OpenXPlay/ReceiverServer.swift`、`OpenXPlay/SelfSignedIdentity.swift`，页面资源放 `OpenXPlay/Resources/web/`。
 - 推流协议：WebSocket 二进制帧，首帧发解码配置，后续发 Annex-B；触摸用 JSON 文本帧回传。
 
-## 2. 触控回传（车机屏幕操作 CarPlay）
+## 2. 音频（剩余）
 
-- Rust 侧已经有 `InputEvents`（`touch(screen, contacts)`），`CarPlayMediaEngine` 绑定会话后可用。
-- 需要在 `oxp-ios` 里把当前 `CarPlayMediaEngine` 存下来，加 `oxp_touch(x, y, phase)` 导出函数，
-  Swift 侧在网页上把触摸坐标归一化后调它。
-- 文件：`src/OpenXPlay-Relay/rust/oxp-ios/src/lib.rs`、`OpenXPlay/ContentView.swift`。
+- AAC-ELD（部分车机/通话）、Opus、ALAC 还没解，日志会写「不在本地播放范围」。
+- 需要按 codec 分支加 AudioConverter 的输入格式，或直接推给车机蓝牙。
 
 ## 3. 音频
 

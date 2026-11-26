@@ -30,6 +30,9 @@ int32_t oxp_start(const char *identity_dir,
                   uint16_t port,
                   OxpCallbacks callbacks);
 
+int32_t oxp_touch(uint32_t screen, double x, double y, uint32_t pressed);
+int32_t oxp_key(uint32_t code, uint32_t down);
+
 int32_t oxp_stop(void);
 int32_t oxp_is_running(void);
 void oxp_log(const char *line);

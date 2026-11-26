@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub type Result<T> = std::io::Result<T>;
 
 pub use carplay_airplay::*;
+pub use carplay_airplay::AirPlayContact;
 pub use carplay_iap2::mfi::MfiAuthenticator;
 pub use carplay_iap2::mfi::local_mfi_authentication_client::LocalMfiAuthenticationClient;
 
@@ -130,6 +131,14 @@ struct Running {
 }
 
 static RUNNING: OnceLock<Mutex<Option<Running>>> = OnceLock::new();
+
+/// The engine bound to the most recent CarPlay session, used to inject touches
+/// that arrive from the head unit through the CarLink output.
+static ACTIVE_ENGINE: OnceLock<Mutex<Option<Arc<CarPlayMediaEngine>>>> = OnceLock::new();
+
+fn active_engine() -> &'static Mutex<Option<Arc<CarPlayMediaEngine>>> {
+    ACTIVE_ENGINE.get_or_init(|| Mutex::new(None))
+}
 
 fn running() -> &'static Mutex<Option<Running>> {
     RUNNING.get_or_init(|| Mutex::new(None))
@@ -315,11 +324,13 @@ fn start_inner(
     let factory_sink = sink.clone();
     let factory: server::MediaFactory = Arc::new(move |control, session_transport| {
         let _ = control;
-        Arc::new(CarPlayMediaEngine::new(
+        let engine = Arc::new(CarPlayMediaEngine::new(
             factory_sink.clone(),
             session_transport,
             true,
-        ))
+        ));
+        *active_engine().lock().unwrap() = Some(engine.clone());
+        engine
     });
 
     let listener: Arc<dyn AirPlaySessionListener> = Arc::new(IosListener { callbacks });
@@ -357,6 +368,46 @@ pub extern "C" fn oxp_stop() -> i32 {
 #[no_mangle]
 pub extern "C" fn oxp_is_running() -> i32 {
     if running().lock().unwrap().is_some() { 1 } else { 0 }
+}
+
+/// Inject a touch from the head unit (CarLink UIBC) into the current CarPlay
+/// session. Coordinates are normalised 0..1, as CarLink reports them.
+#[no_mangle]
+pub extern "C" fn oxp_touch(screen: u32, x: f64, y: f64, pressed: u32) -> i32 {
+    use carplay_airplay::InputEvents;
+    let engine = active_engine().lock().unwrap().clone();
+    let Some(engine) = engine else { return -1 };
+    let contact = AirPlayContact {
+        id: 0,
+        x: x.clamp(0.0, 1.0),
+        y: y.clamp(0.0, 1.0),
+        down: pressed != 0,
+    };
+    match engine.touch(screen as u16, &[contact]) {
+        Ok(true) => 0,
+        Ok(false) => -2,
+        Err(e) => {
+            eprintln!("[oxp-ios] touch failed: {e}");
+            -3
+        }
+    }
+}
+
+/// Inject a hardware key from the head unit (CarLink) into the current CarPlay
+/// session. `code` is passed through as the CarPlay/HID key code.
+#[no_mangle]
+pub extern "C" fn oxp_key(code: u32, down: u32) -> i32 {
+    use carplay_airplay::InputEvents;
+    let engine = active_engine().lock().unwrap().clone();
+    let Some(engine) = engine else { return -1 };
+    match engine.key(code as u16, down != 0) {
+        Ok(true) => 0,
+        Ok(false) => -2,
+        Err(e) => {
+            eprintln!("[oxp-ios] key failed: {e}");
+            -3
+        }
+    }
 }
 
 /// Free-form log from Swift into the same channel as Rust logs.

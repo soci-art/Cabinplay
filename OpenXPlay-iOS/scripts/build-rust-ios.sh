@@ -12,6 +12,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # OpenXPlay-iOS
 RELAY="$HERE/../src/OpenXPlay-Relay/rust"
+STREAM="$HERE/../src/OpenXPlay-Stream/rust"
 OUT="$HERE/generated"
 
 command -v cargo >/dev/null || { echo "需要 Rust 工具链：curl https://sh.rustup.rs -sSf | sh"; exit 1; }
@@ -27,6 +28,13 @@ build() {
 build aarch64-apple-ios
 cp "$RELAY/target/aarch64-apple-ios/release/liboxp_ios.a" "$OUT/liboxp_ios.a"
 
+# CarLink client lives in the Stream workspace
+( cd "$STREAM" && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios )
+cp "$STREAM/target/aarch64-apple-ios/release/liboxp_clink_ios.a" "$OUT/liboxp_clink_ios.a"
+
+# Both static libraries contain Rust std; combine them so the linker sees one archive.
+libtool -static -o "$OUT/liboxp_all.a" "$OUT/liboxp_ios.a" "$OUT/liboxp_clink_ios.a"
+
 if [[ "${1:-}" == "sim" ]]; then
   build aarch64-apple-ios-sim
   build x86_64-apple-ios
@@ -38,10 +46,12 @@ if [[ "${1:-}" == "sim" ]]; then
 fi
 
 cp "$RELAY/oxp-ios/include/oxp_ios.h" "$OUT/oxp_ios.h"
+cp "$STREAM/oxp-clink-ios/include/oxp_clink_ios.h" "$OUT/oxp_clink_ios.h"
 echo
 echo "完成："
-echo "  $OUT/liboxp_ios.a"
+echo "  $OUT/liboxp_all.a"
 echo "  $OUT/oxp_ios.h"
+echo "  $OUT/oxp_clink_ios.h"
 echo
 echo "下一步："
 echo "  brew install xcodegen   # 只需一次"

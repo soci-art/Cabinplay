@@ -401,6 +401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxp-clink-ios"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "oxp-clink",
+ "oxp-core",
+]
+
+[[package]]
 name = "oxp-core"
 version = "0.1.0"
 dependencies = [

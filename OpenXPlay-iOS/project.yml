@@ -22,7 +22,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.openxplay.receiver
         INFOPLIST_FILE: OpenXPlay/Info.plist
-        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_ios"]
+        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_all"]
         LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/generated"]
         HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated"]
         SWIFT_OBJC_BRIDGING_HEADER: OpenXPlay/OpenXPlay-Bridging-Header.h

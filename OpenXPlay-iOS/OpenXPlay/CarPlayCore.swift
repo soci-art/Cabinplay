@@ -22,6 +22,7 @@ final class CarPlayCore {
     var onVideoConfig: ((UInt16, Data) -> Void)?
     var onVideoFrame: ((UInt16, Data, UInt64) -> Void)?
     var onAudioFormat: ((Data) -> Void)?
+    var onAudioRtp: ((Data) -> Void)?
 
     private(set) var running = false
     private(set) var lastError: String?
@@ -58,6 +59,11 @@ final class CarPlayCore {
             guard let context, let bytes else { return }
             Unmanaged<CarPlayCore>.fromOpaque(context).takeUnretainedValue()
                 .onAudioFormat?(Data(bytes: bytes, count: length))
+        }
+        callbacks.on_audio_rtp = { context, bytes, length, _ in
+            guard let context, let bytes else { return }
+            Unmanaged<CarPlayCore>.fromOpaque(context).takeUnretainedValue()
+                .onAudioRtp?(Data(bytes: bytes, count: length))
         }
         callbacks.on_state = { context, bytes, length in
             guard let context, let bytes else { return }

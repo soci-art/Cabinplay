@@ -17,6 +17,8 @@
 | `../src/OpenXPlay-Relay/rust/carplay-airplay` | AirPlay / CarPlay 会话、配对、MFi SAP、加密、HID（OpenXPlay 原样代码） |
 | `../src/OpenXPlay-Relay/rust/carplay-iap2` | iAP2 链路、MFi 认证（PKCS#8 + PKCS#7 校验就在这里） |
 | `../src/OpenXPlay-Relay/rust/oxp-ios` | 新增：iOS 宿主（`server.rs` 由 `linux_air_play_server.rs` 移植）+ C ABI |
+| `../src/OpenXPlay-Stream/rust/oxp-clink` | CarLink 协议（原样），车机端 Carlink 应用就是它对接的 |
+| `../src/OpenXPlay-Stream/rust/oxp-clink-ios` | 新增：CarLink 客户端 + C ABI（PIN/信任库/回调/帧推送） |
 | `../src/OpenXPlay-Stream/rust` | 工作区依赖（oxp-core / oxp-wire），构建时 Cargo 需要 |
 | `scripts/build-rust-ios.sh` | 交叉编译 aarch64-apple-ios，产出 `liboxp_ios.a` + `oxp_ios.h` |
 | `project.yml` | XcodeGen 工程定义（生成 `.xcodeproj`） |
@@ -64,7 +66,17 @@ Xcode 里选你的 iPhone，Team 选自己的开发者账号，Bundle Identifier
 > 内置的好处是拿到 IPA 的人不用再找证书；代价是 IPA 本身就带着私钥，别把装好的包发给别人。
 > 要发给别人用，删掉 `OpenXPlay/Resources/` 里两个文件重新打包，再让对方在 App 里导入。
 
-## 4. 已知边界（务必看）
+## 4. CarLink 输出的实现方式
+
+- 方向是「我们去连车机」：iPhone 以 Wi-Fi 客户端加入车机的 Carlink 网络，连车机上的 CarLink 服务，
+  用配对码完成认证，然后推 H.264、收 UIBC 触摸。全程公开 API（`NWConnection`/BSD socket，无需特殊权限）。
+- 协议用 `oxp-clink`（和中继同一个实现），iOS 侧只加了 `oxp-clink-ios` 的 C ABI。
+- 帧的来源是 CarPlay 接收端：`IosMediaSink` 收到 Annex-B 后，同时调 `clink_push_config` / `clink_push_frame`。
+- 触摸：车机 `OutputHost::control(ControlEvent::Touch)` → Swift 回调 → `oxp_touch()` → `CarPlayMediaEngine::touch`。
+- CarLife 在 iOS 上做不了：它需要 USB 配件模式（手机当 USB device），iOS 没有这个能力；
+  官方 App 的 CarLife 支持也是经 CarPlay 转的，不是真的模拟 CarLife 设备。
+
+## 5. 已知边界（务必看）
 
 - **CarPlay 会话能不能起来，取决于 iOS 是否允许本机配件连接。** 官方 App 用 TestFlight 分发、不开源，
   很可能带 Apple 私有授权；本工程用的是公开协议栈，能做的都做了，但这一步没有授权就由系统决定。
@@ -75,7 +87,7 @@ Xcode 里选你的 iPhone，Team 选自己的开发者账号，Bundle Identifier
 - **音频**当前只把格式和 RTP 包回调出来，没有解码播放；接 AVAudioEngine 即可。
 - 接收端只监听、不主动发起；如果车机和你这台 iPhone 不在同一网段，什么都不会发生。
 
-## 5. 许可
+## 6. 许可
 
 Rust 部分沿用 OpenXPlay-Relay 的 AGPL-3.0（`carplay-airplay` / `carplay-iap2` 为 GPL-3.0，
 `oxp-ios` 为 AGPL-3.0），修改和分发时保留 `Powered by OpenXPlay.` 与上游链接。

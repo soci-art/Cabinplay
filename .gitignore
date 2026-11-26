@@ -9,3 +9,6 @@ OpenXPlay-iOS/OpenXPlay.xcodeproj/
 Payload/
 *.ipa
 .DS_Store
+OpenXPlay-iOS/generated/liboxp_clink_ios.a
+OpenXPlay-iOS/generated/liboxp_all.a
+OpenXPlay-iOS/generated/oxp_clink_ios.h

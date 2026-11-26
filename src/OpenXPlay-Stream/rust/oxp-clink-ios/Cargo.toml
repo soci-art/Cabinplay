@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "oxp-clink-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "oxp_clink_ios"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+oxp-clink = { path = "../oxp-clink" }
+oxp-core = { path = "../oxp-core" }
+libc = "0.2"

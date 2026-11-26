@@ -14,7 +14,11 @@ struct OpenXPlayApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+                .onAppear {
+                UIApplication.shared.isIdleTimerDisabled = true
+                if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
+                pipReady = pip.setup(layer: decoder.layer)
+            }
         }
     }
 }
@@ -44,6 +48,14 @@ struct ContentView: View {
     @State private var showingImporter = false
     @State private var status = "未启动"
     @State private var codec: UInt32 = 1
+    @State private var headUnitIP = "192.168.49.1"
+    @State private var localIP = ""
+    @State private var pairingCode = ""
+    @State private var carLinkState = CarLinkCore.State.idle
+    @State private var carLinkRunning = false
+    @State private var audio = AudioPipeline()
+    @State private var pip = PictureInPicture()
+    @State private var pipReady = false
 
     private var core: CarPlayCore { .shared }
 
@@ -84,6 +96,32 @@ struct ContentView: View {
 
                 Text(status).font(.footnote).foregroundStyle(.secondary)
 
+                GroupBox("车机 CarLink 输出") {
+                    VStack(spacing: 8) {
+                        TextField("车机 IP（Carlink 网络里的地址）", text: $headUnitIP)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numbersAndPunctuation)
+                        TextField("本机 IP（iPhone 在该网络的地址）", text: $localIP)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numbersAndPunctuation)
+                        TextField("车机屏幕上的配对码", text: $pairingCode)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numberPad)
+                        HStack {
+                            Button(carLinkRunning ? "断开 CarLink" : "连接车机 CarLink") {
+                                if carLinkRunning {
+                                    stopCarLink()
+                                } else {
+                                    startCarLink()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            Spacer()
+                            Text(carLinkState.text).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 List(log.suffix(200), id: \.self) { line in
                     Text(line).font(.caption.monospaced())
                 }
@@ -92,6 +130,14 @@ struct ContentView: View {
             .padding()
             .navigationTitle("OpenXPlay 直连")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        if !pip.start() { appendLog("画中画不可用") }
+                    } label: {
+                        Image(systemName: "pip.enter")
+                    }
+                    .disabled(!pipReady)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button("1280×720") { setSize(1280, 720) }
@@ -118,6 +164,39 @@ struct ContentView: View {
 
     @State private var targetSize: (Int, Int) = (1280, 720)
 
+    private var clinkStateDirectory: String {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("OpenXPlay/clink", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
+
+    private func startCarLink() {
+        if localIP.isEmpty {
+            localIP = LocalNetwork.ipv4Addresses().first ?? ""
+        }
+        let core = CarLinkCore.shared
+        core.onLog = { appendLog($0) }
+        core.onState = { state in
+            carLinkState = state
+            carLinkRunning = (state != .idle && state != .ended)
+        }
+        core.onTouch = { screen, x, y, pressed in
+            appendLog("车机触摸 \(screen) (\(String(format: "%.3f", x)), \(String(format: "%.3f", y))) \(pressed ? "按下" : "抬起")")
+        }
+        carLinkRunning = core.start(headUnit: headUnitIP, local: localIP,
+                                    pin: pairingCode, stateDir: clinkStateDirectory,
+                                    width: 1280, height: 720)
+        appendLog(carLinkRunning ? "CarLink 已启动，等待车机画面" : "CarLink 启动失败")
+    }
+
+    private func stopCarLink() {
+        CarLinkCore.shared.stop()
+        carLinkRunning = false
+        carLinkState = .idle
+        appendLog("CarLink 已断开")
+    }
+
     private func setSize(_ width: Int, _ height: Int) {
         targetSize = (width, height)
         appendLog("输出尺寸将使用 \(width)×\(height)")
@@ -137,6 +216,12 @@ struct ContentView: View {
         }
         core.onVideoFrame = { _, data, nanos in
             decoder.append(data, ptsNanos: nanos)
+        }
+        core.onAudioFormat = { data in
+            audio.configure(formatJSON: data)
+        }
+        core.onAudioRtp = { data in
+            audio.push(rtp: data)
         }
 
         let started = core.start(identityDirectory: identity.directory,
