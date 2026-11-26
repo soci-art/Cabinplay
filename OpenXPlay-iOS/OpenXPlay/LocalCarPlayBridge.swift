@@ -19,7 +19,7 @@ final class LocalCarPlayBridge {
     private var configRecord: Data?
     private var configPushed = false
     private var currentCodec: VideoCodec = .h264
-    private var fps: Double = 30
+    private var fps: Double = 60
     private var clinkPlaying = false
     private var pushedFrames = 0
     private var clockStart: DispatchTime?
@@ -78,24 +78,37 @@ final class LocalCarPlayBridge {
             configRecord = nil
             configPushed = false
         }
-        guard let units = try? AnnexB.units(in: data) else { return }
-        var current = sets ?? VideoParameterSets(codec: codec)
-        var changed = false
-        for unit in units where current.absorb(unit) { changed = true }
-        sets = current
-        if changed, current.isComplete,
-           let record = try? current.decoderConfigurationRecord() {
-            let isNewRecord = record != configRecord
-            configRecord = record
-            if clinkPlaying, isNewRecord {
-                pushConfigNow(record)
-                // 本机流在 CarLink 已出画之后才凑齐参数集：推完配置补请
-                // 一个关键帧，让车机从完整帧开始解（顺序兜底）。
-                if configPushed {
-                    onLog?("帧桥：参数集在 CarLink 出画后才凑齐，配置已补推，再请求一个关键帧")
-                    keyFrameRequester?()
+        // 快路径（帧桥解析瘦身，CARWITHIN-AUDIO-STUDY §6.4 第 3 条）：
+        // 参数集已凑齐、配置记录已建好时，只做轻量头扫描取关键帧标
+        // 记，不再每帧全量 AnnexB.units 拆包＋逐个 Data 分配——升 60
+        // 帧后这笔 CPU 是翻倍的。夹带参数集的 AU（分辨率切换会换
+        // SPS）与扫描拿不准的 AU 一律回落全量路径吸收，参数集变化
+        // 不会被漏掉。
+        let keyFrame: Bool
+        if let current = sets, current.isComplete, configRecord != nil,
+           let scan = AnnexB.scanHeaders(in: data, codec: codec), !scan.hasParameterSet {
+            keyFrame = scan.isKeyFrame
+        } else {
+            guard let units = try? AnnexB.units(in: data) else { return }
+            var current = sets ?? VideoParameterSets(codec: codec)
+            var changed = false
+            for unit in units where current.absorb(unit) { changed = true }
+            sets = current
+            if changed, current.isComplete,
+               let record = try? current.decoderConfigurationRecord() {
+                let isNewRecord = record != configRecord
+                configRecord = record
+                if clinkPlaying, isNewRecord {
+                    pushConfigNow(record)
+                    // 本机流在 CarLink 已出画之后才凑齐参数集：推完配置补请
+                    // 一个关键帧，让车机从完整帧开始解（顺序兜底）。
+                    if configPushed {
+                        onLog?("帧桥：参数集在 CarLink 出画后才凑齐，配置已补推，再请求一个关键帧")
+                        keyFrameRequester?()
+                    }
                 }
             }
+            keyFrame = units.contains { codec.isRandomAccess($0) }
         }
         guard clinkPlaying else { return }
         // 配置还没推成：别让帧闸门永久关着——随帧流节流重试推配置。
@@ -107,7 +120,6 @@ final class LocalCarPlayBridge {
             }
             guard configPushed else { return }
         }
-        let keyFrame = units.contains { codec.isRandomAccess($0) }
         if clockStart == nil { clockStart = DispatchTime.now() }
         let ptsMicros = Int64(DispatchTime.now().uptimeNanoseconds
                               - (clockStart?.uptimeNanoseconds ?? 0)) / 1000

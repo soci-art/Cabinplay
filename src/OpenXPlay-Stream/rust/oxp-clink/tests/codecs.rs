@@ -248,7 +248,7 @@ fn real_wfd_capabilities_setup_play_idr_and_session_validation() {
     for text in [
         "wfd_video_formats: 28 00 01 01 00000020",
         "port=14321;uibc_encrypted=true",
-        "display=1280:720;dpi=320;fps=30",
+        "display=1280:720;dpi=320;fps=60",
         "rtsp://127.0.0.1:17236/wfd1.0/streamid=0 none",
         "wfd_audio_codecs: AAC 00000001 00",
     ] {

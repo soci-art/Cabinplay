@@ -7,27 +7,42 @@ public enum VideoCodec: String, CaseIterable, Sendable {
 
     public var displayName: String { self == .h264 ? "H.264" : "H.265" }
 
+    /// NAL unit type from the first header byte of a raw NAL unit.
+    public func nalType(firstByte: UInt8) -> UInt8 {
+        self == .h264 ? firstByte & 0x1f : (firstByte >> 1) & 0x3f
+    }
+
     /// NAL unit type of a raw NAL unit (without start code).
     public func nalType(_ unit: Data) -> UInt8? {
         guard let first = unit.first else { return nil }
-        return self == .h264 ? first & 0x1f : (first >> 1) & 0x3f
+        return nalType(firstByte: first)
+    }
+
+    /// True for IDR (H.264) or IRAP (H.265) NAL unit types.
+    public func isRandomAccess(nalType: UInt8) -> Bool {
+        self == .h264 ? nalType == 5 : (16...21).contains(nalType)
     }
 
     /// True for IDR (H.264) or IRAP (H.265) pictures, from which a decoder can start.
     public func isRandomAccess(_ unit: Data) -> Bool {
         guard let type = nalType(unit) else { return false }
-        return self == .h264 ? type == 5 : (16...21).contains(type)
+        return isRandomAccess(nalType: type)
     }
 
-    /// Parameter-set role of a NAL unit, if any.
-    public func parameterSet(_ unit: Data) -> ParameterSet? {
-        guard let type = nalType(unit) else { return nil }
-        switch (self, type) {
+    /// Parameter-set role of a NAL unit type, if any.
+    public func parameterSet(nalType: UInt8) -> ParameterSet? {
+        switch (self, nalType) {
         case (.h264, 7), (.h265, 33): return .sps
         case (.h264, 8), (.h265, 34): return .pps
         case (.h265, 32): return .vps
         default: return nil
         }
+    }
+
+    /// Parameter-set role of a NAL unit, if any.
+    public func parameterSet(_ unit: Data) -> ParameterSet? {
+        guard let type = nalType(unit) else { return nil }
+        return parameterSet(nalType: type)
     }
 
     public enum ParameterSet { case vps, sps, pps }

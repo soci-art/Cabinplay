@@ -100,6 +100,7 @@ final class NativeReceiver {
                       self.connections.count < 8 else { connection.cancel(); return }
                 let id = UUID(); self.connections[id] = connection
                 let state = SessionState(credentials: self.airPlayIdentity)
+                state.setup?.onLog = { [weak self] in self?.log($0) }
                 self.sessions[id] = state
                 if case .hostPort(let host, _) = connection.endpoint { state.peerAddress = "\(host)" }
                 connection.stateUpdateHandler = { [weak self, weak connection] update in

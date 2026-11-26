@@ -24,6 +24,8 @@ final class SRPServer {
     private let verifier: BigUInt
     private let exponent: BigUInt
     private var consumed = false
+    /// 诊断日志钩子（公钥补齐/原样重试时打行），由 PairSetup 透传。
+    var onLog: ((String) -> Void)?
     // Injectable entropy only for deterministic cross-implementation test vectors.
     init(salt: Data? = nil, privateBytes: Data? = nil) throws {
         let salt = try salt ?? Self.random(16)
@@ -40,7 +42,28 @@ final class SRPServer {
     func verify(publicKey peer: Data, proof: Data) throws -> (key: SymmetricKey, proof: Data) {
         guard !consumed else { throw ProtocolError.malformed("SRP proof reused") }
         consumed = true
-        guard peer.count == 384, proof.count == 64 else { throw ProtocolError.malformed("SRP proof/key length") }
+        guard proof.count == 64, !peer.isEmpty, peer.count <= 384 else { throw ProtocolError.malformed("SRP proof/key length") }
+        // iOS 偶尔把公钥开头的零字节省掉再发（2026-11-26 15:25 真机
+        // 实证：M3 整包 456 字节、比正常 457 少 1 字节，被原来的等长
+        // 检查直接拒绝、要整轮重开才过）。公钥是按模数长度（384 字
+        // 节）补齐的大整数：收到的字节补齐后与 iOS 内部算证明用的形
+        // 式一致，先按补齐形式验；若收到的本来就短、补齐形式又验不
+        // 过，再按收到的原样自动重试一次（仅一次，纯本地计算，不用
+        // 等 iOS 重发整轮 pair-setup）。两次都不过才按原样抛错。
+        let padded = peer.count == 384 ? peer : Data(repeating: 0, count: 384 - peer.count) + peer
+        if padded != peer {
+            onLog?("Pair-Setup：iOS 这次的公钥少了前导零（\(peer.count) 字节），已补齐到 384 字节再验")
+        }
+        do {
+            return try check(publicKey: padded, proof: proof)
+        } catch {
+            guard padded != peer else { throw error }
+            onLog?("Pair-Setup：补齐形式没验过，按收到的公钥原样自动重试一次")
+            return try check(publicKey: peer, proof: proof)
+        }
+    }
+
+    private func check(publicKey peer: Data, proof: Data) throws -> (key: SymmetricKey, proof: Data) {
         let a = BigUInt(peer), n = Self.modulus
         guard a > 0, a < n else { throw ProtocolError.malformed("SRP public key") }
         let u = BigUInt(Self.hash(peer, publicKey))
@@ -60,6 +83,8 @@ public final class PairSetup {
     private let identifier: Data
     private let signingKey: Curve25519.Signing.PrivateKey
     private let save: (String, Data) throws -> Void
+    /// 诊断日志钩子，透传给每轮新建的 SRPServer。
+    public var onLog: ((String) -> Void)?
     private var srp: SRPServer?
     private var key: SymmetricKey?
     private var expectedState: UInt8 = 1
@@ -79,7 +104,7 @@ public final class PairSetup {
                 guard fields[0] == Data([0]), fields[19] == nil else {
                     throw ProtocolError.malformed("unsupported pair-setup method or flags")
                 }
-                let session = try SRPServer(); srp = session; expectedState = 3
+                let session = try SRPServer(); session.onLog = onLog; srp = session; expectedState = 3
                 return TLV8.encode([(6, Data([2])), (3, session.publicKey), (2, session.salt)])
             case 3:
                 guard let srp, let peer = fields[3], let proof = fields[4] else {

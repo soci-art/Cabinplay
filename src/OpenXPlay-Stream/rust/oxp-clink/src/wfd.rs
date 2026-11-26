@@ -142,7 +142,7 @@ impl Default for WfdMode {
         Self {
             width: 1280,
             height: 720,
-            fps: 30,
+            fps: 60,
             cea: 5,
             profile: 1,
             level: 1,

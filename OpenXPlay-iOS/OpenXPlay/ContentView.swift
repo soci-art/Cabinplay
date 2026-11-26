@@ -215,7 +215,7 @@ struct ContentView: View {
 
     private func startLocalSession() {
         decoder.reset()
-        localSession.start(width: targetSize.0, height: targetSize.1, fps: 30)
+        localSession.start(width: targetSize.0, height: targetSize.1, fps: 60)
         if localSession.phase.isFailed {
             Haptics.error()
         }
