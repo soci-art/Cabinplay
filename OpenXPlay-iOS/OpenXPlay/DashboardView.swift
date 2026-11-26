@@ -43,6 +43,7 @@ struct DashboardView: View {
     let onOpenSettings: () -> Void
 
     @State private var showingCarLinkSheet = false
+    @FocusState private var blePinFocused: Bool
 
     var body: some View {
         ScrollView {
@@ -85,6 +86,13 @@ struct DashboardView: View {
             .padding()
         }
         .background(Color.pageBackground)
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("完成") { blePinFocused = false }
+            }
+        }
         .sheet(isPresented: $showingCarLinkSheet) {
             carLinkSheet
         }
@@ -284,6 +292,12 @@ struct DashboardView: View {
                 .foregroundStyle(.primary)
             TextField("车机屏幕上的 6 位配对码", text: $blePinField)
                 .keyboardType(.numberPad)
+                .focused($blePinFocused)
+                .submitLabel(.done)
+                .onSubmit { blePinFocused = false }
+                .onChange(of: blePinField) { _, newValue in
+                    if newValue.count >= 6 { blePinFocused = false }
+                }
                 .font(.title3.monospaced())
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
