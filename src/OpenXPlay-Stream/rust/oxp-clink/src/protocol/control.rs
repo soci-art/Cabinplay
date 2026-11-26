@@ -51,6 +51,28 @@ pub fn display(body: &[u8], fallback: &DisplayInfo) -> Result<DisplayInfo> {
         fullscreen_preferred: None,
     })
 }
+/// Video display (visible) size the head unit declares in fields 5/6 of the
+/// same configuration body `display` parses (UCarProto GetUCarConfig:
+/// 2/3 = screenWidth/Height, 5/6 = videoDisplayWidth/Height). The raw UIBC
+/// touch coordinates live in the screen's surface space; the video only
+/// occupies this visible sub-rectangle, so touch normalization needs both
+/// sizes (see uibc.rs). None when either field is absent or out of range.
+pub fn video_display(body: &[u8]) -> Result<Option<(u32, u32)>> {
+    let f = Fields::decode(body)?;
+    let value = |id| -> Result<Option<u32>> {
+        if f.0.contains_key(&id) {
+            let n = f.number(id)?;
+            Ok(if (1..=16384).contains(&n) {
+                Some(n as u32)
+            } else {
+                None
+            })
+        } else {
+            Ok(None)
+        }
+    };
+    Ok(value(5)?.zip(value(6)?))
+}
 /// Head-unit display assumed until the head unit reports its own; Carlink sinks run at 30 FPS.
 pub fn head_unit_fallback_display() -> DisplayInfo {
     DisplayInfo {

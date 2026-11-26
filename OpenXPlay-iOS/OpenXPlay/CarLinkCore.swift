@@ -127,6 +127,35 @@ final class CarLinkCore {
         return code == 0
     }
 
+    /// 登记主流媒体音频格式（AAC-LC）：必须先于该流的音频包调用。核心只
+    /// 收 48000 Hz/2 声道、config 恰为 [0x11, 0x90] 的格式，其余会被核心
+    /// 以 unsupported_media_audio 诊断丢弃。
+    @discardableResult
+    func pushAudioFormat(stream: UInt32, sampleRate: UInt32, channels: UInt32, config: Data) -> Bool {
+        guard running else { return false }
+        let code = config.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else {
+                return clink_push_audio_format(stream, sampleRate, channels, nil, 0)
+            }
+            return clink_push_audio_format(stream, sampleRate, channels,
+                                           base.assumingMemoryBound(to: UInt8.self), config.count)
+        }
+        return code == 0
+    }
+
+    /// 把一个裸 AAC 访问单元（不带 ADTS 头，核心自己加）推给车机。
+    /// pts 与视频帧共用同一条单调时间线（微秒）。
+    @discardableResult
+    func pushAudioPacket(stream: UInt32, data: Data, ptsMicros: Int64) -> Bool {
+        guard running, !data.isEmpty else { return false }
+        let code = data.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return -99 }
+            return clink_push_audio_packet(stream, base.assumingMemoryBound(to: UInt8.self),
+                                            data.count, ptsMicros)
+        }
+        return code == 0
+    }
+
     private func handleState(_ value: UInt16) {
         let state = State(rawValue: value) ?? .ended
         if state == .ended || state == .idle { running = false }

@@ -37,6 +37,13 @@ int32_t clink_push_config(uint32_t screen, uint32_t codec,
                           const uint8_t *config, size_t length, double fps);
 int32_t clink_push_frame(uint32_t screen, const uint8_t *bytes, size_t length,
                          int64_t pts_us, int32_t key_frame);
+/* Media audio (AAC-LC): register the format once per stream, then push raw
+ * access units (no ADTS header) with pts on the video timeline. */
+int32_t clink_push_audio_format(uint32_t stream, uint32_t sample_rate,
+                                uint32_t channels, const uint8_t *config,
+                                size_t length);
+int32_t clink_push_audio_packet(uint32_t stream, const uint8_t *bytes,
+                                size_t length, int64_t pts_us);
 int32_t clink_stop(void);
 int32_t clink_is_running(void);
 

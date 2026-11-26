@@ -21,8 +21,8 @@ use oxp_clink::{
     StaticClinkLink, TrustStore,
 };
 use oxp_core::model::{
-    ControlEvent, Origin, OutputCapabilities, OutputHost, OutputStats, SessionPhase, SessionState,
-    VideoCodec, VideoFormat, VideoFrame,
+    AudioCodec, AudioFormat, AudioPacket, AudioRole, ControlEvent, Origin, OutputCapabilities,
+    OutputHost, OutputStats, SessionPhase, SessionState, VideoCodec, VideoFormat, VideoFrame,
 };
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
@@ -538,6 +538,65 @@ pub extern "C" fn clink_push_frame(
         pts_us,
         key_frame: key_frame != 0,
         received_at_nanos: 0,
+    });
+    0
+}
+
+/// Register the media audio format (AAC-LC) for a stream, mirroring
+/// clink_push_config's role for video: call before pushing packets for the
+/// stream. The core only accepts AAC-LC 48000 Hz / 2ch with config
+/// [0x11, 0x90]; anything else is rejected inside the core with an
+/// `unsupported_media_audio` diagnostic. Session is fixed to 1, aligned
+/// with the video path (see clink_push_config).
+#[no_mangle]
+pub extern "C" fn clink_push_audio_format(
+    stream: u32,
+    sample_rate: u32,
+    channels: u32,
+    config: *const u8,
+    length: usize,
+) -> i32 {
+    let Some(running) = running().lock().unwrap().clone() else { return -1 };
+    let config = if config.is_null() || length == 0 {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(config, length) };
+        Some(Arc::from(bytes.to_vec().into_boxed_slice()))
+    };
+    running.output.on_audio_format(
+        stream,
+        Some(Arc::new(AudioFormat {
+            stream,
+            role: AudioRole::Media,
+            codec: AudioCodec::AacLc,
+            sample_rate,
+            channels,
+            config,
+        })),
+    );
+    0
+}
+
+/// Push one raw AAC access unit (no ADTS header; the core adds it) for a
+/// previously registered media stream. pts_us must share the video
+/// timeline (microseconds from the same monotonic start).
+#[no_mangle]
+pub extern "C" fn clink_push_audio_packet(
+    stream: u32,
+    data: *const u8,
+    length: usize,
+    pts_us: i64,
+) -> i32 {
+    let Some(running) = running().lock().unwrap().clone() else { return -1 };
+    if data.is_null() || length == 0 {
+        return -2;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, length) };
+    running.output.on_audio_packet(AudioPacket {
+        stream,
+        session: 1,
+        data: Arc::from(bytes.to_vec().into_boxed_slice()),
+        pts_us,
     });
     0
 }

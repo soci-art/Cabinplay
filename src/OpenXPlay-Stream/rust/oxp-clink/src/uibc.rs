@@ -18,6 +18,13 @@ pub struct UibcDecoder {
     active: Vec<(u32, u8, (f64, f64))>,
     last_view_size: Option<(u32, u32)>,
     on_view_size: Option<Box<dyn Fn(u32, u32) + Send + Sync>>,
+    on_diagnostic: Option<Box<dyn Fn(String) + Send + Sync>>,
+    /// Head-unit geometry from the CONTROL configuration: surface (screen)
+    /// size from fields 2/3 and the visible video display size from 5/6.
+    display_surface: Option<(u32, u32)>,
+    display_visible: Option<(u32, u32)>,
+    anchor_reported: bool,
+    touch_anchor_reported: bool,
 }
 impl UibcDecoder {
     pub fn new(origin: Origin) -> Self {
@@ -28,6 +35,11 @@ impl UibcDecoder {
             active: Vec::new(),
             last_view_size: None,
             on_view_size: None,
+            on_diagnostic: None,
+            display_surface: None,
+            display_visible: None,
+            anchor_reported: false,
+            touch_anchor_reported: false,
         }
     }
     pub fn with_trace(mut self, trace: Arc<dyn ClinkTrace>, session: u64) -> Self {
@@ -61,6 +73,64 @@ impl UibcDecoder {
     ) -> Self {
         self.on_view_size = Some(Box::new(on_view_size));
         self
+    }
+    pub fn with_diagnostic(
+        mut self,
+        on_diagnostic: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_diagnostic = Some(Box::new(on_diagnostic));
+        self
+    }
+    fn diagnostic(&self, message: String) {
+        if let Some(report) = &self.on_diagnostic {
+            report(message);
+        }
+    }
+    /// Feed the head-unit geometry declared in the CONTROL configuration:
+    /// `surface` is the screen size (fields 2/3), `visible` the video
+    /// display size (fields 5/6). The first time a visible size shows up,
+    /// one anchor line goes to the diagnostic channel so a device log can
+    /// be checked against the correction that will be applied.
+    pub fn set_display_geometry(
+        &mut self,
+        surface: (u32, u32),
+        visible: Option<(u32, u32)>,
+    ) {
+        if surface.0 > 0 && surface.1 > 0 {
+            self.display_surface = Some(surface);
+        }
+        if let Some(visible) = visible {
+            if visible.0 > 0 && visible.1 > 0 {
+                self.display_visible = Some(visible);
+            }
+        }
+        if !self.anchor_reported {
+            if let (Some(s), Some(v)) = (self.display_surface, self.display_visible) {
+                self.anchor_reported = true;
+                let drift_x = (s.0 as f64 - v.0 as f64) / 2.0;
+                let drift_y = (s.1 as f64 - v.1 as f64) / 2.0;
+                self.diagnostic(format!(
+                    "触控定锚：车机声明 screen {}×{}，videoDisplay {}×{}，校正 drift X {drift_x:.1}、Y {drift_y:.1}（原始坐标先减 drift 再按 videoDisplay 归一化；两尺寸相同则不校正、与旧行为一致）",
+                    s.0, s.1, v.0, v.1
+                ));
+            }
+        }
+    }
+    /// Normalize one raw coordinate. CarWith (the head unit's reference
+    /// host) corrects every touch as `(raw - drift) * scale` with
+    /// `drift = (surface - visible) / 2` per axis, because raw coordinates
+    /// live in the head unit's screen space while the video occupies only
+    /// the visible sub-rectangle. Fallback semantics are strict: without a
+    /// trustworthy visible size, or when it equals the surface on this
+    /// axis, the result is exactly the legacy `raw / stream_size`.
+    fn correct(raw: i64, stream: u32, surface: Option<u32>, visible: Option<u32>) -> f64 {
+        if let (Some(s), Some(v)) = (surface, visible) {
+            if s > 0 && v > 0 && v != s {
+                let drift = (s as f64 - v as f64) / 2.0;
+                return ((raw as f64 - drift) / v as f64).clamp(0.0, 1.0);
+            }
+        }
+        (raw as f64 / stream as f64).clamp(0.0, 1.0)
     }
     fn report_view_size(&mut self, size: Option<(u32, u32)>) {
         if size.is_none() || size == self.last_view_size {
@@ -175,6 +245,12 @@ impl UibcDecoder {
         )?;
         let (w, h) = stream_size;
         require(w > 0 && h > 0, "invalid_video_size")?;
+        // Touch geometry: the correction pair is the head unit's own
+        // CONTROL declaration — surface from fields 2/3, visible from
+        // fields 5/6. The message's own width/height is only the view
+        // report (see report_view_size); it never feeds the correction.
+        let surface = self.display_surface;
+        let visible = self.display_visible;
         let mut points = Vec::new();
         for n in 0..count {
             let track = number(&format!("trackID{n}"), None)?;
@@ -183,8 +259,22 @@ impl UibcDecoder {
                     && !points.iter().any(|(t, _)| *t == track as u32),
                 "invalid_uibc_track",
             )?;
-            let x = (number(&format!("x{n}"), None)? as f64 / w as f64).clamp(0.0, 1.0);
-            let y = (number(&format!("y{n}"), None)? as f64 / h as f64).clamp(0.0, 1.0);
+            let raw_x = number(&format!("x{n}"), None)?;
+            let raw_y = number(&format!("y{n}"), None)?;
+            let x = Self::correct(raw_x, w, surface.map(|s| s.0), visible.map(|v| v.0));
+            let y = Self::correct(raw_y, h, surface.map(|s| s.1), visible.map(|v| v.1));
+            if n == 0 && !self.touch_anchor_reported {
+                self.touch_anchor_reported = true;
+                self.diagnostic(format!(
+                    "触控定锚：第一笔触控原始坐标 ({raw_x}, {raw_y})，校正后归一化 ({x:.4}, {y:.4})（触控面 {}，videoDisplay {}）",
+                    surface
+                        .map(|s| format!("{}×{}", s.0, s.1))
+                        .unwrap_or_else(|| "未知".into()),
+                    visible
+                        .map(|v| format!("{}×{}", v.0, v.1))
+                        .unwrap_or_else(|| "未知".into()),
+                ));
+            }
             points.push((track as u32, (x, y)));
         }
         let trace_points = if self.trace.is_some() {
@@ -279,4 +369,86 @@ pub fn key(android_code: u16, action: u8, origin: Origin) -> Result<Option<Contr
             origin,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin() -> Origin {
+        Origin {
+            output_id: "test".into(),
+            client_id: "hu".into(),
+        }
+    }
+
+    fn touch_body(x: i64, y: i64, view: Option<(u32, u32)>) -> Vec<u8> {
+        let view = match view {
+            Some((w, h)) => format!(r#","width":{w},"height":{h}"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"type":1,"count":1,"action":0,"trackID0":7,"x0":{x},"y0":{y}{view}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn first_contact(event: Option<ControlEvent>) -> (f64, f64) {
+        match event {
+            Some(ControlEvent::Touch { contacts, .. }) => {
+                assert_eq!(contacts.len(), 1);
+                (contacts[0].x, contacts[0].y)
+            }
+            other => panic!("expected a touch event, got {other:?}"),
+        }
+    }
+
+    /// CarWith's correction: drift = (surface - visible) / 2 per axis,
+    /// normalized = (raw - drift) / visible. X axis has surface == visible
+    /// here, so it must stay on the legacy path.
+    #[test]
+    fn drift_correction_matches_carwith_formula() {
+        let mut decoder = UibcDecoder::new(origin());
+        decoder.set_display_geometry((1920, 1080), Some((1920, 960)));
+        let body = touch_body(960, 540, Some((1920, 1080)));
+        let (x, y) = first_contact(decoder.decode(&body, (1920, 1080)).unwrap());
+        assert_eq!(x, 960.0 / 1920.0);
+        assert_eq!(y, (540.0 - 60.0) / 960.0);
+    }
+
+    /// A differing view report in the message must not engage the
+    /// correction: only the CONTROL pair (2/3 vs 5/6) counts. This mirrors
+    /// the transport test where the head unit reports several view sizes
+    /// while its declared screen and video display sizes are equal.
+    #[test]
+    fn message_view_size_does_not_engage_correction() {
+        let mut decoder = UibcDecoder::new(origin());
+        decoder.set_display_geometry((1532, 1013), Some((1532, 1013)));
+        let body = touch_body(640, 360, Some((1814, 1200)));
+        let (x, y) = first_contact(decoder.decode(&body, (1280, 720)).unwrap());
+        assert_eq!(x, 640.0 / 1280.0);
+        assert_eq!(y, 360.0 / 720.0);
+    }
+
+    /// No geometry at all: output must be bitwise the legacy raw/stream.
+    #[test]
+    fn no_geometry_is_legacy_behavior() {
+        let mut decoder = UibcDecoder::new(origin());
+        let body = touch_body(333, 111, None);
+        let (x, y) = first_contact(decoder.decode(&body, (1280, 720)).unwrap());
+        assert_eq!(x, 333.0 / 1280.0);
+        assert_eq!(y, 111.0 / 720.0);
+    }
+
+    /// Visible == surface (the UNI-V geometry measured on device): the
+    /// correction must not engage, output stays the legacy raw/stream.
+    #[test]
+    fn equal_sizes_do_not_engage_correction() {
+        let mut decoder = UibcDecoder::new(origin());
+        decoder.set_display_geometry((1280, 720), Some((1280, 720)));
+        let body = touch_body(640, 360, Some((1280, 720)));
+        let (x, y) = first_contact(decoder.decode(&body, (1280, 720)).unwrap());
+        assert_eq!(x, 640.0 / 1280.0);
+        assert_eq!(y, 360.0 / 720.0);
+    }
 }

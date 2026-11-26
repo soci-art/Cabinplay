@@ -32,6 +32,21 @@ final class VideoDecoder {
     /// 上层据此置「已出画」——收到 AU 不算，送入显示层才算（原版口径）。
     var onFirstFrameEnqueued: (() -> Void)?
 
+    /// 画中画内容源：当前托管的显示层（与 CarWithin 原版 H264Surface 的
+    /// pictureInPictureLayer 同义）。预览视图已从界面移除、显示层在根层
+    /// 离屏承接，画中画就以这一层为源头。
+    var pictureInPictureLayer: AVSampleBufferDisplayLayer { layer }
+
+    /// 画中画就绪判断（照原版 H264Surface 的条件组）：有格式、非等关键
+    /// 帧、渲染器健康、层已挂进视图层级；17.4+ 再看 isReadyForDisplay，
+    /// 更早系统以已入队首帧为准。
+    var isReadyForPictureInPicture: Bool {
+        guard format != nil, !awaitingKeyframe, !rendererNeedsRecovery,
+              layer.superlayer != nil else { return false }
+        if #available(iOS 17.4, *) { return layer.isReadyForDisplay }
+        return hasEnqueuedFrame
+    }
+
     private var format: CMVideoFormatDescription?
     private var codec: UInt32 = 1
     private var pending: [(CMSampleBuffer, Int)] = []

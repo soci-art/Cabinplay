@@ -46,6 +46,19 @@ final class LocalCarPlaySession: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
+    /// 本轮会话是否真正连上过（控制连接建立过）：会话结束时据此落
+    /// 「下次连接前先轮换 deviceID」标记（见 preRotationPending）。
+    private var connectedThisSession = false
+
+    /// 预轮换标记（持久化）：会话真正连上过又结束时落下；下次点「连接
+    /// 车机」时上层先轮换 deviceID 再发起，跳过注定失败的同身份等待；
+    /// 新会话连上后由 onControlConnected 清除。存在的原因：系统侧的
+    /// 会话记录在一轮会话真正跑过又结束后会楔住，同身份再发起不回连，
+    /// 换个新身份等于新车、天然没有那本旧账。
+    static var preRotationPending: Bool {
+        get { UserDefaults.standard.bool(forKey: "cabinplay.preRotateDeviceID") }
+        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.preRotateDeviceID") }
+    }
     /// 本轮会话启动时绑定的本机地址（入网切网后上层据此判断要不要重开会话）。
     private(set) var boundAddress: String?
     /// 首个画面样本真正送入本机显示层的时刻（「已出画」的判定点，原版口径）。
@@ -436,6 +449,11 @@ final class LocalCarPlaySession: ObservableObject {
 
     /// 所有停止路径统一走这里并打明原因，别再出现无原因的「已停止」。
     func stop(reason: String = "用户手动停止") {
+        // 真正连上过的会话结束：落预轮换标记，下次连接先换新身份。
+        if connectedThisSession {
+            Self.preRotationPending = true
+        }
+        connectedThisSession = false
         pendingSSIDStart = nil
         addressWatch?.cancel()
         addressWatch = nil
@@ -495,6 +513,9 @@ final class LocalCarPlaySession: ObservableObject {
         receiver.onControlConnected = { [weak self] in
             guard let self else { return }
             self.controlConnected = true
+            self.connectedThisSession = true
+            // 新会话已连上：预轮换标记完成使命，清掉。
+            Self.preRotationPending = false
             self.phase = .negotiating
             self.sameDevice.didConnectControl()
         }
@@ -510,6 +531,10 @@ final class LocalCarPlaySession: ObservableObject {
             // 注意：收到 AU 不等于出画（32 字节的配置包也走这里）。「已出画」
             // 改由预览显示层首帧 enqueue 成功后经 previewDidDisplayFirstFrame 置位。
             self.bridge.append(data, codec: codec)
+        }
+        receiver.onEncodedAudio = { [weak self] stream, samples, stamp, format in
+            self?.bridge.appendAudio(stream: stream, samples: samples,
+                                     hostMicros: stamp, format: format)
         }
         receiver.onVideo = { [weak self] data, codec in
             guard let self else { return }

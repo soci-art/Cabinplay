@@ -36,6 +36,9 @@ final class NativeReceiver {
     var onListening: ((UInt16) -> Void)?
     var onControlConnected: (() -> Void)?
     var onVideo: ((Data, VideoCodec) -> Void)?
+    /// 主流（102）编码音频帧 tap：裸 AAC 访问单元 + 主机微秒时间戳 + 格式。
+    /// 由媒体会话转出，给音频桥送车机用；本机扬声器播放不走这里。
+    var onEncodedAudio: ((Int, Data, UInt64, ReceiverAudioFormat) -> Void)?
     /// Queue-confined raw access-unit fan-out (no main-thread hop, no local-display
     /// throttling). The clink bridge consumes from here.
     var onVideoAccessUnit: ((Data, VideoCodec) -> Void)?
@@ -277,6 +280,9 @@ final class NativeReceiver {
                 let media = CarPlayMediaSession(queue: queue, secret: secret, peerAddress: state.peerAddress,
                                                 audioEnabled: configuration.audioEnabled, hevc: configuration.videoCodec == .h265)
                 media.onLog = { [weak self] in self?.log($0) }
+                media.onEncodedAudio = { [weak self] stream, samples, stamp, format in
+                    self?.onEncodedAudio?(stream, samples, stamp, format)
+                }
                 if let nightMode { media.setNightMode(nightMode) }
                 media.onVideo = { [weak self] data, codec in
                     guard let self else { return }

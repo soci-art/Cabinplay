@@ -58,6 +58,9 @@ final class LocalCarPlayBridge {
                 self.clinkPlaying = false
                 self.pushedFrames = 0
                 self.clockStart = nil
+                self.audioFormatKey = nil
+                self.audioPacketsPushed = 0
+                self.audioPushFailures = 0
             }
         }
     }
@@ -131,6 +134,57 @@ final class LocalCarPlayBridge {
         } else {
             configPushFailures += 1
             onLog?("帧桥：解码配置推送没成功（第 \(configPushFailures) 次），随后续帧继续重试，不再等参数集变化")
+        }
+    }
+
+    // MARK: 音频桥（主流 AAC tap → 车机核心，与视频共用一条时间线）
+
+    private var audioFormatKey: String?
+    private var audioPacketsPushed = 0
+    private var audioPushFailures = 0
+
+    /// 接收端 tap 到的主流 AAC 帧。hostMicros 是 CarPlayAudio 的
+    /// browserTimestamp（主机开机单调时钟微秒），喂核心前必须换算到
+    /// 视频帧共用的桥时间线（自 clockStart 起算的微秒）：核心用同一个
+    /// offset 把音视频一起映射到传输时钟，两边 epoch 不一致声音会被
+    /// 核心队列压住丢掉。本机扬声器播放是另一条路，这里只是多喂一份。
+    func appendAudio(stream: Int, samples: Data, hostMicros: UInt64, format: ReceiverAudioFormat) {
+        queue.async { [weak self] in
+            guard let self, self.clinkPlaying, format.isAAC else { return }
+            if self.clockStart == nil { self.clockStart = DispatchTime.now() }
+            let epochMicros = (self.clockStart?.uptimeNanoseconds ?? 0) / 1000
+            let ptsMicros = max(0, Int64(hostMicros) - Int64(epochMicros))
+            let key = "\(stream)/\(format.sampleRate)/\(format.channels)"
+            if self.audioFormatKey != key {
+                self.audioFormatKey = key
+                // 解码 cookie 与 CarPlayAudio 解码器用的是同一组值；核心
+                // 的硬门槛是 48k 的 [0x11, 0x90]。
+                let cookie = Data(format.sampleRate == 44100 ? [0x12, 0x10] : [0x11, 0x90])
+                let ok = CarLinkCore.shared.pushAudioFormat(
+                    stream: UInt32(stream), sampleRate: UInt32(format.sampleRate),
+                    channels: UInt32(format.channels), config: cookie)
+                if format.sampleRate == 48000 {
+                    onLog?("音频桥：主流声音格式已登记给车机核心（AAC-LC 48000 Hz / \(format.channels) 声道），声音开始多喂一份去车机")
+                } else {
+                    onLog?("音频桥：主流声音是 \(format.sampleRate) Hz，核心只收 48000 Hz——这轮声音多半送不到车机（核心会报 unsupported_media_audio）")
+                }
+                if !ok {
+                    onLog?("音频桥：音频格式登记被拒（CarLink 没在跑？），后续声音包继续试")
+                }
+            }
+            if CarLinkCore.shared.pushAudioPacket(stream: UInt32(stream), data: samples, ptsMicros: ptsMicros) {
+                audioPacketsPushed += 1
+                if audioPacketsPushed == 1 {
+                    onLog?("音频桥：首个声音包已喂给车机核心（\(samples.count) 字节）")
+                } else if audioPacketsPushed % 500 == 0 {
+                    onLog?("音频桥：已向车机喂第 \(audioPacketsPushed) 个声音包（累计被拒 \(audioPushFailures) 次）")
+                }
+            } else {
+                audioPushFailures += 1
+                if audioPushFailures == 1 || audioPushFailures % 300 == 0 {
+                    onLog?("音频桥：声音包被拒（第 \(audioPushFailures) 次）——核心没在出画状态或格式没登记上")
+                }
+            }
         }
     }
 }

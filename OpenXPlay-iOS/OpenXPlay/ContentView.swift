@@ -45,10 +45,6 @@ struct VideoSurface: UIViewRepresentable {
         let view = PreviewHostView()
         view.backgroundColor = .black
         decoder.attachLayer(view.displayLayer)
-        view.onWindowChange = { [weak decoder] inWindow in
-            decoder?.logHostWindow(inWindow)
-        }
-        decoder.logHostGeometry(bounds: view.bounds)
         return view
     }
 
@@ -56,7 +52,6 @@ struct VideoSurface: UIViewRepresentable {
         if decoder.layer !== view.displayLayer {
             decoder.attachLayer(view.displayLayer)
         }
-        decoder.logHostGeometry(bounds: view.bounds)
     }
 }
 
@@ -66,7 +61,6 @@ struct ContentView: View {
     @State private var decoder = VideoDecoder()
     @State private var log: [String] = []
     @State private var tab = 0
-    @State private var hasVideo = false
     @State private var blePin = ""
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
@@ -93,6 +87,14 @@ struct ContentView: View {
     @State private var localRetryWork: DispatchWorkItem?
     @State private var localRetryGeneration = 0
     @State private var localAttemptCount = 0
+    /// 本轮连接内是否已用过身份轮换（同身份重试用尽后的第二道杠杆）：
+    /// 每轮 arm 时复位，轮换后新身份再走一遍同样的 3 次重试上限。
+    @State private var localRotatedThisFlow = false
+
+    /// 画中画保活（与静音音频保活并存的第二条腿）：懒创建——控制器要在
+    /// 预览托管层接管完成后（首帧时）建，建早了内容源会指着占位层。
+    @State private var pictureInPicture: CarPlayPictureInPicture?
+    @Environment(\.scenePhase) private var scenePhase
 
     // clink 候选真连接试序＋被拒重试（流程内部行为，不受用户点按守卫影响）。
     // 参数：同候选原地重试间隔 2 秒、同候选最多 4 次、单次尝试 8 秒看门狗、
@@ -120,10 +122,7 @@ struct ContentView: View {
                 DashboardView(
                     localPhaseText: localSession.phase.text,
                     localPhaseFailed: localSession.phase.isFailed,
-                    localRunning: localSession.isRunning,
                     localStreaming: localSession.phase == .streaming,
-                    hasVideo: hasVideo,
-                    decoder: decoder,
                     carLinkState: carLinkState,
                     carLinkRunning: carLinkRunning,
                     carLinkStatusText: carLinkStatusText,
@@ -136,7 +135,6 @@ struct ContentView: View {
                     keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
                     selectedSize: targetSize,
-                    onToggleLocalSession: { userToggleLocalSession() },
                     onSelectSize: { setSize($0, $1) },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
@@ -165,6 +163,28 @@ struct ContentView: View {
             .tag(2)
         }
         .tint(.sunsetAccent)
+        // 预览的离屏承接：界面上不再显示本机预览（只看车机屏），但显示层
+        // 本身是帧管线的承重件——首帧入队靠它置「已出画」、出画后保活
+        // 靠它触发、画中画的内容源也是它。所以托管视图保留在根层背景
+        // 里：全尺寸、透明、不可点，层一直在窗口内正常入队渲染，只是不
+        // 给人看。摘掉它帧路会断，勿删。
+        .background {
+            VideoSurface(decoder: decoder)
+                .opacity(0)
+                .allowsHitTesting(false)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .inactive:
+                // 离场兜底：出画时已主动拉起过画中画，这里再给系统一次
+                // 自动拉起的机会（原版 willResignActive 同款兜底）。
+                if localSession.isRunning { pipController()?.awaitAutomaticStart() }
+            case .active:
+                pipController()?.returnedToForeground()
+            default:
+                break
+            }
+        }
         .onAppear {
             bleProbe.onLog = { appendLog($0) }
             bleProbe.onServerInfo = { handleUCarServerInfo($0) }
@@ -178,8 +198,10 @@ struct ContentView: View {
                 localSession.previewNeedsKeyFrame(reason: reason)
             }
             decoder.onFirstFrameEnqueued = {
-                if !hasVideo { hasVideo = true }
                 localSession.previewDidDisplayFirstFrame()
+                // 画中画保活：出画后（与静音保活同一时机）主动拉起一次；
+                // 控制器懒创建，到这一刻托管层早已接管、内容源有效。
+                startPictureInPicture()
             }
             localSession.onPreviewFrame = { data, _ in
                 decoder.append(data, ptsNanos: UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000))
@@ -193,28 +215,36 @@ struct ContentView: View {
 
     private func startLocalSession() {
         decoder.reset()
-        hasVideo = false
         localSession.start(width: targetSize.0, height: targetSize.1, fps: 30)
         if localSession.phase.isFailed {
             Haptics.error()
         }
     }
 
-    private func stopLocalSession(reason: String = "用户在驾驶舱点停") {
+    private func stopLocalSession(reason: String = "流程停止本机 CarPlay 会话") {
+        // 会话停了画中画保活也停（静音保活由会话自己关）。
+        pictureInPicture?.stop()
         localSession.stop(reason: reason)
         decoder.reset()
-        hasVideo = false
     }
 
-    /// 驾驶舱开关是用户手动启停：手动点停要连带取消流程挂着的无回连
-    /// 自动重试，别在用户已经停掉之后又自己发起。
-    private func userToggleLocalSession() {
-        if localSession.isRunning {
-            cancelLocalCallbackRetry()
-            stopLocalSession()
-        } else {
-            startLocalSession()
-        }
+    // MARK: 画中画保活
+
+    /// 懒创建画中画控制器：内容源是解码器的托管显示层，必须等预览视图
+    /// 把层接管过去之后建（onAppear 时序不保证），所以拖到首帧才建。
+    private func pipController() -> CarPlayPictureInPicture? {
+        if let pictureInPicture { return pictureInPicture }
+        let pip = CarPlayPictureInPicture(surface: decoder)
+        pip.onLog = { appendLog($0) }
+        pictureInPicture = pip
+        return pip
+    }
+
+    /// 出画后主动拉起画中画，并打开系统自动拉起（离场时由系统接管）。
+    private func startPictureInPicture() {
+        guard let pip = pipController() else { return }
+        pip.setAutomatic(true)
+        _ = pip.start()
     }
 
     // MARK: 本机 CarPlay 无回连自动重试（连接车机流程专用）
@@ -228,6 +258,7 @@ struct ContentView: View {
     private func armLocalCallbackRetry() {
         localRetryGeneration += 1
         localAttemptCount = 1
+        localRotatedThisFlow = false
         scheduleLocalCallbackCheck(generation: localRetryGeneration)
     }
 
@@ -240,7 +271,22 @@ struct ContentView: View {
                 return
             }
             guard localAttemptCount < 3 else {
-                appendLog("本机 CarPlay：自动重试 3 次都没有回连——这个系统的毛病是：一轮里只要有 CarPlay 会话真正跑过又结束，新的就再也发起不起来，非得重启手机才行。先重启手机，再点一次「连接车机」从头走完")
+                // 同身份 3 次用尽：先走身份轮换这道杠杆——停会话（已完全
+                // 停稳才换，运行中换身份会让同一会话前后不一致）、换新
+                // deviceID、用新身份重新发起，新身份再走同样的 3 次上限。
+                // 系统按 deviceID 记账，换了等于换台新车、没有楔住的旧账。
+                if !localRotatedThisFlow {
+                    localRotatedThisFlow = true
+                    localAttemptCount = 1
+                    appendLog("本机 CarPlay：同身份自动重试 3 次都没有回连——停下会话，换新设备标识再试一轮")
+                    stopLocalSession(reason: "连接车机：换设备标识重试，先停会话")
+                    ReceiverConfiguration.rotatePersistentDeviceID()
+                    appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录），用新身份重新发起")
+                    startLocalSession()
+                    scheduleLocalCallbackCheck(generation: generation)
+                } else {
+                    appendLog("本机 CarPlay：换了新设备标识也重试满 3 次，还是没有回连——这一轮已经换身份重试过了，仍不行就只能重启手机后再点一次「连接车机」")
+                }
                 return
             }
             localAttemptCount += 1
@@ -271,6 +317,13 @@ struct ContentView: View {
     /// 后被接续完成），再入网；地址一切过来按新地址重开接续、重发
     /// StartSession，clink 试序同时开始（见 handleUCarServerInfo）。
     private func connectCarFlow() {
+        // 预轮换：上次会话真正连上过又结束（标记在会话停止时落下），
+        // 系统侧那本旧账多半已经楔住——先换新设备标识再发起，跳过注定
+        // 失败的同身份等待。新会话连上后标记自动清除。
+        if LocalCarPlaySession.preRotationPending {
+            ReceiverConfiguration.rotatePersistentDeviceID()
+            appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录）——上次会话连上过又结束了，这次先换标识再连接")
+        }
         appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
         bleProbe.connect(pin: blePin)
     }
@@ -597,7 +650,7 @@ struct ContentView: View {
                     // 本轮流程刚发起的会话还没回连过：停掉它不占重启
                     // 后的发起机会，留着它只会挂在已作废的凭据上空等。
                     stopLocalSession(reason: "连接车机：入网失败，停掉刚发起的会话")
-                    appendLog("本机 CarPlay：入网失败，刚发起的会话已停掉（它还没回连过，不占发起机会）；手动点「启动 CarPlay」可单独用")
+                    appendLog("本机 CarPlay：入网失败，刚发起的会话已停掉（它还没回连过，不占发起机会）")
                 }
                 // 入网没成 = 这轮车机会话未成立，刚存的凭据一并作废。
                 if LocalCarPlaySession.carCredentialsFresh {

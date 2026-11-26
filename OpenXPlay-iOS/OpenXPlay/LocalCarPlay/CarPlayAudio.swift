@@ -82,6 +82,9 @@ final class CarPlayAudio {
     #endif
     var onLog: ((String) -> Void)?
     var onBrowserAudio: ((AVAudioPCMBuffer, UInt64) -> Void)?
+    /// 编码音频 tap（仅主流 AAC）：在解码前截一份裸 AAC 访问单元与主机
+    /// 微秒时间戳，供音频桥多喂一份给车机；原解码→扬声器路径不动。
+    var onEncodedAudio: ((Data, UInt64) -> Void)?
     init(secret: SymmetricKey, peerAddress: String, connectionID: UInt64, format: ReceiverAudioFormat, microphonePort: UInt16? = nil) throws {
         self.queue = Self.renderQueue; self.connectionID = connectionID; self.format = format
         decoder = try NativeAudioDecoder(format: format)
@@ -104,6 +107,12 @@ final class CarPlayAudio {
             packets += 1
             if let lastTimestamp, Int32(bitPattern: packet.timestamp &- lastTimestamp) <= 0 { latePackets += 1; return }
             lastTimestamp = packet.timestamp
+            // 音频桥 tap：解码前把裸 AAC 访问单元多喂一份出去（送车机），
+            // 时间戳与浏览器音频共用 browserTimestamp 锚点。扬声器路径
+            // 在下面照常走，一行不动。
+            if let onEncodedAudio {
+                onEncodedAudio(packet.samples, browserTimestamp(packet.timestamp, arrival: arrival))
+            }
             guard let buffer = try decoder.decode(packet.samples) else { return }
             if let onBrowserAudio {
                 onBrowserAudio(buffer, browserTimestamp(packet.timestamp, arrival: arrival))

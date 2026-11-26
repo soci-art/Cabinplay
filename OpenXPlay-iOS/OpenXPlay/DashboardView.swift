@@ -1,22 +1,21 @@
 // SPDX-FileCopyrightText: 2026 OpenXPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// 驾驶舱（主页）：一条主线——本机 CarPlay（启动/停止 + 预览）→ 蓝牙连接
-// 车机 → 连接车机 CarLink（纯状态卡）→ 上车状态汇总。CarLink 没有任何
-// 手填表单：车机地址入网后自动推导、本机 IP 实测、配对码只用蓝牙卡的
-// 输入框、热点凭据由蓝牙 ServerInfo 带回静默存下。
+// 驾驶舱（主页）：一条主线——本机 CarPlay（纯状态卡，启停由连接车机
+// 流程自动走、画面只上车机屏）→ 蓝牙连接车机 → 连接车机 CarLink（纯
+// 状态卡）→ 上车状态汇总。CarLink 没有任何手填表单：车机地址入网后
+// 自动推导、本机 IP 实测、配对码只用蓝牙卡的输入框、热点凭据由蓝牙
+// ServerInfo 带回静默存下。
 
 import SwiftUI
 import AVFoundation
 
 struct DashboardView: View {
-    // 本机 CarPlay
+    // 本机 CarPlay（纯状态：启停只由「连接车机」流程自动走，没有手动开关；
+    // 预览也不在这里——画面只上车机屏，本机显示层在根层离屏承接）
     let localPhaseText: String
     let localPhaseFailed: Bool
-    let localRunning: Bool
     let localStreaming: Bool
-    let hasVideo: Bool
-    let decoder: VideoDecoder
     // CarLink（纯状态）
     let carLinkState: CarLinkCore.State
     let carLinkRunning: Bool
@@ -37,7 +36,6 @@ struct DashboardView: View {
     /// 当前生效的分辨率（与 ContentView 的状态实时绑定，菜单打勾用）。
     let selectedSize: (Int, Int)
 
-    let onToggleLocalSession: () -> Void
     let onSelectSize: (Int, Int) -> Void
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
@@ -97,7 +95,7 @@ struct DashboardView: View {
         }
     }
 
-    // MARK: 第一步：本机 CarPlay
+    // MARK: 第一步：本机 CarPlay（纯状态卡）
 
     private var localCarPlayCard: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -112,24 +110,9 @@ struct DashboardView: View {
                 }
             }
 
-            ZStack {
-                VideoSurface(decoder: decoder)
-                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                    .background(Color.black)
-
-                if !hasVideo {
-                    VStack(spacing: 8) {
-                        Image(systemName: "car.fill")
-                            .font(.largeTitle)
-                            .foregroundStyle(.gray)
-                        Text("CarPlay 画面会出现在这里")
-                            .font(.footnote)
-                            .foregroundStyle(.gray)
-                    }
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay(alignment: .bottomTrailing) {
+            HStack {
+                Text("分辨率").font(.footnote.weight(.medium))
+                Spacer()
                 Menu {
                     // Picker 放进 Menu 是系统原生的勾选菜单形态：当前生效
                     // 的那一档自动带勾，且与 selectedSize 实时绑定——切换
@@ -150,7 +133,6 @@ struct DashboardView: View {
                 }
                 .foregroundStyle(.primary)
                 .background(.ultraThinMaterial, in: Capsule())
-                .padding(8)
                 .accessibilityLabel("分辨率")
             }
 
@@ -160,20 +142,7 @@ struct DashboardView: View {
                     .foregroundStyle(.red)
             }
 
-            Button {
-                Haptics.tap()
-                onToggleLocalSession()
-            } label: {
-                Label(localRunning ? "停止 CarPlay" : "启动 CarPlay",
-                      systemImage: localRunning ? "stop.fill" : "play.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(localRunning ? Color.stopRed : Color.sunsetAccent)
-
-            Text("在这台 iPhone 上直接跑出 CarPlay 画面，再送上车机。声音走手机本机出声（也可以用手机蓝牙连车机出声）。")
+            Text("没有手动开关：点蓝牙卡的「连接车机」，CarPlay 会自己跑起来送上车机屏；手机这边不再显示画面，只看车机屏。声音走手机本机出声（也可以用手机蓝牙连车机出声）。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

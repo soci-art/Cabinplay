@@ -900,8 +900,11 @@ impl ClinkSession {
         };
         *origin_slot.lock().unwrap() = Some(origin.clone());
         let listener = self.listener.clone();
+        let diagnostic_listener = self.listener.clone();
         let mut touch = UibcDecoder::new(origin.clone())
-            .with_view_size(move |width, height| listener.view_size(width, height));
+            .with_view_size(move |width, height| listener.view_size(width, height))
+            .with_diagnostic(move |message| diagnostic_listener.diagnostic(&message));
+        let mut audio_anchor: Option<bool> = None;
         if let Some(trace) = &self.options.trace {
             touch = touch.with_trace(trace.clone(), self.trace_session());
         }
@@ -956,6 +959,7 @@ impl ClinkSession {
             readers: BTreeMap::new(),
             ciphers: BTreeMap::new(),
             display: control::head_unit_fallback_display(),
+            video_display: None,
             malformed_records: VecDeque::new(),
             malformed_sensor: 0,
         };
@@ -1053,6 +1057,24 @@ impl ClinkSession {
                             s.media_audio = wfd.audio;
                             s.hevc_enabled = wfd.hevc_enabled();
                         }
+                        // 协商定锚：车机回不回 AAC 决定音频桥开不开。协商
+                        // 消息到达且结果与上次不同才打一行，最后一行就是
+                        // 本会话的结论（iOS 构建没开 trace，只能走这里）。
+                        if (message.body.contains("wfd_video_formats:")
+                            || message.line.starts_with("SETUP "))
+                            && audio_anchor != Some(wfd.audio)
+                        {
+                            audio_anchor = Some(wfd.audio);
+                            self.listener.diagnostic(&format!(
+                                "车机协商音频 media_audio={}（{}）",
+                                wfd.audio,
+                                if wfd.audio {
+                                    "车机接受 AAC 声音，音频桥开启"
+                                } else {
+                                    "车机没接受 AAC 声音，声音送不到车机"
+                                }
+                            ));
+                        }
                         owner.report(&wfd);
                         owner.update_play(&wfd);
                         if let Some(trace) = &self.options.trace {
@@ -1110,6 +1132,10 @@ impl ClinkSession {
                 Some(Event::Bytes(service, bytes)) if service == ports.uibc => {
                     require(owner.certified, "certificate_required")?;
                     for plain in input_cipher.feed(&bytes)? {
+                        touch.set_display_geometry(
+                            (owner.display.width_px, owner.display.height_px),
+                            owner.video_display,
+                        );
                         if let Some(e) = touch.decode(&plain, self.stream_size())? {
                             self.callbacks.control(e);
                         }
@@ -1204,6 +1230,9 @@ struct Owner<'a> {
     readers: BTreeMap<u16, FrameReader>,
     ciphers: BTreeMap<u16, SecureRecord>,
     display: DisplayInfo,
+    /// Video display (visible) size from CONTROL fields 5/6, parsed next to
+    /// `display`; feeds the UIBC touch drift correction.
+    video_display: Option<(u32, u32)>,
     malformed_records: VecDeque<Instant>,
     malformed_sensor: u64,
 }
@@ -1575,6 +1604,7 @@ impl Owner<'_> {
                 24 => {
                     if !body.is_empty() {
                         self.display = control::display(&body, &self.display)?;
+                        self.video_display = control::video_display(&body)?;
                         self.report(wfd);
                     }
                     let mut display = self.display.clone();
@@ -1597,6 +1627,7 @@ impl Owner<'_> {
                         "unexpected_configuration",
                     )?;
                     self.display = control::display(&body, &self.display)?;
+                    self.video_display = control::video_display(&body)?;
                     self.configured = true;
                     self.report(wfd);
                 }
@@ -1889,6 +1920,7 @@ mod tests {
                 .map(|service| (service, SecureRecord::new(&[7; 16]).unwrap()))
                 .collect(),
             display: DisplayInfo::default(),
+            video_display: None,
             malformed_records: VecDeque::new(),
             malformed_sensor: 0,
         }
@@ -2170,6 +2202,7 @@ mod tests {
                 (ports.cert, SecureRecord::new(&key).unwrap()),
             ]),
             display: DisplayInfo::default(),
+            video_display: None,
             malformed_records: VecDeque::new(),
             malformed_sensor: 0,
         };
@@ -2435,6 +2468,7 @@ mod audio_tests {
                 ),
             ]),
             display: DisplayInfo::default(),
+            video_display: None,
             malformed_records: VecDeque::new(),
             malformed_sensor: 0,
         }

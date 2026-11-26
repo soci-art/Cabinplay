@@ -76,7 +76,7 @@ enum CarPlayInfo {
                 (100, "telephony", 0x70000150, 0x70000150),
                 (100, "speechRecognition", 0x20000040, 0x20000040),
                 (101, "default", 0x40008800, 0),
-                (102, "media", 0xc00000, 0)]
+                (102, "media", 0x800000, 0)]
             info["audioFormats"] = profiles.map { type, audioType, output, input -> [String: Any] in
                 var entry: [String: Any] = ["type": type, "audioType": audioType, "audioOutputFormats": output]
                 if input != 0 { entry["audioInputFormats"] = input }

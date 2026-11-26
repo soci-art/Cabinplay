@@ -96,10 +96,30 @@ struct ReceiverConfiguration {
 
     static func persistentDeviceID() -> String {
         if let existing = UserDefaults.standard.string(forKey: "receiverDeviceID") { return existing }
+        let value = makeDeviceID()
+        UserDefaults.standard.set(value, forKey: "receiverDeviceID")
+        return value
+    }
+
+    /// 生成一个新 deviceID（口径与 persistentDeviceID 首次生成完全一致：
+    /// 6 字节随机数、置本地管理位、MAC 格式字符串）。
+    private static func makeDeviceID() -> String {
         var random = [UInt8](repeating: 0, count: 6)
         _ = SecRandomCopyBytes(kSecRandomDefault, random.count, &random)
         random[0] = (random[0] | 2) & 0xfe
-        let value = random.map { String(format: "%02X", $0) }.joined(separator: ":")
+        return random.map { String(format: "%02X", $0) }.joined(separator: ":")
+    }
+
+    /// 轮换 deviceID：生成新值覆写存量，下次会话启动时现取即生效。系统
+    /// 是按 deviceID 给这台「车」记账的（传输注册/iAP2 识别/StartSession
+    /// 都报它），会话记录楔住后换一个新值等于换了台新车——正是去设置
+    /// 里「忽略这辆车」达到的效果。必须在会话完全停止后调用：配置在
+    /// 会话启动时现取（LocalCarPlaySession.beginStart），运行中换不会
+    /// 生效、还会让同一会话前后身份不一致。配对凭据在 Keychain 独立
+    /// 一层，不受影响，pair-verify 照常走。
+    @discardableResult
+    static func rotatePersistentDeviceID() -> String {
+        let value = makeDeviceID()
         UserDefaults.standard.set(value, forKey: "receiverDeviceID")
         return value
     }

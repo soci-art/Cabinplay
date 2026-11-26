@@ -24,6 +24,8 @@ final class CarPlayMediaSession {
     private var videoBytes = 0
     var onLog: ((String) -> Void)?
     var onBrowserAudio: ((Int, AVAudioPCMBuffer, UInt64) -> Void)?
+    /// 编码音频 tap 转出：（流类型，裸 AAC 访问单元，主机微秒时间戳，格式）。
+    var onEncodedAudio: ((Int, Data, UInt64, ReceiverAudioFormat) -> Void)?
     var onVideo: ((Data, VideoCodec) -> Void)?
     init(queue: DispatchQueue, secret: SymmetricKey, peerAddress: String, audioEnabled: Bool, hevc: Bool) {
         self.queue = queue; self.secret = secret; self.peerAddress = peerAddress
@@ -52,6 +54,14 @@ final class CarPlayMediaSession {
                     let output = try CarPlayAudio(secret: secret, peerAddress: peerAddress,
                         connectionID: connectionID.uint64Value, format: format, microphonePort: microphonePort)
                     output.onLog = { [weak self] in self?.onLog?($0) }
+                    // 音频桥只 tap 主流（102）的 AAC：裸帧多喂一份给车机
+                    // 核心，本机扬声器播放保持原样。语音/通话流不走这条。
+                    if type.intValue == 102, format.isAAC {
+                        let streamType = type.intValue
+                        output.onEncodedAudio = { [weak self] samples, stamp in
+                            self?.onEncodedAudio?(streamType, samples, stamp, format)
+                        }
+                    }
                     // Keep calls and Siri on the iPhone; only intended playback goes to LAN viewers.
                     if let onBrowserAudio, !requestsMicrophone, !["telephony", "speechrecognition"].contains(audioType) {
                         let streamType = type.intValue
