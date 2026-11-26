@@ -1255,9 +1255,9 @@ fn media_worker(
                                 .unwrap_or((48000, 2))
                         };
                         let frame_config = oxp_media::AudioSpecificConfig::new(
-                            2,
+                            2u8,
                             media_rate,
-                            media_channels,
+                            media_channels as u8,
                         )?;
                         adts.clear();
                         adts.extend_from_slice(&oxp_media::Adts::build_header(
