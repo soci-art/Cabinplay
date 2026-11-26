@@ -8,6 +8,7 @@
 // 显示。不需要再导入任何文件。
 
 import SwiftUI
+import AVFoundation
 
 struct SettingsView: View {
     // Wi-Fi 名兜底：记住值与授权状态进页时刷新一次；手填保存后即时更新。
@@ -17,6 +18,8 @@ struct SettingsView: View {
     @State private var manualSSID = ""
     @State private var manualPassword = ""
     @State private var manualOpenNetwork = false
+    @State private var audioMode: AudioOutputMode = AudioOutputPolicy.mode
+    @State private var routeText = AudioOutputPolicy.routeSummary
 
     private var manualSSIDTrimmed: String {
         manualSSID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -77,6 +80,27 @@ struct SettingsView: View {
                 Text("启动本机 CarPlay 时要把当前 Wi-Fi 的名字和密码成对报给系统。系统规定读名字需要定位授权；不想给权限，就在这里把名称和密码成对填一次。只填名字、密码空着，系统会以为这是没密码的网络，就不理了——除非它真是开放网络，那就在上面把「没有密码」打开。")
             }
 
+            Section {
+                Picker("声音输出", selection: $audioMode) {
+                    ForEach(AudioOutputMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .onChange(of: audioMode) { _, value in
+                    AudioOutputPolicy.mode = value
+                    routeText = AudioOutputPolicy.routeSummary
+                }
+                HStack {
+                    Text("当前路由")
+                    Spacer()
+                    Text(routeText).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("声音")
+            } footer: {
+                Text(audioMode.detail + " 车机 Carlink 没有音频通道，所以音乐只能走车机蓝牙（A2DP）：先在系统蓝牙里连上这台车，再启动本机 CarPlay。")
+            }
+
             Section("关于") {
                 HStack {
                     Text("版本")
@@ -96,6 +120,8 @@ struct SettingsView: View {
             rememberedSSID = LocalCarPlaySession.rememberedInfraSSID
             rememberedPasswordState = LocalCarPlaySession.passwordStateText(for: rememberedSSID)
             locationStatusText = WiFiNameAccess.authorizationStatusText
+            audioMode = AudioOutputPolicy.mode
+            routeText = AudioOutputPolicy.routeSummary
         }
     }
 }
