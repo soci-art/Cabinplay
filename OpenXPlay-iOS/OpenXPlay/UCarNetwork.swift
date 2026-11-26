@@ -114,7 +114,7 @@ final class UCarNetworkJoiner {
         // 程序化加入：NEHotspotConfiguration（系统会弹确认框，用户点「加入」）。
         onStatus?("入网中：请在系统弹窗里点「加入」连上车机网络")
         onLog?("UCar 入网：请系统加入「\(ssid)」——会弹系统确认框，点「加入」才执行；若报 entitlement 相关错误，说明签名描述文件不带 HotspotConfiguration 能力，改走手动加入")
-        let configuration = NEHotspotConfiguration(ssid: ssid, passphrase: psk ?? "")
+        let configuration = NEHotspotConfiguration(ssid: ssid, passphrase: psk ?? "", isWEP: false)
         configuration.joinOnce = false
         NEHotspotConfigurationManager.shared.apply(configuration) { [weak self] error in
             guard let self, !self.finished else { return }
