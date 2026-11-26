@@ -44,7 +44,8 @@ final class LocalCarPlaySession: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
-    @Published private(set) var firstFrameAt: Date?
+    /// 首个画面样本真正送入本机显示层的时刻（「已出画」的判定点，原版口径）。
+    @Published private(set) var firstDisplayedAt: Date?
 
     var onLog: ((String) -> Void)?
     /// 本机预览帧（已在主线程）：喂 VideoDecoder 显示。
@@ -133,7 +134,7 @@ final class LocalCarPlaySession: ObservableObject {
         receiver.stop()
         phase = .idle
         controlConnected = false
-        firstFrameAt = nil
+        firstDisplayedAt = nil
         previewSets = nil
         onLog?("本机 CarPlay：已停止")
     }
@@ -192,13 +193,8 @@ final class LocalCarPlaySession: ObservableObject {
         }
         receiver.onVideoAccessUnit = { [weak self] data, codec in
             guard let self else { return }
-            if self.firstFrameAt == nil {
-                self.firstFrameAt = Date()
-                DispatchQueue.main.async { [weak self] in
-                    self?.phase = .streaming
-                    self?.onLog?("本机 CarPlay：首帧已到，画面开始流动")
-                }
-            }
+            // 注意：收到 AU 不等于出画（32 字节的配置包也走这里）。「已出画」
+            // 改由预览显示层首帧 enqueue 成功后经 previewDidDisplayFirstFrame 置位。
             self.bridge.append(data, codec: codec)
         }
         receiver.onVideo = { [weak self] data, codec in
@@ -252,6 +248,20 @@ final class LocalCarPlaySession: ObservableObject {
         } else {
             onLog?("车机按键：收到键码 \(code)，暂时没有对应的 CarPlay 动作，先记下")
         }
+    }
+
+    /// 预览显示层把首个画面样本真正 enqueue 成功后由 ContentView 回调：
+    /// 到这一步才置「已出画」（原版口径——首帧送入显示层才算，收到 AU 不算）。
+    func previewDidDisplayFirstFrame() {
+        guard isRunning, firstDisplayedAt == nil else { return }
+        firstDisplayedAt = Date()
+        phase = .streaming
+        onLog?("本机 CarPlay：首帧已送入显示层，画面开始流动")
+    }
+
+    /// 预览显示层解码失败恢复时请求关键帧（接收端内部有节流与多次重试）。
+    func previewNeedsKeyFrame(reason: String) {
+        receiver.requestKeyFrame(reason: "本机预览恢复：\(reason)")
     }
 
     /// CarLink 进入出画时由 ContentView 调用：桥补配置 + 请求关键帧。

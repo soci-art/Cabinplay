@@ -117,8 +117,15 @@ struct ContentView: View {
                 decoder.configure(codec: codec == .h265 ? 2 : 1, config: record)
                 appendLog("本机预览：解码配置已就绪（\(codec.displayName)，\(record.count) 字节）")
             }
-            localSession.onPreviewFrame = { data, _ in
+            decoder.onLog = { appendLog($0) }
+            decoder.onKeyframeNeeded = { reason in
+                localSession.previewNeedsKeyFrame(reason: reason)
+            }
+            decoder.onFirstFrameEnqueued = {
                 if !hasVideo { hasVideo = true }
+                localSession.previewDidDisplayFirstFrame()
+            }
+            localSession.onPreviewFrame = { data, _ in
                 decoder.append(data, ptsNanos: UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000))
             }
             if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }

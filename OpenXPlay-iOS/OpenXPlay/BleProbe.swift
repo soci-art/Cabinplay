@@ -78,8 +78,10 @@ final class BleProbe: NSObject, ObservableObject {
     private var flowCredential: String?
     /// 本轮是不是在用令牌免码连接。
     private var flowUsesToken = false
-    /// ClientInfo 的 type 候选链：先用车机广播版本码原值，无响应依次回落 1003/1002/1001。
+    /// ClientInfo 的 type 候选链（CarWith 口径）：车机版本码 ≥1002 时 [1002, 1001]，否则 [1001]。
     private var clientInfoTypes: [Int] = []
+    /// 写 …101 失败后是否已按 CarWith 口径同值重写过一次（只重写一次）。
+    private var clientInfoWriteRetried = false
     private var clientInfoTypeIndex = 0
     /// 本轮是否已完整走到 ServerInfo（断线自动重连的判定依据）。
     private var sessionEstablished = false
@@ -153,6 +155,7 @@ final class BleProbe: NSObject, ObservableObject {
         flowUsesToken = false
         clientInfoTypes = []
         clientInfoTypeIndex = 0
+        clientInfoWriteRetried = false
         lastServerInfo = nil
         clientInfoWritten = false
         serverInfoSubscribed = false
@@ -353,14 +356,15 @@ final class BleProbe: NSObject, ObservableObject {
     /// 凭据与 type 候选链就位后，真正跑连接流程（输码/令牌共用）。
     private func beginFlow(peripheral: CBPeripheral, credentialDescription: String) {
         clientInfoWritten = false
-        // type 候选链：广播版本码原值打头，之后依次回落 1003/1002/1001（去重保序）。
-        var chain: [Int] = [foundVersionCode ?? 1005, 1003, 1002, 1001]
-        var seen = Set<Int>()
-        chain = chain.filter { seen.insert($0).inserted }
-        clientInfoTypes = chain
+        clientInfoWriteRetried = false
+        // type 候选链（CarWith y8/h.java M() 口径）：type 是手机声明的协议代际，
+        // 只可能取 1002 或 1001——车机广播版本码 ≥1002 先发 1002，无响应回落 1001；
+        // 版本码不到 1002 就只发 1001。绝不发广播码原值或 1003（取值域外，车机会整包丢弃）。
+        clientInfoTypes = (foundVersionCode ?? 0) >= 1002 ? [1002, 1001] : [1001]
+        let chain = clientInfoTypes
         clientInfoTypeIndex = 0
         flowPhase = .connecting
-        log("UCar 连接：开始连接流程，车机 deviceId \(foundDeviceId ?? "?")，\(credentialDescription)；ClientInfo 的 type 候选链 \(chain.map { String($0) }.joined(separator: " → "))（无响应自动往后换）")
+        log("UCar 连接：开始连接流程，车机 deviceId \(foundDeviceId ?? "?")，\(credentialDescription)；ClientInfo 的 type 候选链 \(chain.map { String($0) }.joined(separator: " → "))（CarWith 口径：只发 1002/1001，10 秒无响应往后换）")
         let readyNow = peripheral.state == .connected && charClientInfo != nil
             && (serverInfoSubscribed || serverInfoNotifyRequested)
         log("UCar 连接：点连接时状态——蓝牙 \(peripheral.state == .connected ? "已连" : "未连（state=\(peripheral.state.rawValue)）")，…101 特征 \(charClientInfo != nil ? "已发现" : "未发现")，…102 订阅 \(serverInfoSubscribed ? "已确认" : (serverInfoNotifyRequested ? "已请求未确认" : "未订阅"))；\(readyNow ? "条件已齐，立即写 ClientInfo" : "等蓝牙连上/特征发现/订阅就绪后写")")
@@ -431,7 +435,7 @@ final class BleProbe: NSObject, ObservableObject {
             return
         }
         if !serverInfoSubscribed {
-            log("UCar 连接：…102 订阅确认回调还没回来，但通知已请求过，不再等回调，直接写 ClientInfo")
+            log("UCar 连接：按「先写 ClientInfo、订阅请求紧随其后」的顺序写（不等 …102 订阅确认，避免 CCCD 确认把写入堵死）")
         }
         clientInfoWritten = true
         writeWatchdog?.cancel()
@@ -451,6 +455,7 @@ final class BleProbe: NSObject, ObservableObject {
             log("UCar 连接：注意 ClientInfo 有 \(data.count) 字节，超过单次可写长度 \(peripheral.maximumWriteValueLength(for: .withResponse))，写可能失败")
         }
         peripheral.writeValue(data, for: char, type: .withResponse)
+        log("UCar 连接：…101 写请求已发出（withResponse），等写回执——回执到了才算真写到了车机")
         flowPhase = .waitingServerInfo
         startServerInfoTimeout()
     }
@@ -460,11 +465,12 @@ final class BleProbe: NSObject, ObservableObject {
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.flowCredential != nil else { return }
             if case .gotServerInfo = self.flowPhase { return }
-            // type 回落链：当前 type 等了 20 秒没等到 ServerInfo，换下一个候选重写。
+            // type 回落链：当前 type 等了 10 秒没等到 ServerInfo，换下一个候选重写。
+            // 每档只等 10 秒，是为了整条链赶在车机约 30 秒的会话看门狗清连接之前走完。
             if self.clientInfoTypeIndex + 1 < self.clientInfoTypes.count {
                 self.clientInfoTypeIndex += 1
                 let next = self.clientInfoTypes[self.clientInfoTypeIndex]
-                self.log("UCar 连接：type=\(self.clientInfoTypes[self.clientInfoTypeIndex - 1]) 写完 20 秒没等到 ServerInfo，自动换 type=\(next) 重写 ClientInfo（候选 \(self.clientInfoTypeIndex + 1)/\(self.clientInfoTypes.count)）")
+                self.log("UCar 连接：type=\(self.clientInfoTypes[self.clientInfoTypeIndex - 1]) 写完 10 秒没等到 ServerInfo，自动换 type=\(next) 重写 ClientInfo（候选 \(self.clientInfoTypeIndex + 1)/\(self.clientInfoTypes.count)）")
                 self.clientInfoWritten = false
                 self.flowPhase = .writingClientInfo
                 self.maybeWriteClientInfo()
@@ -474,7 +480,7 @@ final class BleProbe: NSObject, ObservableObject {
             self.log("UCar 连接：type 候选链 \(self.clientInfoTypes.map { String($0) }.joined(separator: "/")) 全部试完都没等到 …102 的 ServerInfo——可能配对码不对、车机没认，或车机要先在屏幕上确认。把车机屏幕情况和这份日志一起发回来看")
         }
         serverInfoTimeout = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: item)
     }
 
     /// 组装 ClientInfo（字段依据 BLE-SPEC §4.1）。credential 是配对码或已存令牌。
@@ -492,35 +498,52 @@ final class BleProbe: NSObject, ObservableObject {
         } else {
             notes.append("UCar 连接：ClientInfo 的 mac 用此前生成的替代地址 \(mac)（iOS 取不到真 MAC）")
         }
-        // type：候选链当前值（广播版本码原值打头，无响应依次回落 1003/1002/1001）。
+        // type：候选链当前值（CarWith 口径只发 1002/1001，见 beginFlow 的链构造）。
         let typeValue = clientInfoTypes.indices.contains(clientInfoTypeIndex)
-            ? clientInfoTypes[clientInfoTypeIndex] : (foundVersionCode ?? 1001)
-        notes.append("UCar 连接：ClientInfo 的 type 填 \(typeValue)（候选链第 \(clientInfoTypeIndex + 1)/\(max(clientInfoTypes.count, 1)) 个；广播码原值打头，安卓样本代际为 1001/1002/1003）")
+            ? clientInfoTypes[clientInfoTypeIndex]
+            : (((foundVersionCode ?? 0) >= 1002) ? 1002 : 1001)
+        notes.append("UCar 连接：ClientInfo 的 type 填 \(typeValue)（候选链第 \(clientInfoTypeIndex + 1)/\(max(clientInfoTypes.count, 1)) 个；CarWith 口径只发 1002/1001——车机版本码 ≥1002 先 1002、无响应回落 1001）")
         if flowUsesToken {
             notes.append("UCar 连接：本轮用已存令牌免码连接，pinCodeOrAuthentication 填的是令牌（共 \(credential.count) 位）")
         }
         // manufactures：照安卓样本填 Xiaomi，最大化车机接受概率。
         notes.append("UCar 连接：ClientInfo 的 manufactures 照样本填 \"Xiaomi\"（不是真厂商名，是为了让车机按样本路径走）")
-        // channel：未连 Wi-Fi/取不到信道时填 0。
-        notes.append("UCar 连接：ClientInfo 的 channel 填 0（取不到当前 Wi-Fi 信道）")
+        // band：CarWith 口径——手机支持 5 GHz 即填 1（iPhone 全系支持）。
+        let band = 1
+        // channel：CarWith L() 按当前 Wi-Fi 频率换算信道；iOS 没有取当前 Wi-Fi
+        // 频率/信道的公开接口，算不出时按 L() 的回落规则：band=1 → 36，band≠1 → 1。
+        // L() 的取值域里没有 0，绝不填 0（非法值可能被车机整包丢弃）。
+        let channel = band == 1 ? 36 : 1
+        notes.append("UCar 连接：ClientInfo 的 channel 填 \(channel)（iOS 取不到当前 Wi-Fi 信道，按 CarWith L() 回落口径 band=1→36；绝不填 0）")
 
-        let dict: [String: Any] = [
-            "id": phoneId,
-            "name": marketName,
-            "model": marketName,
-            "pinCodeOrAuthentication": credential,
-            "band": 1,
-            "mac": mac,
-            "type": typeValue,
-            "manufactures": "Xiaomi",
-            "channel": 0,
-        ]
-        let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        var maskedDict = dict
-        maskedDict["pinCodeOrAuthentication"] = "**" + String(credential.suffix(2))
-        let maskedData = try? JSONSerialization.data(withJSONObject: maskedDict, options: [.sortedKeys])
-        let masked = maskedData.flatMap { String(data: $0, encoding: .utf8) } ?? "(拼不出来)"
+        // 键序照 CarWith K() 的插入顺序拼（id, name, model, pinCodeOrAuthentication,
+        // band, mac, type, manufactures, channel）：标准 JSON 解析与键序无关，
+        // 但车机固件的解析健壮性未经证实，照原样对齐、去掉这个变量。
+        let data = Self.clientInfoJSON(id: phoneId, name: marketName, model: marketName,
+                                       credential: credential, band: band, mac: mac,
+                                       type: typeValue, channel: channel)
+        let masked = Self.clientInfoJSON(id: phoneId, name: marketName, model: marketName,
+                                         credential: "**" + String(credential.suffix(2)), band: band,
+                                         mac: mac, type: typeValue, channel: channel)
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "(拼不出来)"
         return (data, masked, notes)
+    }
+
+    /// 按 CarWith K() 的插入顺序拼 ClientInfo JSON。
+    private static func clientInfoJSON(id: String, name: String, model: String,
+                                       credential: String, band: Int, mac: String,
+                                       type: Int, channel: Int) -> Data? {
+        let text = "{\"id\":\(jsonEscaped(id)),\"name\":\(jsonEscaped(name)),\"model\":\(jsonEscaped(model)),\"pinCodeOrAuthentication\":\(jsonEscaped(credential)),\"band\":\(band),\"mac\":\(jsonEscaped(mac)),\"type\":\(type),\"manufactures\":\"Xiaomi\",\"channel\":\(channel)}"
+        return text.data(using: .utf8)
+    }
+
+    /// 单个字符串的 JSON 转义（借 JSONSerialization 处理引号与控制字符）。
+    private static func jsonEscaped(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]),
+              let text = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return text
     }
 
     /// 鉴权成功后经 …103 回告手机局域网地址（BLE-SPEC §4.3）。失败只记日志。
@@ -744,6 +767,7 @@ extension BleProbe: CBCentralManagerDelegate {
         writeWatchdog?.cancel()
         writeWatchdog = nil
         clientInfoWritten = false
+        clientInfoWriteRetried = false
     }
 }
 
@@ -768,6 +792,7 @@ extension BleProbe: CBPeripheralDelegate {
             log("蓝牙探针：读特征失败（服务 \(service.uuid.uuidString)）：\(error.localizedDescription)")
             return
         }
+        var pendingNotifyChar: CBCharacteristic?
         for char in service.characteristics ?? [] {
             let label = charLabel(char.uuid)
             log("蓝牙探针：特征 \(char.uuid.uuidString) 属性 \(describeProperties(char.properties))\(label.isEmpty ? "" : " — \(label)")")
@@ -779,18 +804,27 @@ extension BleProbe: CBPeripheralDelegate {
             }
             if char.uuid == Self.charServerInfo {
                 if char.properties.contains(.notify) {
+                    // 先只登记「待订阅」，setNotifyValue 押后到 ClientInfo 写出之后再发：
+                    // iOS 的 setNotifyValue 是一次真实的 CCCD 写、要等车机确认，CoreBluetooth
+                    // 对同一外设又是串行排队——先发订阅会把后面的 ClientInfo 写堵在队列里
+                    // （13:08 实测：写回执与订阅确认双双缺席，车机 30 秒清连接）。
+                    // CarWith 在安卓上订阅只是本地开关、写紧随其后；iOS 上靠
+                    // 「写在前、订阅紧随其后」对齐同一时序。
                     serverInfoNotifyRequested = true
-                    peripheral.setNotifyValue(true, for: char)
-                    log("蓝牙探针：已订阅 …102 通知，等车机发 ServerInfo")
+                    pendingNotifyChar = char
                 } else {
                     log("蓝牙探针：…102 没有 notify 属性，订不了通知")
                 }
             }
         }
-        // 用户已输码在等连接时，特征一发现齐就直接试着写 ClientInfo，
-        // 不依赖订阅确认回调（有的车机不回那个回调，等它会静默卡住）。
+        // 用户已输码在等连接时，特征一发现齐就先写 ClientInfo（写排在订阅前面），
+        // 不依赖订阅确认回调（本车机从不回那个回调，等它会静默卡住）。
         if flowCredential != nil {
             maybeWriteClientInfo()
+        }
+        if let pendingNotifyChar {
+            peripheral.setNotifyValue(true, for: pendingNotifyChar)
+            log("蓝牙探针：已发出 …102 订阅请求（排在 ClientInfo 写入之后发出），等车机发 ServerInfo")
         }
     }
 
@@ -821,10 +855,18 @@ extension BleProbe: CBPeripheralDelegate {
         switch characteristic.uuid {
         case Self.charClientInfo:
             if let error {
-                flowPhase = .failed("写 ClientInfo 失败")
-                log("UCar 连接：写 …101（ClientInfo）失败：\(error.localizedDescription)")
+                if !clientInfoWriteRetried {
+                    // CarWith 口径：写回调失败时同值重写一次，再失败才判死。
+                    clientInfoWriteRetried = true
+                    clientInfoWritten = false
+                    log("UCar 连接：写 …101（ClientInfo）失败：\(error.localizedDescription)；按 CarWith 口径同值重写一次")
+                    maybeWriteClientInfo()
+                } else {
+                    flowPhase = .failed("写 ClientInfo 失败")
+                    log("UCar 连接：写 …101（ClientInfo）重写仍失败：\(error.localizedDescription)")
+                }
             } else {
-                log("UCar 连接：ClientInfo 已写入 …101，等车机回 ServerInfo（最长等 20 秒）")
+                log("UCar 连接：ClientInfo 已写入 …101（写回执已回，车机确认收到），等车机回 ServerInfo（最长等 10 秒）")
             }
         case Self.charClientAddr:
             if let error {
