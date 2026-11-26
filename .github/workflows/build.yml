@@ -1,3 +1,4 @@
+
 name: build
 
 on:
@@ -19,7 +20,7 @@ jobs:
       - name: Toolchain
         run: |
           rustc -V
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
       - name: oxp-clink tests
         run: |
           set -o pipefail
@@ -41,18 +42,26 @@ jobs:
       - name: Toolchain
         run: |
           rustc -V
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
           brew install xcodegen
       - name: Build app (no signing)
         run: |
           set -o pipefail
           ROOT="$GITHUB_WORKSPACE"
           (
-            cd "$ROOT/src/OpenXPlay-Relay/rust" && cargo build -p oxp-ios --release --target aarch64-apple-ios-sim
-            cd "$ROOT/src/OpenXPlay-Stream/rust" && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios-sim
+            for t in aarch64-apple-ios-sim x86_64-apple-ios; do
+              ( cd "$ROOT/src/OpenXPlay-Relay/rust" && cargo build -p oxp-ios --release --target $t )
+              ( cd "$ROOT/src/OpenXPlay-Stream/rust" && cargo build -p oxp-clink-ios --release --target $t )
+            done
             mkdir -p "$ROOT/OpenXPlay-iOS/generated"
-            cp "$ROOT/src/OpenXPlay-Stream/rust/target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a" "$ROOT/OpenXPlay-iOS/generated/"
-            cp "$ROOT/src/OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a" "$ROOT/OpenXPlay-iOS/generated/"
+            lipo -create \
+              "$ROOT/src/OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a" \
+              "$ROOT/src/OpenXPlay-Relay/rust/target/x86_64-apple-ios/release/liboxp_ios.a" \
+              -output "$ROOT/OpenXPlay-iOS/generated/liboxp_ios.a"
+            lipo -create \
+              "$ROOT/src/OpenXPlay-Stream/rust/target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a" \
+              "$ROOT/src/OpenXPlay-Stream/rust/target/x86_64-apple-ios/release/liboxp_clink_ios.a" \
+              -output "$ROOT/OpenXPlay-iOS/generated/liboxp_clink_ios.a"
             cd "$ROOT/OpenXPlay-iOS/generated" && libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
             cp "$ROOT/src/OpenXPlay-Relay/rust/oxp-ios/include/oxp_ios.h" .
             cp "$ROOT/src/OpenXPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h" .
@@ -61,6 +70,6 @@ jobs:
           ) 2>&1 | tee /tmp/build.log
           code=${PIPESTATUS[0]}
           if [ $code -ne 0 ]; then
-            echo "::error::$(grep -E 'error:|error ' /tmp/build.log | head -n 4 | tr '\n' ' ' | cut -c1-900)"
+            echo "::error::$(grep -E 'error:' /tmp/build.log | head -n 3 | tr '\n' ' ' | cut -c1-900)"
             exit $code
           fi
