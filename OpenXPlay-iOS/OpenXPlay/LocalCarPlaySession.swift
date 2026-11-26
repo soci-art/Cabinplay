@@ -47,21 +47,21 @@ final class LocalCarPlaySession: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
     /// 本轮会话是否真正连上过（控制连接建立过）：连上那一刻据此落
-    /// 「下次连接前先轮换 deviceID」标记，stop() 收尾时再冗余落一次
+    /// 「上次会话连上过」标记，stop() 收尾时再冗余落一次
     /// （见 preRotationPending）。
     private var connectedThisSession = false
 
-    /// 预轮换标记（持久化）：会话真正连上（收到控制连接）的那一刻就
-    /// 落下——onControlConnected 先清掉上一轮的旧标记、再按本次连上
-    /// 重新落；stop() 里保留一处冗余写点。下次点「连接车机」时上层
-    /// 读到就先轮换 deviceID 再发起，跳过注定失败的同身份等待。落点
-    /// 提前到连上时，是因为用户点断开走的上层路径、杀 App 等结束方
-    /// 式都不保证经过 stop()，等收尾才落会漏（ROTATION-MARKER-DIFF
-    /// 实锤：1645 轮点断开从未调 stop()，标记永不落、1649 轮干等约
-    /// 35 秒）。标记只在 connectCarFlow 开头被读，会话运行中没有任何
-    /// 路径读它，不会自触发轮换。存在的原因：系统侧的会话记录在一
-    /// 轮会话真正跑过又结束后会楔住，同身份再发起不回连，换个新身
-    /// 份等于新车、天然没有那本旧账。
+    /// 上次会话标记（持久化，原名预轮换标记）：会话真正连上（收到
+    /// 控制连接）的那一刻就落下——onControlConnected 先清掉上一轮
+    /// 的旧标记、再按本次连上重新落；stop() 里保留一处冗余写点。
+    /// 落点提前到连上时，是因为用户点断开走的上层路径、杀 App 等
+    /// 结束方式都不保证经过 stop()，等收尾才落会漏（ROTATION-
+    /// MARKER-DIFF 实锤：1645 轮点断开从未调 stop()，标记永不落）。
+    /// 2026-11-26 晚起它不再作轮换依据：RECONNECT-WAIT-DIFF 定案
+    /// 回连等待与身份无关（没轮换同样等约 31 秒），轮换改反应式
+    /// ——连接开头先用原标识、接续发起后约 35 秒不回连才换（见
+    /// ContentView 的熔断）。标记读写点原样保留，只作「上次连上
+    /// 过」的记录，不再被任何路径读作触发条件。
     static var preRotationPending: Bool {
         get { UserDefaults.standard.bool(forKey: "cabinplay.preRotateDeviceID") }
         set { UserDefaults.standard.set(newValue, forKey: "cabinplay.preRotateDeviceID") }

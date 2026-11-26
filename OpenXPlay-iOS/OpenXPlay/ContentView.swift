@@ -108,6 +108,14 @@ struct ContentView: View {
     /// 无回连重试是否正挂着（arm 置真、收手/取消/用尽置假）：车机会
     /// 话在出画前结束时，靠它判定要不要连待发重试一并止损。
     @State private var localRetryArmed = false
+    /// 反应式轮换熔断的起算点：arm 的那一刻＝接续发起（切网后按新
+    /// 地址重发 StartSession）。从这里算约 35 秒仍无回连才换新设
+    /// 备标识（RECONNECT-WAIT-DIFF 定案：回连延迟是双峰的——约 1
+    /// 秒或约 30 秒，35 秒刚越过慢峰；连接开头不再预轮换）。
+    @State private var localFuseStartedAt: Date?
+    /// 本轮车机会话是否已重打过触控定锚（出画打一次，beginClinkAttempts
+    /// 与会话结束时复位）。
+    @State private var touchAnchorLogged = false
 
     /// 画中画保活（与静音音频保活并存的第二条腿）：懒创建——控制器要在
     /// 预览托管层接管完成后（首帧时）建，建早了内容源会指着占位层。
@@ -325,44 +333,66 @@ struct ContentView: View {
     /// 会话的生命周期（帧桥汇合、clink 重连都不许动它）。3 次都无回
     /// 连就停手并打人话日志：这个系统一轮里只要有会话真正跑过又结
     /// 束，新的就再也发起不起来，非重启手机不可。
+    ///
+    /// 身份轮换改反应式（RECONNECT-WAIT-DIFF 定案）：arm 的这一刻
+    /// 就是接续发起，熔断从这里起算——约 35 秒仍无回连才停会话、
+    /// 换新 deviceID、重开（保险丝，不是主路径：回连延迟双峰，约
+    /// 1 秒或约 30 秒，35 秒刚越过慢峰，正常慢轮次不会误触发）。
+    /// 连接开头不再预轮换（connectCarFlow 已撤）：先用原标识连，
+    /// 系统状态好时同身份 1 秒回连、慢时约 30 秒，都轮不到换。
     private func armLocalCallbackRetry() {
         localRetryGeneration += 1
         localAttemptCount = 1
         localRotatedThisFlow = false
         localRetryArmed = true
+        localFuseStartedAt = Date()
         scheduleLocalCallbackCheck(generation: localRetryGeneration)
     }
 
     private func scheduleLocalCallbackCheck(generation: Int) {
         localRetryWork?.cancel()
-        // 本轮检查窗：统一 20 秒（定版依据见 armLocalCallbackRetry 的
-        // 注释）。在排期这一刻定格，日志里如实打出本轮等了多少秒，
-        // 方便对账。
-        let waitSeconds = 20
+        // 本轮检查窗：常规 20 秒（定版依据见 armLocalCallbackRetry
+        // 的注释）；但未轮换时下一检查点不许越过 35 秒熔断线——把
+        // 窗收短到熔断点，让熔断在约 35 秒准时触发，而不是拖到
+        // 40 秒那次常规检查。在排期这一刻定格，日志如实对账。
+        var waitSeconds = 20
+        if !localRotatedThisFlow, let fuseStart = localFuseStartedAt {
+            let remaining = 35 - Date().timeIntervalSince(fuseStart)
+            if remaining < 20 {
+                waitSeconds = max(1, Int(remaining.rounded()))
+            }
+        }
         let item = DispatchWorkItem {
             guard generation == localRetryGeneration else { return }
             if localSession.controlConnected || localSession.phase == .streaming {
                 localRetryArmed = false
                 appendLog("本机 CarPlay：已回连，自动重试收手——会话就此跑下去，流程内不再动它")
+                if !localRotatedThisFlow, let fuseStart = localFuseStartedAt {
+                    appendLog("本机 CarPlay：本轮同身份直接连上，从接续发起算回连共等了约 \(Int(Date().timeIntervalSince(fuseStart).rounded())) 秒")
+                }
+                return
+            }
+            // 反应式轮换熔断（跨轮上层触发，优先于次数逻辑）：接续
+            // 发起后约 35 秒仍无回连——停会话（停稳才换，运行中换
+            // 身份会让同一会话前后不一致）、换新 deviceID、用新身
+            // 份重新发起；新身份再走同样的 20 秒×3 次重试与最终提
+            // 示。触发即取消本检查链的后续同身份重试（下面 return
+            // 前不再排期，startLocalSessionAfterAddressWait 会按新
+            // 身份重新排期）。
+            if !localRotatedThisFlow, let fuseStart = localFuseStartedAt,
+               Date().timeIntervalSince(fuseStart) >= 35 {
+                localRotatedThisFlow = true
+                localAttemptCount = 1
+                appendLog("本机 CarPlay：35 秒没等到回连，按反应式轮换换新设备标识重试（先停会话、换标识、用新身份重新发起）")
+                stopLocalSession(reason: "连接车机：反应式轮换，先停会话")
+                ReceiverConfiguration.rotatePersistentDeviceID()
+                appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录），用新身份重新发起")
+                startLocalSessionAfterAddressWait(generation: generation)
                 return
             }
             guard localAttemptCount < 3 else {
-                // 同身份 3 次用尽：先走身份轮换这道杠杆——停会话（已完全
-                // 停稳才换，运行中换身份会让同一会话前后不一致）、换新
-                // deviceID、用新身份重新发起，新身份再走同样的 3 次上限。
-                // 系统按 deviceID 记账，换了等于换台新车、没有楔住的旧账。
-                if !localRotatedThisFlow {
-                    localRotatedThisFlow = true
-                    localAttemptCount = 1
-                    appendLog("本机 CarPlay：同身份自动重试 3 次都没有回连——停下会话，换新设备标识再试一轮")
-                    stopLocalSession(reason: "连接车机：换设备标识重试，先停会话")
-                    ReceiverConfiguration.rotatePersistentDeviceID()
-                    appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录），用新身份重新发起")
-                    startLocalSessionAfterAddressWait(generation: generation)
-                } else {
-                    localRetryArmed = false
-                    appendLog("本机 CarPlay：换了新设备标识也重试满 3 次，还是没有回连——这一轮已经换身份重试过了，仍不行就只能重启手机后再点一次「连接车机」")
-                }
+                localRetryArmed = false
+                appendLog("本机 CarPlay：自动重试满 3 次，还是没有回连——仍不行就只能重启手机后再点一次「连接车机」")
                 return
             }
             localAttemptCount += 1
@@ -436,14 +466,14 @@ struct ContentView: View {
     /// 后被接续完成），再入网；地址一切过来按新地址重开接续、重发
     /// StartSession，clink 试序同时开始（见 handleUCarServerInfo）。
     private func connectCarFlow() {
-        // 预轮换：上次会话真正连上过（标记在它连上那一刻就落下，见
-        // LocalCarPlaySession.preRotationPending），系统侧那本旧账多半
-        // 已经楔住——先换新设备标识再发起，跳过注定失败的同身份等待。
-        // 标记不在这里清：新会话连上时先清旧的、再按本次连上重新落。
-        if LocalCarPlaySession.preRotationPending {
-            ReceiverConfiguration.rotatePersistentDeviceID()
-            appendLog("本机 CarPlay：检测到上次会话标记，先换新设备标识再连接（避开系统里卡住的旧记录）")
-        }
+        // 轮换改反应式（RECONNECT-WAIT-DIFF 定案）：连接开头不再因
+        // 上次会话标记预轮换——实证表明等约 30 秒与身份无关（没轮
+        // 换的轮次同样等 31 秒），预轮换只是白烧新身份、往系统设置
+        // 里堆同名车辆条目。先用原标识连：系统状态好约 1 秒回连、
+        // 残留未清约 30 秒回连；真楔住时由接续发起后约 35 秒的熔
+        // 断换新标识兜底（见 scheduleLocalCallbackCheck）。标记的读
+        // 写点不动：连上照落、stop 照落，只是不再作轮换依据。
+        appendLog("本机 CarPlay：本轮先用原设备标识连接（35 秒不回连再换新标识）")
         appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
         bleProbe.connect(pin: blePin)
     }
@@ -513,12 +543,20 @@ struct ContentView: View {
             }
             if state == .playing {
                 carLinkDetail = "车机 \(flowCarIP) · 本机 \(flowLocalIP) · 正在输出"
+                // 触控定锚防丢：每轮车机会话出画后重打一行（声明几何
+                // ＋当前换算方式）——日志从会话中段导出时，开头那份
+                // 定锚会被 400 行上限滚掉，这一行为中段导出兜底。
+                if !touchAnchorLogged {
+                    touchAnchorLogged = true
+                    CarLinkCore.shared.logTouchAnchor()
+                }
                 // UCar 顺序（CarWith 实证）：57209 鉴权成功之后才经 BLE
                 // …103 回告本机地址。BLE 若已被车机 30 秒看门狗断开，
                 // writeClientAddress 内部会打日志说明，不卡主流程。
                 bleProbe.writeClientAddress(localIP: flowLocalIP)
             }
             if state == .ended {
+                touchAnchorLogged = false
                 if clinkLoopActive && !clinkAttemptHit && !clinkAttemptSettled {
                     settleClinkAttemptFailure(reason: clinkLastError.isEmpty
                         ? "会话刚启动就结束（没走到协商）" : clinkLastError)
@@ -572,6 +610,7 @@ struct ContentView: View {
             return
         }
         wireCarLinkCallbacks()
+        touchAnchorLogged = false
         // 触控校准按这台车推给核心（手动优先、其次预置、都没有走
         // 居中模型）：每轮试序开始时推一次，运行中改校准也立刻生效。
         CarLinkCore.shared.applyTouchCalibration(forDeviceId: bleProbe.foundDeviceId ?? lastCarDeviceId)

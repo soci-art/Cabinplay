@@ -158,6 +158,9 @@ final class LocalCarPlayBridge {
     /// 车机还没进入出画状态时被静默门拦下的声音包数（以前完全静默，
     /// 日志里看不出声音到底来过没有，AUDIO-SILENT-DIFF 点名补上）。
     private var audioPacketsHeldBack = 0
+    /// 非 AAC 包被桥放过的计数：以前是无声 return，若某轮主流建的
+    /// 不是 AAC 流，日志里必须能看见这道门拦了多少、拦的是什么。
+    private var audioPacketsNonAAC = 0
 
     /// 接收端 tap 到的主流 AAC 帧。hostMicros 是 CarPlayAudio 的
     /// browserTimestamp（主机开机单调时钟微秒），喂核心前必须换算到
@@ -168,9 +171,15 @@ final class LocalCarPlayBridge {
         queue.async { [weak self] in
             guard let self else { return }
             // 非 AAC 的包不归这条桥（tap 只装在主流 AAC 实例上，这里
-            // 只是双保险），静默放过；车机还没出画时拦下的 AAC 包要
-            // 计数并节流打日志，不再静默吞掉（AUDIO-SILENT-DIFF）。
-            guard format.isAAC else { return }
+            // 只是双保险）：计数并节流打日志，不再无声放过；车机还没
+            // 出画时拦下的 AAC 包同样计数打日志（AUDIO-SILENT-DIFF）。
+            guard format.isAAC else {
+                self.audioPacketsNonAAC += 1
+                if self.audioPacketsNonAAC == 1 || self.audioPacketsNonAAC % 300 == 0 {
+                    self.onLog?("音频桥：声音包不是 AAC 格式（\(format.name) \(format.sampleRate) Hz / \(format.channels) 声道），不归这条桥，已放过第 \(self.audioPacketsNonAAC) 个")
+                }
+                return
+            }
             guard self.clinkPlaying else {
                 self.audioPacketsHeldBack += 1
                 if self.audioPacketsHeldBack == 1 || self.audioPacketsHeldBack % 300 == 0 {

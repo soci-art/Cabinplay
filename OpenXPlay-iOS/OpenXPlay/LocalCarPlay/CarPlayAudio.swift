@@ -200,7 +200,7 @@ final class CarPlayAudio {
             let now = ProcessInfo.processInfo.systemUptime
             if now >= nextStatistics {
                 nextStatistics = now + 5
-                onLog?(CWL("音频状态：数据包={1}，队列={2}ms，欠载={3}，延迟={4}，溢出={5}，拒绝={6}", [String(describing: packets), String(describing: queuedFrames * 1000 / format.sampleRate), String(describing: underruns), String(describing: latePackets), String(describing: overflowPackets), String(describing: rejected)]))
+                onLog?(CWL("音频状态（流 {1}）：数据包={2}，队列={3}ms，欠载={4}，延迟={5}，溢出={6}，拒绝={7}", [streamType.map { String($0) } ?? "未知", String(describing: packets), String(describing: queuedFrames * 1000 / format.sampleRate), String(describing: underruns), String(describing: latePackets), String(describing: overflowPackets), String(describing: rejected)]))
             }
 
         } catch {

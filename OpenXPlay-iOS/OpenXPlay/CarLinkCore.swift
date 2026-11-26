@@ -116,6 +116,11 @@ final class CarLinkCore {
     /// 心：有就设上，没有就清掉让核心走居中模型。每轮连接开始时调
     /// 一次；手动校准完成/清除时也调，运行中的会话立刻生效。
     func applyTouchCalibration(forDeviceId deviceId: String?) {
+        // 先推触控模式（取证三档）：模式与校准矩形是两件独立的事，
+        // 每次按车应用校准时一并把这台车存的模式推给核心，切换在
+        // 核心侧打日志、立即生效。
+        let mode = deviceId.map { TouchModeStore.mode(for: $0) } ?? .calibrated
+        clink_set_touch_mode(mode.coreValue)
         if let deviceId, let effective = TouchCalibrationStore.effectiveRect(for: deviceId) {
             let rect = effective.rect
             clink_set_touch_calibration(rect.left, rect.right, rect.top, rect.bottom,
@@ -123,6 +128,12 @@ final class CarLinkCore {
         } else {
             clink_clear_touch_calibration()
         }
+    }
+
+    /// 出画后让核心重打一行触控定锚（声明几何＋当前换算方式）：
+    /// 日志中段导出时开头的定锚行会被滚掉，这一行为新会话兜底。
+    func logTouchAnchor() {
+        clink_log_touch_anchor()
     }
 
     /// 校准捕获开关：开着时车机触控只报原始坐标、不转发给 iOS。

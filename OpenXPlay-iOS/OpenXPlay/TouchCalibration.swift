@@ -64,6 +64,44 @@ enum TouchCalibrationStore {
     }
 }
 
+/// 触控换算模式（取证三档，设置页切换）：直通＝原始坐标不做任何
+/// 校正原样转发；居中模型＝无视校准记录、按 screen 与 videoDisplay
+/// 的居中差换算；按校准＝现状（有校准按矩形、没有回落居中模型）。
+/// 三档在同一台车上各点一轮，核心逐笔日志里原始/换算成对可比，
+/// 哪个模型对一算便知。rawValue 与核心 FFI 的模式编号一致。
+enum TouchConversionMode: Int, CaseIterable {
+    case passthrough = 0
+    case centered = 1
+    case calibrated = 2
+
+    var coreValue: UInt32 { UInt32(rawValue) }
+
+    var label: String {
+        switch self {
+        case .passthrough: return "直通（不校正）"
+        case .centered: return "居中模型"
+        case .calibrated: return "按校准"
+        }
+    }
+}
+
+/// 触控模式按车存 UserDefaults；没存过默认「按校准」（现状）。
+enum TouchModeStore {
+    private static func key(for deviceId: String) -> String {
+        "cabinplay.touchMode.\(deviceId)"
+    }
+
+    static func mode(for deviceId: String) -> TouchConversionMode {
+        guard let raw = UserDefaults.standard.object(forKey: key(for: deviceId)) as? Int,
+              let mode = TouchConversionMode(rawValue: raw) else { return .calibrated }
+        return mode
+    }
+
+    static func save(_ mode: TouchConversionMode, for deviceId: String) {
+        UserDefaults.standard.set(mode.rawValue, forKey: key(for: deviceId))
+    }
+}
+
 /// 校准捕获总线：核心的捕获回调（ContentView 接线）把原始坐标送到
 /// 这里，校准界面在进行时挂上自己的处理函数，结束就摘掉。
 final class TouchCaptureBus {
