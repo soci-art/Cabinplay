@@ -117,12 +117,11 @@ impl MemoryTrust {
     fn restore(&self) {
         if let Some(path) = self.identity_path() {
             if let Ok(bytes) = std::fs::read(&path) {
+                // On-disk form: raw P-256 scalar (32 bytes) || public key (64).
                 if bytes.len() == 96 {
-                    let mut pkcs8 = [0u8; 32];
-                    let mut public = [0u8; 64];
-                    pkcs8.copy_from_slice(&bytes[..32]);
-                    public.copy_from_slice(&bytes[32..]);
-                    if let Ok(identity) = AuthIdentity::new(&pkcs8, &public) {
+                    if let Ok(identity) =
+                        AuthIdentity::from_scalar_bytes(&bytes[..32], &bytes[32..])
+                    {
                         *self.identity.lock().unwrap() = Some(identity);
                     }
                 }
@@ -138,8 +137,12 @@ impl TrustStore for MemoryTrust {
     fn save_identity(&self, identity: &AuthIdentity) -> oxp_clink::Result<()> {
         *self.identity.lock().unwrap() = Some(identity.clone());
         if let Some(path) = self.identity_path() {
+            // Persist scalar(32) || public(64) = 96 bytes, matching restore().
+            // (Previously this wrote the PKCS#8 DER blob, which is longer than
+            // 32 bytes, so restore() could never rebuild the identity and
+            // every launch silently minted a fresh one, breaking QUICK.)
             let mut bytes = Vec::with_capacity(96);
-            bytes.extend_from_slice(&identity.pkcs8()?);
+            bytes.extend_from_slice(&identity.scalar_bytes());
             bytes.extend_from_slice(&identity.public_key());
             let _ = std::fs::write(path, bytes);
         }
@@ -172,6 +175,9 @@ impl TrustStore for MemoryTrust {
     }
     fn forget_peer(&self, head_unit_id: &str) -> oxp_clink::Result<()> {
         self.peers.lock().unwrap().remove(head_unit_id);
+        if let Some(path) = self.peer_path(head_unit_id) {
+            let _ = std::fs::remove_file(path);
+        }
         Ok(())
     }
 }
@@ -303,6 +309,55 @@ fn cstr(ptr: *const c_char) -> Option<String> {
     unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(str::to_owned)
 }
 
+// ---------------------------------------------------------------------------
+// Phone identity presented to the head unit (set by Swift before clink_start)
+// ---------------------------------------------------------------------------
+
+struct PhoneIdentity {
+    device_id: String,
+    model: String,
+    product_name: String,
+}
+
+static PHONE_IDENTITY: OnceLock<Mutex<PhoneIdentity>> = OnceLock::new();
+
+fn phone_identity() -> &'static Mutex<PhoneIdentity> {
+    PHONE_IDENTITY.get_or_init(|| {
+        Mutex::new(PhoneIdentity {
+            device_id: "OpenXPlay-iOS".to_string(),
+            model: "OpenXPlay".to_string(),
+            product_name: "CabinPlay".to_string(),
+        })
+    })
+}
+
+/// Set the identity the next clink_start presents in the auth request:
+/// field 7 id (same persistent id the BLE ClientInfo uses), field 8 model
+/// (market name), field 11 productName. Call before clink_start.
+#[no_mangle]
+pub extern "C" fn clink_set_identity(
+    device_id: *const c_char,
+    model: *const c_char,
+    product_name: *const c_char,
+) {
+    let mut slot = phone_identity().lock().unwrap();
+    if let Some(v) = cstr(device_id) {
+        if !v.is_empty() {
+            slot.device_id = v;
+        }
+    }
+    if let Some(v) = cstr(model) {
+        if !v.is_empty() {
+            slot.model = v;
+        }
+    }
+    if let Some(v) = cstr(product_name) {
+        if !v.is_empty() {
+            slot.product_name = v;
+        }
+    }
+}
+
 /// Connect to the head unit's CarLink service.
 /// Returns 0 on success, negative on error (details arrive through `on_error`).
 #[no_mangle]
@@ -357,12 +412,16 @@ pub extern "C" fn clink_start(
         }
     };
 
+    let identity = phone_identity().lock().unwrap();
     let options = SessionOptions {
         picture_size: Some((width.max(320), height.max(240))),
-        device_id: "OpenXPlay-iOS".to_string(),
-        device_name: "OpenXPlay".to_string(),
+        device_id: identity.device_id.clone(),
+        device_name: identity.model.clone(),
+        work_modes: Some(781),
+        product_name: Some(identity.product_name.clone()),
         ..Default::default()
     };
+    drop(identity);
 
     let output = match output
         .with_options(options)

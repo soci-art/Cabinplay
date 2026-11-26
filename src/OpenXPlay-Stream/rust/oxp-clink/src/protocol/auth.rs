@@ -31,6 +31,18 @@ impl AuthIdentity {
             secret: SecretKey::random(&mut OsRng),
         }
     }
+    /// Rebuild an identity from its raw P-256 scalar (32 bytes) + public key
+    /// (64 bytes, X||Y). The on-disk identity store keeps this compact form:
+    /// a PKCS#8 DER blob is longer than 32 bytes and cannot round-trip
+    /// through a fixed 96-byte scalar+public record.
+    pub fn from_scalar_bytes(scalar: &[u8], public: &[u8]) -> Result<Self> {
+        let secret = SecretKey::from_slice(scalar)?;
+        require(raw(&secret.public_key()) == public, "identity_key_mismatch")?;
+        Ok(Self { secret })
+    }
+    pub fn scalar_bytes(&self) -> Vec<u8> {
+        self.secret.to_bytes().to_vec()
+    }
     pub fn pkcs8(&self) -> Result<Vec<u8>> {
         Ok(self.secret.to_pkcs8_der()?.as_bytes().to_vec())
     }
@@ -62,6 +74,10 @@ pub struct Auth {
     identity: AuthIdentity,
     device_id: String,
     name: String,
+    /// AuthRequest field 10 (workModes); CarWith's default is 781.
+    work_modes: u32,
+    /// AuthRequest field 11 (productName); CarWith sends its own app name.
+    product_name: String,
     local_ipv4: String,
     peer: Option<Vec<u8>>,
     agreement: Option<SecretKey>,
@@ -100,6 +116,8 @@ impl Auth {
             identity,
             device_id,
             name,
+            work_modes: 781,
+            product_name: "CabinPlay".to_string(),
             local_ipv4,
             peer,
             agreement: None,
@@ -109,6 +127,12 @@ impl Auth {
             sequence: 0,
             complete: false,
         })
+    }
+    pub fn set_work_modes(&mut self, work_modes: u32) {
+        self.work_modes = work_modes;
+    }
+    pub fn set_product_name(&mut self, product_name: String) {
+        self.product_name = product_name;
     }
     pub fn start(
         &mut self,
@@ -165,6 +189,8 @@ impl Auth {
             (7, V::Bytes(self.device_id.as_bytes().to_vec())),
             (8, V::Bytes(self.name.as_bytes().to_vec())),
             (9, V::Varint(confirmed as u64)),
+            (10, V::Varint(self.work_modes as u64)),
+            (11, V::Bytes(self.product_name.clone().into_bytes())),
         ]);
         if !self.quick {
             let public = self.identity.public_key();

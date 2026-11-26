@@ -19,6 +19,12 @@ typedef struct ClinkCallbacks {
     void (*on_log)(void *context, const uint8_t *bytes, size_t length);
 } ClinkCallbacks;
 
+/* Set the phone identity presented in the auth request (id / model /
+ * productName). Call before clink_start; NULL or empty keeps the previous
+ * value. Defaults: "OpenXPlay-iOS" / "OpenXPlay" / "CabinPlay". */
+void clink_set_identity(const char *device_id, const char *model,
+                        const char *product_name);
+
 int32_t clink_start(const char *head_unit_ipv4,
                     const char *local_ipv4,
                     const char *pin,

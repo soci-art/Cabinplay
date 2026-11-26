@@ -43,6 +43,10 @@ pub struct SessionOptions {
     pub output_id: String,
     pub device_id: String,
     pub device_name: String,
+    /// AuthRequest field 10 (workModes); None keeps the CarWith default 781.
+    pub work_modes: Option<u32>,
+    /// AuthRequest field 11 (productName); None keeps the default "CabinPlay".
+    pub product_name: Option<String>,
     /// Monotonic session clock, injectable for timeout and record-window tests.
     pub clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
@@ -59,6 +63,8 @@ impl Default for SessionOptions {
             output_id: "clink".into(),
             device_id: "openxplay-stream".into(),
             device_name: "OpenXPlay".into(),
+            work_modes: None,
+            product_name: None,
             clock: Arc::new(Instant::now),
         }
     }
@@ -655,6 +661,12 @@ impl ClinkSession {
             a.local_ipv4.to_string(),
             pinned,
         )?;
+        if let Some(w) = self.options.work_modes {
+            auth.set_work_modes(w);
+        }
+        if let Some(p) = &self.options.product_name {
+            auth.set_product_name(p.clone());
+        }
         let mut sequence = 1u32;
         let mut attempt = auth.start(now(), sequence, pin.as_deref(), false, false)?;
         let mut decoder = FrameReader::default();
@@ -739,6 +751,12 @@ impl ClinkSession {
                         a.local_ipv4.to_string(),
                         None,
                     )?;
+                    if let Some(w) = self.options.work_modes {
+                        auth.set_work_modes(w);
+                    }
+                    if let Some(p) = &self.options.product_name {
+                        auth.set_product_name(p.clone());
+                    }
                     attempt = auth.start(now(), sequence, pin.as_deref(), true, false)?;
                     deadline = (self.options.clock)() + Duration::from_secs(20);
                     break;

@@ -68,8 +68,14 @@ fn full_request_matches_oracle_and_signature_transcript() {
     let signature = actual.bytes(5).unwrap().to_vec();
     let version = actual.number(1).unwrap();
     let mut compare = actual;
+    // Fields 10/11 (workModes/productName) follow CarWith and are not part of
+    // the Kotlin oracle vector; pin them here, then compare the rest.
+    assert_eq!(781, compare.number(10).unwrap());
+    assert_eq!(b"CabinPlay".as_slice(), compare.bytes(11).unwrap());
     compare.0.remove(&1);
     compare.0.remove(&5);
+    compare.0.remove(&10);
+    compare.0.remove(&11);
     expected.0.remove(&1);
     expected.0.remove(&5);
     assert_eq!(0x0701, version);
@@ -127,8 +133,12 @@ fn quick_reconnect_omits_identity_proof_and_confirms() {
     assert_eq!(1, actual.number(9).unwrap());
     let mut expected = Fields::decode(&vector("m1_quick")).unwrap();
     let version = actual.number(1).unwrap();
+    assert_eq!(781, actual.number(10).unwrap());
+    assert_eq!(b"CabinPlay".as_slice(), actual.bytes(11).unwrap());
     actual.0.remove(&1);
     actual.0.remove(&5);
+    actual.0.remove(&10);
+    actual.0.remove(&11);
     expected.0.remove(&1);
     expected.0.remove(&5);
     assert_eq!(0x0701, version);
