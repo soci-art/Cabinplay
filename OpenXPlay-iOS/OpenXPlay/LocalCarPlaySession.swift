@@ -72,6 +72,7 @@ final class LocalCarPlaySession: ObservableObject {
     /// 用户再点一次。stop() 会把它清掉，清掉后授权回调不再续启。
     private var pendingSSIDStart: (address: String, identity: AccessoryIdentity)?
     private var addressWatch: DispatchWorkItem?
+    private var noCallbackHintWork: DispatchWorkItem?
     private var previewSets: VideoParameterSets?
 
     // MARK: Wi-Fi 凭据（车机热点）与新鲜度
@@ -249,12 +250,18 @@ final class LocalCarPlaySession: ObservableObject {
         wireCallbacks()
         phase = .starting
         onLog?("本机 CarPlay：启动中——本机地址 \(address):7001，画面 \(width)×\(height) @\(fps)，Wi-Fi「\(wifi.ssid)」(来源：\(wifi.source))")
-        // 保活在请求 CarPlay 之前、还在前台时开启（CarWithin 原版口径：
-        // 等退到后台再开可能来不及）。开启失败只记日志，不拦会话启动。
+        // 保活不在这里开：它一开就抢先激活音频会话（SoloAmbient），而
+        // 今天卡 StartSession 的轮次（14:25/14:31/14:56）全都开了保活、
+        // 出画的轮次（13:08/14:20）都没开——时机嫌疑最大。改为首帧送入
+        // 显示层（previewDidDisplayFirstFrame）之后才开启。
+        // 注：CarWithin 原版是在会话启动前就开的（其源码注释称等退到
+        // 后台再开可能抢不到音频会话；保活文件本身与原版逐字一致）。
+        // 本版按真机对账故意改晚做一次对照：若复验仍卡 StartSession，
+        // 说明不是保活时机的事，再按原版口径改回。
         keepAlive.onLog = { [weak self] in self?.onLog?("本机 CarPlay：\($0)") }
-        keepAliveActive = keepAlive.start()
         receiver.start(configuration: config, identity: loadedIdentity)
         watchStartupAddress(expected: address)
+        scheduleNoCallbackHint()
     }
 
     /// 可信度链一个可用 Wi-Fi 名都没选出来时的分流处理：
@@ -323,6 +330,8 @@ final class LocalCarPlaySession: ObservableObject {
         pendingSSIDStart = nil
         addressWatch?.cancel()
         addressWatch = nil
+        noCallbackHintWork?.cancel()
+        noCallbackHintWork = nil
         sameDevice.stop()
         receiver.stop()
         keepAlive.stop()
@@ -453,6 +462,26 @@ final class LocalCarPlaySession: ObservableObject {
         firstDisplayedAt = Date()
         phase = .streaming
         onLog?("本机 CarPlay：首帧已送入显示层，画面开始流动")
+        // 会话出画后才开启后台保活（时机定案见 beginStart 的注释）：
+        // 静音音频不再抢在 StartSession 之前激活音频会话。开启失败只
+        // 记日志（keepAlive.start 内部会打），不影响会话本身。
+        if !keepAliveActive {
+            keepAliveActive = keepAlive.start()
+            onLog?("本机 CarPlay：会话出画后开启后台保活（回桌面/锁屏靠它撑住会话）")
+        }
+    }
+
+    /// StartSession 发出后久等不到系统回连时打一行大白话提示（0x4301
+    /// 约每 3 秒重发一次，15 秒没回连就是重发 ≥4 次）：只提示、不停
+    /// 会话——残留会话卡住时重启手机通常能清掉，它自己接上也会继续。
+    private func scheduleNoCallbackHint() {
+        noCallbackHintWork?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.isRunning, !self.controlConnected else { return }
+            self.onLog?("本机 CarPlay：系统 CarPlay 一直没回连——今天连失败多次时系统里可能卡了残留会话，重启手机后再试通常能恢复（会话没停，它自己接上会继续走）")
+        }
+        noCallbackHintWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: item)
     }
 
     /// 预览显示层解码失败恢复时请求关键帧（接收端内部有节流与多次重试）。
