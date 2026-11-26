@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 OpenXPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The app shell: import the MFi identity, start the receiver, show the
-// decoded CarPlay surface and the protocol log.
+// The app shell: three tabs （驾驶舱 / 日志 / 设置）, with all receiver,
+// CarLink, decoder and identity state held here and passed down.
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -55,116 +55,100 @@ struct ContentView: View {
     @State private var pip = PictureInPicture()
     @State private var pipReady = false
 
+    // New shell state
+    @State private var tab = 0
+    @State private var phoneConnected = false
+    @State private var hasVideo = false
+    @State private var receiverError: String?
+    @State private var startedAt: Date?
+    @State private var targetSize: (Int, Int) = (1280, 720)
+
     private var core: CarPlayCore { .shared }
 
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                VideoSurface(layer: decoder.layer)
-                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                HStack {
-                    Label(identity.hasIdentity ? "身份已就绪" : "缺少 MFi 身份",
-                          systemImage: identity.hasIdentity ? "checkmark.seal.fill" : "exclamationmark.triangle")
-                        .foregroundStyle(identity.hasIdentity ? .green : .orange)
-                    Spacer()
-                    Text(identity.deviceId).font(.footnote.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-
-                Button {
-                    showingImporter = true
-                } label: {
-                    Label("导入 identity.pk8 和 certificate.p7b", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    running ? stop() : start()
-                } label: {
-                    Label(running ? "停止接收端" : "启动接收端",
-                          systemImage: running ? "stop.fill" : "play.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!identity.hasIdentity)
-
-                Text(status).font(.footnote).foregroundStyle(.secondary)
-
-                GroupBox("车机 CarLink 输出") {
-                    VStack(spacing: 8) {
-                        TextField("车机 IP（Carlink 网络里的地址）", text: $headUnitIP)
-                            .textFieldStyle(.roundedBorder)
-                            .keyboardType(.numbersAndPunctuation)
-                        TextField("本机 IP（iPhone 在该网络的地址）", text: $localIP)
-                            .textFieldStyle(.roundedBorder)
-                            .keyboardType(.numbersAndPunctuation)
-                        TextField("车机屏幕上的配对码", text: $pairingCode)
-                            .textFieldStyle(.roundedBorder)
-                            .keyboardType(.numberPad)
-                        HStack {
-                            Button(carLinkRunning ? "断开 CarLink" : "连接车机 CarLink") {
-                                if carLinkRunning {
-                                    stopCarLink()
-                                } else {
-                                    startCarLink()
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            Spacer()
-                            Text(carLinkState.text).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                List(log.suffix(200), id: \.self) { line in
-                    Text(line).font(.caption.monospaced())
-                }
-                .listStyle(.plain)
-            }
-            .padding()
-            .navigationTitle("OpenXPlay 直连")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        if !pip.start() { appendLog("画中画不可用") }
-                    } label: {
-                        Image(systemName: "pip.enter")
-                    }
-                    .disabled(!pipReady)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("1280×720") { setSize(1280, 720) }
-                        Button("1920×1080") { setSize(1920, 1080) }
-                        Button("854×480") { setSize(854, 480) }
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                    }
-                }
-            }
-            .fileImporter(isPresented: $showingImporter,
-                          allowedContentTypes: [.data, .item],
-                          allowsMultipleSelection: true) { result in
-                switch result {
-                case .success(let urls):
-                    do { appendLog(try identity.importFiles(urls)) }
-                    catch { appendLog("导入失败：\(error.localizedDescription)") }
-                case .failure(let error):
-                    appendLog("导入失败：\(error.localizedDescription)")
-                }
-            }
-            .onAppear {
-                if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
-                pipReady = pip.setup(layer: decoder.layer)
-            }
-        }
+    private var heroState: String {
+        if carLinkState == .playing && phoneConnected { return "正在车上显示" }
+        if phoneConnected { return "已连接，画面传输中" }
+        if running { return "等待 iPhone 连接" }
+        return "未启动"
     }
 
-    @State private var targetSize: (Int, Int) = (1280, 720)
+    private var heroDetail: String {
+        if let receiverError { return receiverError }
+        if running { return status }
+        return "启动后，在这台 iPhone 的 CarPlay 里选择本机"
+    }
+
+    var body: some View {
+        TabView(selection: $tab) {
+            NavigationStack {
+                DashboardView(
+                    identity: identity,
+                    heroState: heroState,
+                    heroDetail: heroDetail,
+                    receiverError: receiverError,
+                    running: running,
+                    phoneConnected: phoneConnected,
+                    hasVideo: hasVideo,
+                    startedAt: startedAt,
+                    videoLayer: decoder.layer,
+                    pipReady: pipReady,
+                    carLinkState: carLinkState,
+                    carLinkRunning: carLinkRunning,
+                    headUnitIP: headUnitIP,
+                    headUnitIPField: $headUnitIP,
+                    localIPField: $localIP,
+                    pairingCodeField: $pairingCode,
+                    onToggleReceiver: { running ? stop() : start() },
+                    onPiP: {
+                        if !pip.start() { appendLog("画中画不可用") }
+                    },
+                    onSelectSize: { setSize($0, $1) },
+                    onConnectCarLink: { startCarLink() },
+                    onDisconnectCarLink: { stopCarLink() },
+                    onImportIdentity: { showingImporter = true },
+                    onOpenSettings: { tab = 2 }
+                )
+                .navigationTitle("驾驶舱")
+            }
+            .tabItem { Label("驾驶舱", systemImage: "gauge.with.dots.needle.33percent") }
+            .tag(0)
+
+            NavigationStack {
+                LogView(lines: log, onClear: { log.removeAll() })
+                    .navigationTitle("日志")
+            }
+            .tabItem { Label("日志", systemImage: "doc.text") }
+            .tag(1)
+
+            NavigationStack {
+                SettingsView(
+                    identity: identity,
+                    selectedSize: targetSize,
+                    onSelectSize: { setSize($0, $1) },
+                    onImportIdentity: { showingImporter = true }
+                )
+                .navigationTitle("设置")
+            }
+            .tabItem { Label("设置", systemImage: "gearshape") }
+            .tag(2)
+        }
+        .tint(.sunsetAccent)
+        .fileImporter(isPresented: $showingImporter,
+                      allowedContentTypes: [.data, .item],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                do { appendLog(try identity.importFiles(urls)) }
+                catch { appendLog("导入失败：\(error.localizedDescription)") }
+            case .failure(let error):
+                appendLog("导入失败：\(error.localizedDescription)")
+            }
+        }
+        .onAppear {
+            if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
+            pipReady = pip.setup(layer: decoder.layer)
+        }
+    }
 
     private var clinkStateDirectory: String {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -206,6 +190,9 @@ struct ContentView: View {
 
     private func start() {
         decoder.reset()
+        phoneConnected = false
+        hasVideo = false
+        receiverError = nil
         core.onLog = { appendLog($0) }
         core.onState = { text in status = text }
         core.onVideoCodec = { kind, value in
@@ -213,10 +200,13 @@ struct ContentView: View {
             appendLog("视频流 \(kind) 编码 \(value == 2 ? "HEVC" : "H.264")")
         }
         core.onVideoConfig = { kind, data in
+            phoneConnected = true
             decoder.configure(codec: codec, config: data)
             appendLog("解码配置 \(kind)：\(data.count) 字节")
         }
         core.onVideoFrame = { _, data, nanos in
+            if !hasVideo { hasVideo = true }
+            if !phoneConnected { phoneConnected = true }
             decoder.append(data, ptsNanos: nanos)
         }
         core.onAudioFormat = { data in
@@ -235,10 +225,13 @@ struct ContentView: View {
                                  port: 7000)
         running = started
         if started {
+            startedAt = Date()
             advertiser.start(deviceId: identity.deviceId, port: 7000)
             appendLog("接收端已启动，等待 iPhone 的 CarPlay 会话")
             UIApplication.shared.isIdleTimerDisabled = true
         } else {
+            receiverError = core.lastError ?? "启动失败"
+            Haptics.error()
             appendLog(core.lastError ?? "启动失败")
         }
     }
@@ -247,10 +240,17 @@ struct ContentView: View {
         core.stop()
         advertiser.stop()
         running = false
+        phoneConnected = false
+        hasVideo = false
+        startedAt = nil
         status = "已停止"
     }
 
     private func appendLog(_ line: String) {
+        if line.contains("device-info") && !phoneConnected {
+            phoneConnected = true
+            Haptics.success()
+        }
         let stamp = DateFormatter.logFormatter.string(from: Date())
         log.append("[\(stamp)] \(line)")
         if log.count > 400 { log.removeFirst(log.count - 400) }
