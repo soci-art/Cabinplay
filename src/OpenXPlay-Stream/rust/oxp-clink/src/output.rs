@@ -41,6 +41,13 @@ struct Handoff {
     queue: VideoQueue,
     media_formats: Vec<(u32, Arc<AudioFormat>)>,
     media_stream: Option<u32>,
+    /// 音频桥入口三道门的拦截计数（会话围栏／主流对不上／包过大）：
+    /// 以前全是静默 return——1850 轮接收端近万个声音包、核心零送
+    /// 出、日志零痕迹，就是死在这里看不见。计数供 on_audio_packet
+    /// 节流打诊断，下次哪道门拦的一眼可见。
+    audio_drop_session: u64,
+    audio_drop_stream: u64,
+    audio_drop_size: u64,
     audio: VecDeque<AudioPacket>,
     audio_bytes: usize,
     voice_streams: BTreeSet<u32>,
@@ -112,6 +119,9 @@ impl Run {
                 queue: VideoQueue::default(),
                 media_formats: Vec::new(),
                 media_stream: None,
+                audio_drop_session: 0,
+                audio_drop_stream: 0,
+                audio_drop_size: 0,
                 audio: VecDeque::new(),
                 audio_bytes: 0,
                 voice_streams: BTreeSet::new(),
@@ -522,9 +532,18 @@ impl ClinkOutput {
                     h.media_formats.push((stream, f.clone()));
                 } else {
                     h.diagnostic(format!("unsupported_media_audio:{stream}"));
+                    h.diagnostic(format!(
+                        "音频桥：主流声音格式被核心拒收（流 {stream}，{} Hz / {} 声道）——核心只收 AAC-LC 48000 Hz / 2 声道 / 配置 [0x11, 0x90]，这一轮声音送不到车机",
+                        f.sample_rate, f.channels
+                    ));
                 }
             }
             h.media_stream = h.media_formats.last().map(|(s, _)| *s);
+            if h.media_stream == Some(stream) && previous != Some(stream) {
+                h.diagnostic(format!(
+                    "音频桥：核心已登记主流声音格式（流 {stream}，AAC-LC 48000 Hz / 2 声道），声音包开始进队列"
+                ));
+            }
             if previous != h.media_stream || previous == Some(stream) {
                 h.audio.clear();
                 h.audio_bytes = 0;
@@ -545,10 +564,25 @@ impl ClinkOutput {
         if let Some(run) = self.current.lock().unwrap().clone() {
             let mut h = run.handoff.lock().unwrap();
             if !run.active.load(Ordering::Acquire) || h.input_session != Some(packet.session) {
+                h.audio_drop_session += 1;
+                let total = h.audio_drop_session;
+                if total == 1 || total % 300 == 0 {
+                    h.diagnostic(format!(
+                        "音频桥：声音包被核心入口围栏拦下（输出未激活或输入会话未对齐），累计 {total} 个"
+                    ));
+                }
                 return;
             }
             if h.media_stream == Some(packet.stream) {
                 if !(1..=8184).contains(&packet.data.len()) {
+                    h.audio_drop_size += 1;
+                    let total = h.audio_drop_size;
+                    if total == 1 || total % 300 == 0 {
+                        h.diagnostic(format!(
+                            "音频桥：声音包大小异常（{} 字节）被拦下，累计 {total} 个",
+                            packet.data.len()
+                        ));
+                    }
                     return;
                 }
                 if let Some(skew) = h.clock_mix.audio(packet.pts_us, Instant::now()) {
@@ -569,6 +603,19 @@ impl ClinkOutput {
                 h.audio.push_back(packet);
             } else if h.voice_streams.contains(&packet.stream) {
                 run.voice.packet(packet);
+            } else {
+                h.audio_drop_stream += 1;
+                let total = h.audio_drop_stream;
+                if total == 1 || total % 300 == 0 {
+                    let registered = h
+                        .media_stream
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "无（格式还没登记上）".into());
+                    h.diagnostic(format!(
+                        "音频桥：声音包的流（{}）与核心登记的主流（{registered}）对不上，被拦下，累计 {total} 个——先看「核心已登记主流声音格式」那一行有没有出现",
+                        packet.stream
+                    ));
+                }
             }
         }
     }
@@ -716,6 +763,18 @@ fn media_worker(
     // reported through the diagnostic channel every 500 frames so the app
     // log can prove audio reached the car without needing a trace run.
     let mut audio_frames_written = 0u64;
+    // 音频时间轴校正（1850 零送出定案后加）：接收端声音包的 pts 走
+    // RTP 位置时钟（browserTimestamp），与按到达打戳的视频 pts 有
+    // 恒定偏差（实测约 400ms）；实时出画后 offset 只按视频锚定，
+    // 声音超前时 ±50ms 的排空窗口永远等不到、队列只进不出，滞后
+    // 时又被静默丢弃——整场零送出、零日志。校正量在排空前发现队
+    // 首超前画面时钟过多时一次性拉平；迟到包贴着画面时钟送出、
+    // 不再丢。看门狗在队列积压且长时间无送出时打全现场。
+    let mut audio_pts_correction = 0i64;
+    let mut audio_late_clamped = 0u64;
+    let mut audio_last_write_at: Option<Instant> = None;
+    let mut audio_stuck_reported_at: Option<Instant> = None;
+    let worker_started_at = Instant::now();
     let mut trace_stats = run.trace.as_ref().map(|_| TraceMedia::default());
     while run.active.load(Ordering::Acquire) {
         let session = run.session.lock().unwrap().clone();
@@ -765,6 +824,9 @@ fn media_worker(
                     session_codec = None;
                     keyframes = KeyframeRequests::default();
                     placeholder_feed_reported = false;
+                    audio_pts_correction = 0;
+                    audio_last_write_at = None;
+                    audio_stuck_reported_at = None;
                 }
                 placeholder_index = 0;
                 next_placeholder = Instant::now();
@@ -1138,12 +1200,26 @@ fn media_worker(
                             video_clock.audio_offset = Some(output_pts.max(0) - p.pts_us);
                         }
                     }
-                    let offset = if gate.live {
+                    let base_offset = if gate.live {
                         live_offset
                     } else {
                         video_clock.audio_offset.unwrap_or(0)
                     };
-                    poll_audio(&mut h, offset, video_clock.pts(output_pts, Instant::now()))
+                    let clock = video_clock.pts(output_pts, Instant::now());
+                    // 队首超前画面时钟过多＝两条时间轴的恒定偏差：一次
+                    // 性拉平，不然排空窗口永远对不上（见状态量注释）。
+                    if let Some(front) = h.audio.front() {
+                        let front_mapped = front.pts_us + base_offset + audio_pts_correction;
+                        if let Some(adjust) = audio_lead_adjustment(front_mapped, clock) {
+                            audio_pts_correction += adjust;
+                            h.diagnostic(format!(
+                                "音频桥：声音包时间比画面快了约 {} 毫秒，已把声音时间对齐到画面（累计校正 {} 微秒）",
+                                -adjust / 1000,
+                                audio_pts_correction
+                            ));
+                        }
+                    }
+                    poll_audio(&mut h, base_offset + audio_pts_correction, clock)
                 };
                 if let Some(p) = audio {
                     let mapped = p.pts_us
@@ -1151,9 +1227,22 @@ fn media_worker(
                             live_offset
                         } else {
                             video_clock.audio_offset.unwrap_or(0)
-                        };
-                    if mapped >= 0 && mapped >= transport_pts - 50_000 {
-                        let pts = mapped.max(transport_pts);
+                        }
+                        + audio_pts_correction;
+                    // 迟到包不再静默丢弃：贴着画面时钟送出并计数打日志
+                    // ——「包流即桥送」，每一道门都不许无声。
+                    let late_by = transport_pts - 50_000 - mapped;
+                    if late_by > 0 {
+                        audio_late_clamped += 1;
+                        if audio_late_clamped == 1 || audio_late_clamped % 300 == 0 {
+                            listener.diagnostic(&format!(
+                                "音频桥：声音包比画面时钟迟到约 {} 毫秒，已贴着当前时刻送出（累计 {audio_late_clamped} 个）",
+                                late_by / 1000
+                            ));
+                        }
+                    }
+                    {
+                        let pts = mapped.max(transport_pts).max(0);
                         adts.clear();
                         adts.extend_from_slice(&oxp_media::Adts::build_header(
                             &audio_config,
@@ -1171,6 +1260,7 @@ fn media_worker(
                         }
                         if result != Emit::Dropped {
                             audio_frames_written += 1;
+                            audio_last_write_at = Some(Instant::now());
                             if audio_frames_written % 500 == 0 {
                                 listener.diagnostic(&format!(
                                     "音频桥：已向车机送出 {audio_frames_written} 个声音包"
@@ -1181,6 +1271,36 @@ fn media_worker(
                         if result == Emit::Late {
                             writable = false;
                         }
+                    }
+                }
+            }
+        }
+        // 音频桥看门狗：队列里有包、却连续 3 秒一个都没送出去，就把
+        // 全现场打出来（积压数、最老包时刻、已送出数、车机这轮协商
+        // 带没带声音），5 秒最多一行——杜绝 1850 那种「零送出、零日
+        // 志」再发生：桥不动，日志必须说话。
+        {
+            let (queued, front_pts) = {
+                let h = run.handoff.lock().unwrap();
+                (h.audio.len(), h.audio.front().map(|p| p.pts_us))
+            };
+            if queued > 0 {
+                let idle_since = audio_last_write_at.unwrap_or(worker_started_at);
+                let now = Instant::now();
+                if now.duration_since(idle_since) >= Duration::from_secs(3)
+                    && audio_stuck_reported_at
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5))
+                {
+                    audio_stuck_reported_at = Some(now);
+                    if snapshot.media_audio {
+                        listener.diagnostic(&format!(
+                            "音频桥：队列积压 {queued} 个声音包（最老一个时刻 {} 微秒）迟迟送不出去，已送出 {audio_frames_written} 个——看前面的门拦截与时间校正日志",
+                            front_pts.unwrap_or(0)
+                        ));
+                    } else {
+                        listener.diagnostic(&format!(
+                            "音频桥：队列积压 {queued} 个声音包，但车机这轮协商没带声音通道，包只进不出，已送出 {audio_frames_written} 个"
+                        ));
                     }
                 }
             }
@@ -1491,6 +1611,15 @@ impl VideoClock {
             .is_none_or(|t| now.duration_since(t) > Duration::from_secs(3))
     }
 }
+/// 队首声音包的映射时刻比画面时钟快过 250ms 时，返回要加到声音
+/// offset 上的校正量（负数，把队首拉回画面时钟）；不超界返回
+/// None。两条时间轴的偏差是恒定差（实测约 400ms），一次性拉平
+/// 即可、不逐包追赶；250ms 界取在正常抖动之上、400ms 实测偏差
+/// 之下。
+fn audio_lead_adjustment(front_mapped: i64, clock_pts: i64) -> Option<i64> {
+    (front_mapped - clock_pts > 250_000).then_some(clock_pts - front_mapped)
+}
+
 fn poll_audio(h: &mut Handoff, offset: i64, clock_pts: i64) -> Option<AudioPacket> {
     if h.audio
         .front()
@@ -2081,10 +2210,16 @@ mod audio_tests {
                 config: None,
             })),
         );
-        assert_eq!(
-            run.handoff.lock().unwrap().diagnostics.front().unwrap(),
-            "unsupported_media_audio:4"
-        );
+        // The unsupported-format diagnostic must be recorded (the queue
+        // front is now the stream-0 registration line, which is also
+        // asserted to exist by the audio bridge diagnostics).
+        assert!(run
+            .handoff
+            .lock()
+            .unwrap()
+            .diagnostics
+            .iter()
+            .any(|d| d == "unsupported_media_audio:4"));
         o.on_audio_format(3, None);
         assert_eq!(run.handoff.lock().unwrap().media_stream, Some(0));
         o.on_microphone(
@@ -2106,6 +2241,21 @@ mod audio_tests {
         assert!(h.audio.is_empty() && h.media_stream.is_none() && h.microphone.is_none());
         drop(h);
         o.close();
+    }
+    #[test]
+    fn audio_lead_adjustment_only_beyond_250_ms() {
+        // At or under the 250 ms bound: no correction (normal jitter).
+        assert_eq!(super::audio_lead_adjustment(1_250_000, 1_000_000), None);
+        assert_eq!(super::audio_lead_adjustment(900_000, 1_000_000), None);
+        // Beyond it: pull the front packet back onto the video clock.
+        assert_eq!(
+            super::audio_lead_adjustment(1_250_001, 1_000_000),
+            Some(-250_001)
+        );
+        assert_eq!(
+            super::audio_lead_adjustment(1_400_000, 1_000_000),
+            Some(-400_000)
+        );
     }
     #[test]
     fn audio_on_another_clock_is_reported_once_per_session() {

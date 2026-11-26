@@ -61,5 +61,11 @@ uint32_t clink_touch_geometry(uint32_t *out);
 /* While capture is on, touches report raw coordinates via
  * on_touch_capture and are never forwarded as normal touches. */
 void clink_set_touch_capture(uint32_t enabled);
+/* Touch conversion mode: 0 = passthrough (raw), 1 = centered model,
+ * 2 = calibrated (default). Takes effect immediately. */
+void clink_set_touch_mode(uint32_t mode);
+/* Re-print the touch anchor line (declared geometry + active
+ * conversion mode/rectangle) into the diagnostic log. */
+void clink_log_touch_anchor(void);
 
 #endif /* OXP_CLINK_IOS_H */

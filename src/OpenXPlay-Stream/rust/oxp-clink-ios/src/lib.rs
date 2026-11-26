@@ -413,6 +413,59 @@ pub extern "C" fn clink_set_touch_capture(enabled: u32) {
     });
 }
 
+/// Set the touch conversion mode (settings three-way switch, for
+/// model evidence gathering): 0 = passthrough (raw, no correction),
+/// 1 = centered drift model, anything else = calibrated (preset or
+/// manual rectangle, falling back to centered). Default is
+/// calibrated. Takes effect immediately; the switch itself is logged.
+#[no_mangle]
+pub extern "C" fn clink_set_touch_mode(mode: u32) {
+    let mode = match mode {
+        0 => oxp_clink::uibc::TouchMode::Passthrough,
+        1 => oxp_clink::uibc::TouchMode::Centered,
+        _ => oxp_clink::uibc::TouchMode::Calibrated,
+    };
+    touch_cal_state().lock().unwrap().mode = mode;
+    log(&format!("触控模式已切换：{}（立即生效）", mode.label()));
+}
+
+/// Re-print the touch anchor on demand (Swift calls this once per
+/// session when playback starts): the head unit's declared CONTROL
+/// geometry plus the conversion mode/rectangle in effect — so a log
+/// export that starts mid-session still carries the anchor instead
+/// of losing it with the session's opening lines.
+#[no_mangle]
+pub extern "C" fn clink_log_touch_anchor() {
+    let state = touch_cal_state();
+    let state = state.lock().unwrap();
+    let surface = state
+        .surface
+        .map(|(w, h)| format!("{w}×{h}"))
+        .unwrap_or_else(|| "未知".into());
+    let visible = state
+        .visible
+        .map(|(w, h)| format!("{w}×{h}"))
+        .unwrap_or_else(|| "未知".into());
+    let mode_desc = match state.mode {
+        oxp_clink::uibc::TouchMode::Passthrough => "直通（不校正）".to_string(),
+        oxp_clink::uibc::TouchMode::Centered => "居中模型".to_string(),
+        oxp_clink::uibc::TouchMode::Calibrated => match state.calibration {
+            Some((cal, source)) => format!(
+                "{}，矩形 left={:.4} right={:.4} top={:.4} bottom={:.4}",
+                source.label(),
+                cal.left,
+                cal.right,
+                cal.top,
+                cal.bottom
+            ),
+            None => "居中模型（按校准档，但这台车没有校准记录）".to_string(),
+        },
+    };
+    log(&format!(
+        "触控定锚（出画后重打）：车机声明 screen {surface}，videoDisplay {visible}；当前换算方式：{mode_desc}"
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Phone identity presented to the head unit (set by Swift before clink_start)
 // ---------------------------------------------------------------------------
