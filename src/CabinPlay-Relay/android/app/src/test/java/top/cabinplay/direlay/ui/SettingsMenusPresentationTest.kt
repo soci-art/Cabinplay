@@ -1,0 +1,107 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-21
+package top.cabinplay.direlay.ui
+
+import android.app.Application
+import android.content.res.Configuration
+import org.junit.Assert.*
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
+import top.cabinplay.direlay.R
+import top.cabinplay.direlay.relay.CarBrand
+import top.cabinplay.direlay.relay.CarModel
+import top.cabinplay.direlay.relay.CarYear
+import top.cabinplay.direlay.relay.CarModels
+import top.cabinplay.direlay.settings.CarSelection
+import top.cabinplay.direlay.settings.TeslaBrowserMode
+import top.cabinplay.direlay.storage.MaterialStatus
+import top.cabinplay.direlay.ui.design.IconHue
+import java.util.Locale
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], manifest = Config.NONE, application = Application::class)
+class SettingsMenusPresentationTest {
+    @Test fun displayPageUsesItsMenuTitleAndPictureHue() {
+        assertEquals(R.string.display_title, settingsPageTitle("settings/display"))
+        assertEquals(IconHue.PICTURE, settingsMenuHue(R.string.display_title))
+    }
+
+    @Test fun displaySummaryNamesHighPerformanceInEnglishAndChinese() {
+        val application = RuntimeEnvironment.getApplication()
+        for (locale in listOf(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE)) {
+            val context = application.createConfigurationContext(Configuration(application.resources.configuration).apply { setLocale(locale) })
+            for (highPerformance in listOf(false, true)) {
+                val performance = context.getString(if (highPerformance) R.string.menu_on else R.string.menu_off)
+                val expected = if (locale == Locale.ENGLISH) "High performance: $performance" else "高性能：$performance"
+                assertEquals(expected, context.getString(R.string.menu_display_summary, performance))
+            }
+        }
+    }
+
+    @Test fun teslaIsAlwaysInTheFirstMenuGroupDirectlyAfterCarAndScreen() {
+        assertEquals(listOf("settings/output", "settings/car", "settings/tesla", "settings/picture", "settings/audio"),
+            settingsMainPages.map { it.route })
+        val tesla = settingsMainPages.single { it.route == "settings/tesla" }
+        assertEquals(R.string.tesla_title, tesla.title)
+        assertEquals(R.string.tesla_title, settingsPageTitle(tesla.route))
+        assertEquals(R.drawable.symbol_car, tesla.icon)
+        assertEquals(IconHue.CAR, settingsMenuHue(tesla.title))
+    }
+
+    @Test fun teslaMenuSummaryUsesTheSelectedModesTitleIncludingOff() {
+        val titles = mapOf(TeslaBrowserMode.OFF to R.string.tesla_off, TeslaBrowserMode.TESLAMIRROR to R.string.tesla_mirror,
+            TeslaBrowserMode.VIRTUAL_NAME to R.string.tesla_virtual_name, TeslaBrowserMode.PUBLIC_ADDRESS to R.string.tesla_public_address,
+            TeslaBrowserMode.TESLA_ANDROID to R.string.tesla_android)
+        TeslaBrowserMode.entries.forEach { mode -> assertEquals(titles.getValue(mode), teslaBrowserOption(mode).title) }
+    }
+
+    @Test fun frameRateAndPictureSummariesShowTheSuppliedSessionOrNextStartRate() {
+        val auto = top.cabinplay.stream.core.FrameRatePreference.AUTO
+        assertEquals("Auto · 60 fps", frameRateSummary(auto, 60, "Auto"))
+        assertEquals("自动 · 30 fps", frameRateSummary(auto, 30, "自动"))
+        assertEquals("45 fps", frameRateSummary(top.cabinplay.stream.core.FrameRatePreference.FPS_45, 45, "Auto"))
+        assertEquals("Automatic · 200 mm · H.265 · 60 fps", pictureMenuSummary("Automatic", 200, "H.265", 60))
+    }
+
+    private val models = CarModels(listOf(CarBrand("xpeng", mapOf("en" to "XPeng", "zh-CN" to "小鹏"),
+        listOf(CarModel("g6", mapOf("en" to "G6", "zh-CN" to "G6"),
+            listOf(CarYear("g6-2023", mapOf("en" to "2023", "zh-CN" to "2023"), emptyList())))))))
+
+    @Test fun identityPageUsesItsMenuTitleAndStatusLabels() {
+        assertEquals(R.string.menu_identity, settingsPageTitle("settings/identity"))
+        assertEquals(R.string.direlay_installed, identityStatusKey(MaterialStatus.Installed))
+        assertEquals(R.string.direlay_missing, identityStatusKey(MaterialStatus.Missing))
+        assertEquals(R.string.dev_invalid_identity, identityStatusKey(MaterialStatus.Invalid("Invalid files")))
+    }
+
+    @Test fun backgroundPageUsesItsMenuTitleAndPermissionHue() {
+        assertEquals(R.string.background_title, settingsPageTitle("settings/background"))
+        assertEquals(IconHue.PERMISSIONS, settingsMenuHue(R.string.background_title))
+    }
+
+    @Test fun summariesResolveCatalogIdsInTheCurrentLocale() {
+        val car = CarSelection("xpeng", model = "g6", year = "g6-2023")
+        assertEquals("XPeng · G6 · 2023", carSelectionSummary(car, models, Locale.ENGLISH, "None", "Other"))
+        assertEquals("小鹏 · G6 · 2023", carSelectionSummary(car, models, Locale.SIMPLIFIED_CHINESE, "无", "其他"))
+    }
+
+    @Test fun incompleteSelectionsLeaveEmptyPartsOut() {
+        assertEquals("XPeng", carSelectionSummary(CarSelection("xpeng"), models, Locale.ENGLISH, "None", "Other"))
+        assertEquals("XPeng · G6", carSelectionSummary(CarSelection("xpeng", model = "g6"), models, Locale.ENGLISH, "None", "Other"))
+        assertEquals("XPeng · G6 · Custom", carSelectionSummary(CarSelection("xpeng", model = "g6", year = "other", yearText = "Custom"),
+            models, Locale.ENGLISH, "None", "Other"))
+    }
+
+    @Test fun customAndUnavailableModelsNeverExposeRawCatalogIds() {
+        assertEquals("My brand · My model · My year", carSelectionSummary(CarSelection("other", "My brand", "other", "My model", "other", "My year"),
+            models, Locale.ENGLISH, "None", "Other"))
+        assertEquals("其他 · 其他 · 其他", carSelectionSummary(CarSelection("other", model = "other", year = "other"),
+            models, Locale.SIMPLIFIED_CHINESE, "无", "其他"))
+        assertEquals("None", carSelectionSummary(CarSelection("xpeng", model = "g6", year = "g6-2023"), null, Locale.ENGLISH, "None", "Other"))
+        assertEquals("None", carSelectionSummary(CarSelection(), models, Locale.ENGLISH, "None", "Other"))
+    }
+}

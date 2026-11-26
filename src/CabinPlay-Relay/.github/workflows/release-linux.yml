@@ -1,0 +1,284 @@
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: AGPL-3.0-only
+# Created by riko chen on 2026-10-19
+
+name: Release Linux
+
+# A pushed tag linux-vMAJOR.MINOR.PATCH[-PRERELEASE] publishes the Linux relay as a GitHub
+# Release (tarball, Debian package and flash-stage manifest). A manual run from a branch builds
+# the same files and keeps them as workflow artifacts only. The Android app is released separately
+# by release-android.yml.
+on:
+  push:
+    tags: ['linux-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Path components that must never ship: MFi identities, TLS secrets, offline MFi material.
+  IDENTITY_FILES: '(^|/)(offline-mfi[^/]*|tls\.password|[^/]*\.(pk8|p7b|p12|pfx))(/|$)'
+
+# The Rust build references CabinPlay-Stream by relative path, so the jobs check the repositories
+# out side by side, Stream at the commit resolved in prepare.
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      stream-sha: ${{ steps.pin.outputs.stream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: CabinPlay-Relay
+      # The relay reports its Cargo workspace version, so a release tag must match it.
+      - name: Derive version
+        id: version
+        run: |
+          cargo=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' CabinPlay-Relay/rust/Cargo.toml)
+          [[ $cargo =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::Cannot read the workspace version from rust/Cargo.toml."; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            pattern='^linux-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+            if ! [[ $GITHUB_REF_NAME =~ $pattern ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME must be linux-vMAJOR.MINOR.PATCH or linux-vMAJOR.MINOR.PATCH-PRERELEASE."
+              exit 1
+            fi
+            version=${GITHUB_REF_NAME#linux-v}
+            # Exact match, pre-release included, so every beta reports its own version.
+            if [ "$cargo" != "$version" ]; then
+              echo "::error::rust/Cargo.toml has version $cargo; set it to $version before tagging $GITHUB_REF_NAME."
+              exit 1
+            fi
+            prerelease=false
+            [ -z "${BASH_REMATCH[4]}" ] || prerelease=true
+            { echo "version=$version"; echo release=true; echo "prerelease=$prerelease"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "version=$cargo-dev.${GITHUB_SHA::7}"; echo release=false; echo prerelease=false; } >> "$GITHUB_OUTPUT"
+          fi
+      # Every build of a Relay commit uses the same CabinPlay-Stream commit, the one in stream.lock. The Linux
+      # relay does not build CabinPlay-DiPlay, so diplay.lock does not apply.
+      - name: Read the locked Stream commit
+        id: pin
+        run: |
+          stream=$(CabinPlay-Relay/scripts/sources.sh read stream)
+          echo "stream=$stream" >> "$GITHUB_OUTPUT"
+      # The release notes link this commit as the source, so it must stay reachable on main.
+      - name: Check that the locked commit is on main
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: CabinPlay-Relay/scripts/sources.sh on-main stream
+      - uses: actions/checkout@v4
+        with:
+          repository: CabinPlay/CabinPlay-Stream
+          ref: ${{ steps.pin.outputs.stream }}
+          path: CabinPlay-Stream
+      - name: Check the Stream checkout
+        run: CabinPlay-Relay/scripts/sources.sh verify stream CabinPlay-Stream
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            CabinPlay-Relay/admin-web/package-lock.json
+            CabinPlay-Stream/rust/web-receiver/package-lock.json
+      - name: Build admin page
+        working-directory: CabinPlay-Relay/admin-web
+        run: npm ci && npm run build
+      # The Linux relay ships the Rust stack's web receiver.
+      - name: Build web receiver
+        working-directory: CabinPlay-Stream/rust/web-receiver
+        env:
+          OXP_APP_VERSION: ${{ steps.version.outputs.version }}
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: |
+            CabinPlay-Relay/admin-web/dist
+            CabinPlay-Stream/rust/web-receiver/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: Linux relay (aarch64)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: CabinPlay-Relay
+      - uses: actions/checkout@v4
+        with:
+          repository: CabinPlay/CabinPlay-Stream
+          ref: ${{ needs.prepare.outputs.stream-sha }}
+          path: CabinPlay-Stream
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target aarch64-unknown-linux-musl --component llvm-tools
+          rustup default 1.99.1
+          command -v clang >/dev/null || { sudo apt-get update && sudo apt-get install -y clang; }
+      - name: Build cabinplay-relay
+        working-directory: CabinPlay-Relay/rust
+        run: cargo fetch --locked && scripts/build-aarch64.sh --locked
+      - name: Build oxp-relay
+        working-directory: CabinPlay-Stream/rust
+        run: scripts/build-aarch64.sh --locked -p oxp-bin --bin oxp-relay
+      # The layout mirrors the repository, so rust/packaging/install.sh installs it directly and
+      # CabinPlay-Hardware's make-bundle.sh accepts its rust/packaging directory.
+      - name: Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          name="cabinplay-relay-$VERSION-linux-aarch64"
+          pkg="$RUNNER_TEMP/package/$name"
+          target=aarch64-unknown-linux-musl/release
+          mkdir -p "$pkg/bin" "$pkg/rust/packaging" "$pkg/licenses/CabinPlay-Stream" "$RUNNER_TEMP/dist"
+          install -m 0755 "CabinPlay-Relay/rust/target/$target/cabinplay-relay" "CabinPlay-Stream/rust/target/$target/oxp-relay" "$pkg/bin/"
+          for binary in "$pkg"/bin/*; do
+            file -b "$binary" | grep -E 'ARM aarch64.*(statically|static-pie) linked' ||
+              { echo "::error::$binary is not a static aarch64 executable."; exit 1; }
+          done
+          cp -R CabinPlay-Stream/rust/web-receiver/dist "$pkg/web"
+          cp -R CabinPlay-Relay/admin-web/dist "$pkg/admin"
+          install -m 0644 CabinPlay-Relay/LICENSE CabinPlay-Relay/LICENSE-GPL-3.0 CabinPlay-Relay/NOTICE "$pkg/"
+          install -m 0644 CabinPlay-Stream/NOTICE CabinPlay-Stream/THIRD-PARTY-LICENSES.md "$pkg/licenses/CabinPlay-Stream/"
+          install -m 0755 CabinPlay-Relay/rust/packaging/install.sh "$pkg/rust/packaging/"
+          install -m 0644 CabinPlay-Relay/rust/packaging/plugins-bundle.py "$pkg/rust/packaging/"
+          install -m 0644 CabinPlay-Relay/rust/packaging/cabinplay-relay.service "$pkg/rust/packaging/"
+          cp -a CabinPlay-Relay/rust/packaging/host "$pkg/rust/packaging/host"
+          # Install into a staging root to prove the package meets the installer's input checks.
+          root="$RUNNER_TEMP/install-root"
+          stub="$RUNNER_TEMP/stub"
+          mkdir -p "$root/etc/systemd/system" "$stub"
+          printf '#!/bin/sh\nexit 0\n' > "$stub/systemctl" && chmod +x "$stub/systemctl"
+          (cd "$pkg" && PATH="$stub:$PATH" DESTDIR="$root" sh rust/packaging/install.sh bin/cabinplay-relay bin/oxp-relay web admin)
+          test -x "$root/opt/cabinplay/bin/oxp-relay" && test -f "$root/opt/cabinplay/share/web/receiver/index.html"
+          for policy in powersave scan-mac; do
+            cmp "$pkg/rust/packaging/host/cabinplay-relay-wifi-$policy.conf" "$root/etc/NetworkManager/conf.d/cabinplay-relay-wifi-$policy.conf"
+            test "$(stat -c %a "$root/etc/NetworkManager/conf.d/cabinplay-relay-wifi-$policy.conf")" = 644
+          done
+          cmp "$pkg/rust/packaging/host/clock-guard" "$root/usr/lib/cabinplay-relay/clock-guard"
+          test "$(stat -c %a "$root/usr/lib/cabinplay-relay/clock-guard")" = 755
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP/package" -czf "$RUNNER_TEMP/dist/$name.tar.gz" "$name"
+          if found=$(tar -tzf "$RUNNER_TEMP/dist/$name.tar.gz" | grep -E -i "$IDENTITY_FILES"); then
+            echo "::error::The package contains identity files:"
+            echo "$found"
+            exit 1
+          fi
+      - name: Build and check relay flash stage
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          fail() { echo "::error::$*" >&2; exit 1; }
+          pkg="$RUNNER_TEMP/package/cabinplay-relay-$VERSION-linux-aarch64"
+          dist="$RUNNER_TEMP/dist"
+          SOURCE_DATE_EPOCH=$(git -C CabinPlay-Relay log -1 --format=%ct) || fail "Cannot read the relay commit time."
+          export SOURCE_DATE_EPOCH
+          sh CabinPlay-Relay/rust/packaging/build-deb.sh "$pkg" "$dist" || fail "Failed to build the relay flash stage."
+          debversion=$(printf '%s' "$VERSION" | sed 's/-/~/')
+          name="cabinplay-relay_${debversion}_arm64"
+          deb="$dist/$name.deb"
+          manifest="$dist/$name.manifest.json"
+          shopt -s nullglob
+          debs=("$dist"/*.deb)
+          manifests=("$dist"/*.manifest.json)
+          [[ ${#debs[@]} -eq 1 && ${debs[0]} = "$deb" ]] || fail "Expected exactly one Debian package: $name.deb."
+          [[ ${#manifests[@]} -eq 1 && ${manifests[0]} = "$manifest" ]] || fail "Expected exactly one flash-stage manifest: $name.manifest.json."
+          info=$(dpkg-deb --info "$deb") || fail "Cannot read the Debian package metadata."
+          for field in 'Package: cabinplay-relay' 'Architecture: arm64' "Version: $debversion"; do
+            grep -Fxq " $field" <<< "$info" || fail "The Debian package must declare $field."
+          done
+          contents=$(dpkg-deb --contents "$deb") || fail "Cannot list the Debian package contents."
+          if found=$(grep -E -i "$IDENTITY_FILES" <<< "$contents"); then
+            fail "The Debian package contains identity files: $found"
+          elif [ "$?" -ne 1 ]; then
+            fail "Cannot check the Debian package for identity files."
+          fi
+          digest=$(sha256sum "$deb") || fail "Cannot hash the Debian package."
+          digest=${digest%% *}
+          jq -e --arg version "$debversion" --arg sha256 "$digest" '
+            .schema == "top.cabinplay.flash-stage/1" and .stage == "relay" and
+            .version == $version and .sha256 == $sha256
+          ' "$manifest" >/dev/null || fail "The relay flash-stage manifest has invalid metadata or a mismatched SHA-256."
+          # GitHub renames release assets with "~" in their names, so the assets use the release
+          # version (0.1.5-beta.1). The manifest keeps the Debian file name it installs under.
+          asset="cabinplay-relay_${VERSION}_arm64"
+          if [ "$asset" != "$name" ]; then
+            mv "$deb" "$dist/$asset.deb" && mv "$manifest" "$dist/$asset.manifest.json" ||
+              fail "Cannot rename the relay flash stage to its release asset names."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-aarch64
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, linux]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-aarch64
+          path: dist
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          STREAM_SHA: ${{ needs.prepare.outputs.stream-sha }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+          # An annotated tag's message is the changelog and opens the notes; a lightweight tag has none.
+          changelog=""
+          read -r type sha < <(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          if [ "$type" = tag ]; then
+            # A signed tag's message ends with its signature block, which is not part of the changelog.
+            changelog="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq .message | sed '/^-----BEGIN [A-Z]* SIGNATURE-----$/,$d')"
+          fi
+          # The rest of the notes record the exact sources of every file in the release.
+          server="$GITHUB_SERVER_URL/CabinPlay"
+          notes="${changelog:+$changelog
+
+          ---
+
+          }Built from [CabinPlay-Relay@${GITHUB_SHA::12}]($server/CabinPlay-Relay/commit/$GITHUB_SHA) and [CabinPlay-Stream@${STREAM_SHA::12}]($server/CabinPlay-Stream/commit/$STREAM_SHA).
+
+          - \`cabinplay-relay-$VERSION-linux-aarch64.tar.gz\`: the Linux relay for aarch64 (static musl binaries, web pages and \`rust/packaging/install.sh\`).
+          - \`cabinplay-relay_${VERSION}_arm64.deb\`: the relay Debian package for CabinPlay Flasher and other Debian-based hosts.
+          - \`cabinplay-relay_${VERSION}_arm64.manifest.json\`: the relay flash-stage manifest (\`top.cabinplay.flash-stage/1\`), including the package SHA-256.
+          - \`SHA256SUMS\`: SHA-256 checksums of these files.
+
+          Setup: https://cabinplay.org/quick-start · 设置：https://cabinplay.org/zh/quick-start. No build contains an Apple accessory (MFi) identity; supply your own."
+          # A Linux release never becomes Latest: the latest-download link must keep finding the APK.
+          flags=(--latest=false)
+          [ "$PRERELEASE" != true ] || flags+=(--prerelease)
+          gh release create "$TAG" dist/* --verify-tag --title "CabinPlay Relay for Linux $VERSION" --notes "$notes" "${flags[@]}"

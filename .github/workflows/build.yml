@@ -24,15 +24,15 @@ jobs:
       - name: oxp-clink tests
         run: |
           set -o pipefail
-          cd src/OpenXPlay-Stream/rust
+          cd src/CabinPlay-Stream/rust
           if ! cargo test -p oxp-clink 2>&1 | tee /tmp/rust.log; then
             echo "::error::$(tail -n 20 /tmp/rust.log | tr '\n' ' ' | cut -c1-800)"
             exit 1
           fi
       - name: rust builds
         run: |
-          cd src/OpenXPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
-          cd ../../OpenXPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
+          cd src/CabinPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
+          cd ../../CabinPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
 
   ios:
     name: ios-simulator-build
@@ -50,23 +50,23 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           (
             for t in aarch64-apple-ios-sim x86_64-apple-ios; do
-              ( cd "$ROOT/src/OpenXPlay-Relay/rust" && cargo build -p oxp-ios --release --target $t )
-              ( cd "$ROOT/src/OpenXPlay-Stream/rust" && cargo build -p oxp-clink-ios --release --target $t )
+              ( cd "$ROOT/src/CabinPlay-Relay/rust" && cargo build -p oxp-ios --release --target $t )
+              ( cd "$ROOT/src/CabinPlay-Stream/rust" && cargo build -p oxp-clink-ios --release --target $t )
             done
-            mkdir -p "$ROOT/OpenXPlay-iOS/generated"
+            mkdir -p "$ROOT/CabinPlay-iOS/generated"
             lipo -create \
-              "$ROOT/src/OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a" \
-              "$ROOT/src/OpenXPlay-Relay/rust/target/x86_64-apple-ios/release/liboxp_ios.a" \
-              -output "$ROOT/OpenXPlay-iOS/generated/liboxp_ios.a"
+              "$ROOT/src/CabinPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a" \
+              "$ROOT/src/CabinPlay-Relay/rust/target/x86_64-apple-ios/release/liboxp_ios.a" \
+              -output "$ROOT/CabinPlay-iOS/generated/liboxp_ios.a"
             lipo -create \
-              "$ROOT/src/OpenXPlay-Stream/rust/target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a" \
-              "$ROOT/src/OpenXPlay-Stream/rust/target/x86_64-apple-ios/release/liboxp_clink_ios.a" \
-              -output "$ROOT/OpenXPlay-iOS/generated/liboxp_clink_ios.a"
-            cd "$ROOT/OpenXPlay-iOS/generated" && libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
-            cp "$ROOT/src/OpenXPlay-Relay/rust/oxp-ios/include/oxp_ios.h" .
-            cp "$ROOT/src/OpenXPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h" .
-            cd "$ROOT/OpenXPlay-iOS" && xcodegen generate
-            xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+              "$ROOT/src/CabinPlay-Stream/rust/target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a" \
+              "$ROOT/src/CabinPlay-Stream/rust/target/x86_64-apple-ios/release/liboxp_clink_ios.a" \
+              -output "$ROOT/CabinPlay-iOS/generated/liboxp_clink_ios.a"
+            cd "$ROOT/CabinPlay-iOS/generated" && libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
+            cp "$ROOT/src/CabinPlay-Relay/rust/oxp-ios/include/oxp_ios.h" .
+            cp "$ROOT/src/CabinPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h" .
+            cd "$ROOT/CabinPlay-iOS" && xcodegen generate
+            xcodebuild -project CabinPlay.xcodeproj -scheme CabinPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
           ) 2>&1 | tee /tmp/build.log
           code=${PIPESTATUS[0]}
           if [ $code -ne 0 ]; then

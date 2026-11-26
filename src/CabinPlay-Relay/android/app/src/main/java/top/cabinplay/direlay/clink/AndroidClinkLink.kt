@@ -1,0 +1,1220 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-14
+package top.cabinplay.direlay.clink
+
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.bluetooth.le.*
+import android.content.*
+import android.net.*
+import android.net.wifi.WifiNetworkSpecifier
+import android.net.wifi.p2p.*
+import android.os.*
+import android.util.Log
+import top.cabinplay.stream.clink.*
+import top.cabinplay.stream.clink.ble.*
+import top.cabinplay.direlay.network.readWifiEnabled
+import top.cabinplay.direlay.settings.ExperimentalOptions
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+/** Blocking lifecycle API; Android callbacks and owned resource cleanup run on the main handler. */
+@SuppressLint("MissingPermission")
+class AndroidClinkLink(context: Context, private val deviceId: String,
+    private val deviceName: String, private val deviceModel: String,
+    private val diagnostics: ClinkDiagnostics = ClinkDiagnostics.NONE,
+    private val p2pReservation: P2pReservation = P2pReservation { false },
+    private val onSecret: (String) -> Unit = {},
+    experimental: ExperimentalOptions = ExperimentalOptions.OFF) : ClinkLink {
+    private val context = context.applicationContext
+    private val handler = Handler(Looper.getMainLooper())
+    private val bluetooth = context.getSystemService(BluetoothManager::class.java)
+    private val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    private val p2p = context.getSystemService(WifiP2pManager::class.java)
+    companion object {
+        private val reconnect = LinkReconnect()
+        internal val retryBackoff = LinkBackoff()
+        private val scanStartBudget = BleScanStartBudget()
+        /**
+         * Failures that happen before the subscription is ever exercised. They carry no signal about
+         * whether the head unit wants CCCD or a local subscription, so they must not clear that choice.
+         */
+        private val CONNECT_SIDE_FAILURES = setOf(ClinkFailureReason.GATT_CONNECT,
+            ClinkFailureReason.GATT_SERVICES, ClinkFailureReason.BLE_SCAN,
+            ClinkFailureReason.BLE_TIMEOUT, ClinkFailureReason.BLE_DISCOVERY,
+            ClinkFailureReason.BLE_SERVICE_MISSING)
+        /**
+         * How often a running scan reports how much it has heard. A scan that finds nothing produces no
+         * log lines at all, which is why "no progress" and "no such device" looked the same in the field.
+         */
+        private const val SCAN_PROGRESS_MS = 10_000L
+        /** WifiNetworkSpecifier request window; the platform gives up on its own after this. */
+        private const val REQUEST_TIMEOUT_MS = 12_000L
+        /** Never hand the request less than this, even if priming ate most of the stage budget. */
+        private const val MIN_REQUEST_TIMEOUT_MS = 5_000L
+        /**
+         * Window for a join retry. The first attempt gets the full [REQUEST_TIMEOUT_MS] because a slow
+         * access point can still come up inside it; a retry only has to catch an AP that is coming
+         * back, and waiting another full window there costs more than restarting the link.
+         */
+        private const val JOIN_RETRY_BUDGET_MS = 5_000L
+        /**
+         * Pause before a join retry. Short on purpose: every retry polls for the platform's own link,
+         * so the moment the access point returns it is adopted without waiting out the rest.
+         */
+        private const val JOIN_RETRY_FIRST_MS = 500L
+        private const val JOIN_RETRY_NEXT_MS = 1_500L
+        /** Quiet window granted to the platform's own join before asking for a network. */
+        private const val QUIET_JOIN_MS = 2_500L
+        /** How often a link the platform brought up on its own is checked for adoption. */
+        private const val ADOPT_POLL_MS = 100L
+        /**
+         * How long the platform gets to join the saved head-unit network after one scan. Measured:
+         * when the scan does show the AP the link is up in 350-430 ms, so this only has to cover a
+         * slow association, not a whole request window.
+         */
+        private const val PLATFORM_JOIN_MS = 3_000L
+        /** Shorter listen when the scan was refused: the platform may already be joining on its own. */
+        private const val PLATFORM_JOIN_REFUSED_MS = 800L
+        /** How long a freshly started scan is given to deliver results before the request goes out. */
+        private const val PRIME_BUDGET_MS = 3_000L
+        /** How long a scan result counts as evidence that the head unit's AP is up right now. */
+        private const val PRIME_FRESH_MS = 15_000L
+    }
+    private val peerStore = object : BlePeerPolicy.Store, BlePeerPolicy.SubscriptionStore {
+        private val preferences = this@AndroidClinkLink.context.getSharedPreferences("clinkPeers", Context.MODE_PRIVATE)
+        override fun read(key: String): Int? = preferences.getInt(key, 0).takeIf { it != 0 }
+        override fun write(key: String, type: Int) {
+            if (!preferences.edit().putInt(key, type).commit()) cleanupFailure(IllegalStateException("peer_store_failed"))
+        }
+        override fun readLegacy(key: String) = preferences.getBoolean("$key.legacy", false)
+        override fun writeLegacy(key: String) {
+            if (!preferences.edit().putBoolean("$key.legacy", true).commit()) cleanupFailure(IllegalStateException("peer_store_failed"))
+        }
+        override fun removeLegacy(key: String) {
+            if (!preferences.edit().remove("$key.legacy").commit()) cleanupFailure(IllegalStateException("peer_store_failed"))
+        }
+    }
+    private val peers = BlePeerPolicy(peerStore, if (experimental.rememberSubscription) peerStore else null) { message ->
+        Log.i("DiRelayCarlink", message)
+    }
+    private val scanPolicy = BleScanPolicy.forAttempt(experimental.keepScanning)
+    private val phoneAddress: () -> String = if (experimental.sendBluetoothAddress) ({ experimental.bluetoothAddress }) else ::phoneMac
+    private val experimentNames = experimental.names()
+    private val wifiRecovery = experimental.carlinkWifiRecovery
+    private val isolateNetwork = experimental.isolateCarlinkNetwork
+    private val advertisements = if (experimental.recordAdvertisements) BleAdvertisementTrace(diagnostics, object : BleAdvertisementTrace.Store {
+        private val preferences = this@AndroidClinkLink.context.getSharedPreferences("clinkAdvertisementSerials", Context.MODE_PRIVATE)
+        private fun key(carId: String) = peers.key(carId, "")
+        override fun readSerial(carId: String): Int? = key(carId).let { if (preferences.contains(it)) preferences.getInt(it, 0) else null }
+        override fun writeSerial(carId: String, serial: Int) {
+            if (!preferences.edit().putInt(key(carId), serial).commit()) cleanupFailure(IllegalStateException("serial_store_failed"))
+        }
+    }) else null
+    fun authenticated() { advertisements?.connected() }
+    fun sessionDiagnostic(message: String) { advertisements?.sessionDiagnostic(message) }
+    fun refreshWifi() { main { current?.takeUnless { it.cancelled }?.wifiFlow?.refresh() } }
+    private val backoff = retryBackoff
+    private fun retry(run: Run) {
+        val delay = backoff.next()
+        diagnostics.emit(ClinkDiagnostic.Retry(delay))
+        val done = CompletableFuture<Unit>()
+        handler.postDelayed({ done.complete(Unit) }, delay)
+        await(run, done, 16)
+    }
+    /**
+     * Pause between join attempts. Deliberately separate from [retry]: that backoff belongs to the BLE
+     * exchange, and letting a Wi-Fi retry push it to 4 s would slow the next full link start.
+     */
+    private fun joinRetry(run: Run, delayMs: Long) {
+        // Distinct from the BLE backoff on purpose: seeing this line means the link was kept alive
+        // through a Wi-Fi failure instead of being rebuilt from a fresh scan.
+        Log.i("DiRelayCarlink", "join_retry delay=${delayMs}ms")
+        diagnostics.emit(ClinkDiagnostic.Retry(delayMs))
+        val done = CompletableFuture<Unit>()
+        handler.postDelayed({ done.complete(Unit) }, delayMs)
+        await(run, done, 5)
+    }
+    /** MIUI's unanswerable confirmation dialog only: see the comment at the call site. */
+    private val scanAdoptJoin: Boolean get() = miuiRequestsNeedCache
+    /**
+     * Nudges the platform with one scan and adopts whatever link it brings up, without asking for a
+     * network of our own. Returns null when the phone does not join by itself, so the caller falls
+     * back to the request path exactly as before.
+     */
+    @Suppress("DEPRECATION")
+    private fun platformScanJoin(run: Run, ssid: String): Pair<String, String>? {
+        adoptHeadUnitLink(run, ssid)?.let { return it }
+        val wifi = context.getSystemService(android.net.wifi.WifiManager::class.java) ?: return null
+        if (!runCatching { wifi.isWifiEnabled }.getOrDefault(false)) return null
+        val started = SystemClock.elapsedRealtime()
+        val issued = runCatching { wifi.startScan() }.getOrDefault(false)
+        // A refused scan means MIUI's budget is spent. The platform may still be joining, so listen
+        // briefly, but not long enough to delay the request path this is meant to avoid.
+        val deadline = started + if (issued) PLATFORM_JOIN_MS else PLATFORM_JOIN_REFUSED_MS
+        while (!run.cancelled && SystemClock.elapsedRealtime() < deadline) {
+            adoptHeadUnitLink(run, ssid)?.let {
+                Log.i("DiRelayCarlink", "join_scan_adopted issued=$issued waited=${SystemClock.elapsedRealtime() - started}ms")
+                return it
+            }
+            try { Thread.sleep(ADOPT_POLL_MS) } catch (_: InterruptedException) { break }
+        }
+        Log.i("DiRelayCarlink", "join_scan_miss issued=$issued waited=${SystemClock.elapsedRealtime() - started}ms")
+        return null
+    }
+
+    private fun awaitCleanup() {
+        reconnect.awaitReleased(diagnostics)
+    }
+    private class Run(val lost: (Throwable?) -> Unit) {
+        @Volatile var cancelled = false
+        @Volatile var ready = false
+        var lossReported = false
+        @Volatile var failure: Throwable? = null
+        var peerKey: String? = null
+        var peerChoice: BlePeerPolicy.Choice? = null
+        var scan: ScanCallback? = null
+        var scanner: BluetoothLeScanner? = null
+        var scanRenewal: Runnable? = null
+        var scanCounter: ScanCallback? = null
+        var scanProgress: Runnable? = null
+        var rawScan: ScanCallback? = null
+        var rawCapture: BleRawCapture? = null
+        var gatt: BluetoothGatt? = null
+        var closingGatt: BluetoothGatt? = null
+        var bleClosed = CompletableFuture.completedFuture(Unit)
+        var cccdTimer: Runnable? = null
+        var verifyTimer: Runnable? = null
+        var serviceMonitor: Runnable? = null
+        var channel: WifiP2pManager.Channel? = null
+        var headUnitClientGroup = false
+        var expectedSsid: String? = null
+        var receiver: BroadcastReceiver? = null
+        var wifiFlow: AndroidCarlinkWifi? = null
+        var networkCallback: ConnectivityManager.NetworkCallback? = null
+        var linkWatcher: Runnable? = null
+        var adoptedCallback: ConnectivityManager.NetworkCallback? = null
+        var monitor: Runnable? = null
+        var bound: Network? = null
+        var previousBinding: Network? = null
+        @Volatile var selectedNetwork: Network? = null
+        val waits = java.util.concurrent.CopyOnWriteArrayList<CompletableFuture<*>>()
+    }
+    @Volatile private var current: Run? = null
+    @Volatile private var failurePassphrase = ""
+    /**
+     * MIUI scan-cache priming is throttled by wall time, not by session: the 2-minute foreground
+     * scan budget (4 requests) is shared with the system dialog, and the relay retries with a fresh
+     * connect() each attempt, so a per-session flag would prime again on every retry and starve the
+     * dialog. One priming per throttle window keeps the remaining requests for the dialog.
+     */
+    @Volatile private var lastPrimeAt = 0L
+    /**
+     * When the head unit's SSID was last actually seen in scan results. A timestamp, not a flag: the
+     * 2-minute throttle means a retry can reuse a scan from long ago, and treating that as "the AP is
+     * there right now" spends the quiet window waiting for a network that has moved or restarted.
+     */
+    @Volatile private var lastPrimeSawAt = 0L
+    private fun primeSawTarget(): Boolean =
+        lastPrimeSawAt != 0L && android.os.SystemClock.elapsedRealtime() - lastPrimeSawAt < PRIME_FRESH_MS
+    /**
+     * The confirmation dialog, and the scan-cache workaround for it, are MIUI/Android 10-11 specific.
+     * Everything else here is generic AOSP behaviour and must not be slowed down for other vendors.
+     */
+    private val miuiRequestsNeedCache = Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true) &&
+        Build.VERSION.SDK_INT <= 30
+    internal fun redactFailureMessage(text: String): String = failurePassphrase.let {
+        if (it.isEmpty()) text else text.replace(it, "[redacted]")
+    }
+    override fun connect(onLinkLost: (Throwable?) -> Unit): ClinkAddresses {
+        check(Looper.myLooper() != Looper.getMainLooper()) { "Connect must run on a worker" }
+        val run = Run(onLinkLost)
+        synchronized(this) { check(current == null); current = run }
+        failurePassphrase = ""
+        diagnostics.emit(ClinkStage.LINK_START)
+        if (experimentNames.isNotEmpty()) diagnostics.emit(ClinkDiagnostic.Experiments(experimentNames))
+        try {
+            diagnosed(ClinkStage.WIFI_JOIN, ClinkFailureReason.WIFI_TIMEOUT) {
+                WifiJoinPolicy.withWifi(readWifiEnabled(context)) { Unit }
+            }
+            awaitCleanup()
+            check(!run.cancelled)
+            check(Build.VERSION.SDK_INT >= 29) { "Carlink Wi-Fi join requires Android 10 or later" }
+            var handoff: Pair<String, HeadUnitReply>? = null
+            for (attempt in 0..2) {
+                try {
+                    // Fresh scan on every retry: the app may change its random BLE address.
+                    val device = diagnosed(ClinkStage.BLE_SCAN, ClinkFailureReason.BLE_TIMEOUT) { scan(run) }
+                    handoff = device.second to diagnosed(ClinkStage.BLE_EXCHANGE,
+                        ClinkFailureReason.BLE_EXCHANGE_TIMEOUT) { exchange(run, device.first, device.second) }
+                    break
+                } catch (failure: Exception) {
+                    main { closeBle(run) }
+                    awaitCleanup()
+                    if (run.cancelled || attempt == 2) throw failure
+                    retry(run)
+                }
+            }
+            val (carId, reply) = checkNotNull(handoff)
+            failurePassphrase = reply.psk
+            onSecret(reply.psk)
+            diagnostics.handoff(reply.ssid, reply.psk.length)
+            // No PIN/UI pause here; return immediately after DHCP so clink can start AUTH.
+            // A join failure says nothing about the BLE exchange: the head unit keeps the same soft AP
+            // for the session, so redoing a scan plus exchange only adds seconds to a Wi-Fi problem it
+            // cannot fix. Retry the join with the reply already in hand; a rotated passphrase still
+            // surfaces as a failure here and the next link attempt redoes BLE anyway.
+            var endpoints: Pair<String, String>? = null
+            for (joinAttempt in 0..2) {
+                try {
+                    endpoints = diagnosed(ClinkStage.WIFI_JOIN, ClinkFailureReason.WIFI_TIMEOUT) {
+                        join(run, reply, if (joinAttempt == 0) REQUEST_TIMEOUT_MS else JOIN_RETRY_BUDGET_MS)
+                    }
+                    break
+                } catch (failure: Exception) {
+                    // Drop the request and any P2P channel before asking again, or the next attempt
+                    // stacks a second request on the first one and MIUI pays for both.
+                    main { leaveP2p(run); releaseNetwork(run) }
+                    if (run.cancelled || joinAttempt == 2) throw failure
+                    joinRetry(run, if (joinAttempt == 0) JOIN_RETRY_FIRST_MS else JOIN_RETRY_NEXT_MS)
+                }
+            }
+            val joined = checkNotNull(endpoints)
+            logLinkReady(run, "join")
+            // A second sample: if the route was missing at join time, this shows when it arrived.
+            handler.postDelayed({ logLinkReady(run, "join+2s") }, 2_000)
+            diagnostics.emit(ClinkDiagnostic.Joined(joined.first, joined.second))
+            main {
+                check(!run.cancelled) { "Link cancelled" }
+                run.failure?.let { throw it }
+                run.ready = true
+                run.peerKey?.let { peers.succeeded(it, checkNotNull(run.peerChoice)) }
+            }
+            return ClinkAddresses(joined.first, joined.second,
+                reply.port.takeIf { it != 0 } ?: 57209, carId,
+                socketBinding = if (!isolateNetwork) ClinkSocketBinding.SYSTEM else ClinkSocketBinding { socket ->
+                    synchronized(this) {
+                        check(current === run && !run.cancelled && run.failure == null) { "link_lost" }
+                        run.selectedNetwork?.bindSocket(socket)
+                    }
+                })
+        } catch (failure: Exception) {
+            disconnectRun(run)
+            throw failure
+        }
+    }
+    private fun <T> diagnosed(stage: ClinkStage, timeout: ClinkFailureReason, action: () -> T): T {
+        try { return action() }
+        catch (error: Exception) {
+            val cause = ClinkFailures.unwrap(error)
+            val failure = if (cause is java.util.concurrent.TimeoutException) ClinkFailure(timeout, cause) else cause
+            diagnostics.emit(ClinkFailures.describe(stage, failure))
+            throw failure
+        }
+    }
+    private fun <T> await(run: Run, future: CompletableFuture<T>, seconds: Long?): T {
+        run.waits.add(future)
+        try {
+            check(!run.cancelled) { "Link cancelled" }
+            return if (seconds == null) future.get() else future.get(seconds, TimeUnit.SECONDS)
+        } finally { run.waits.remove(future) }
+    }
+    private fun scan(run: Run): Pair<BluetoothDevice, String> {
+        val result = CompletableFuture<Pair<BluetoothDevice, String>>()
+        // Counters behind ble_scan_progress. Without them a scan that heard nothing at all is
+        // indistinguishable from a scanner whose results never arrive: raw counts every advertisement
+        // the radio delivered, matched every result that passed the service filter, peer the ones that
+        // decoded as ours. raw stays -1 when the counting scan could not be started.
+        val rawSeen = AtomicInteger(-1)
+        val matched = AtomicInteger()
+        val peer = AtomicInteger()
+        val startedAt = SystemClock.elapsedRealtime()
+        main {
+            check(!run.cancelled)
+            val scanner = bluetooth?.adapter?.bluetoothLeScanner ?: throw ClinkFailure(ClinkFailureReason.BLE_UNAVAILABLE)
+            val callback = object : ScanCallback() {
+                override fun onScanResult(type: Int, scan: ScanResult) {
+                    if (run.cancelled || result.isDone) return
+                    matched.incrementAndGet()
+                    val record = scan.scanRecord ?: return
+                    try {
+                        val identity = record.getServiceData(ParcelUuid(UUID.fromString(BleCodec.IDENTITY_SERVICE))) ?: return
+                        val name = record.getServiceData(ParcelUuid(UUID.fromString(BleCodec.NAME_SERVICE))) ?: byteArrayOf()
+                        val advertisement = BleCodec.advertisement(identity, name)
+                        peer.incrementAndGet()
+                        advertisements?.selected(advertisement)
+                        diagnostics.traceLink("ble_advertisement", mapOf(
+                            "major" to advertisement.major.toString(), "minor" to advertisement.minor.toString(),
+                            "serial" to advertisement.serial.toString(), "carId" to advertisement.carId,
+                            "modelId" to advertisement.modelId, "vendorData" to advertisement.vendorData,
+                            "name" to advertisement.name) + (advertisements?.serialFields(advertisement) ?: emptyMap()))
+                        diagnostics.emit(ClinkDiagnostic.Peer(advertisement.name))
+                        diagnostics.emit(ClinkStage.BLE_PEER)
+                        result.complete(scan.device to advertisement.carId)
+                    } catch (_: IllegalArgumentException) { /* Ignore malformed advertisements. */ }
+                }
+                override fun onScanFailed(errorCode: Int) {
+                    Log.w("DiRelayCarlink", "ble_scan_failed code=$errorCode elapsed=${(SystemClock.elapsedRealtime() - startedAt) / 1000}s")
+                    result.completeExceptionally(ClinkFailure(ClinkFailureReason.BLE_SCAN))
+                }
+            }
+            run.scanner = scanner; run.scan = callback
+            val filters = listOf(ScanFilter.Builder().setServiceUuid(
+                ParcelUuid(UUID.fromString(BleCodec.ADVERTISEMENT_SERVICE))).build())
+            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+            if (advertisements != null) scanStartBudget.recordStart(SystemClock.elapsedRealtime())
+            scanner.startScan(filters, settings, callback)
+            // One unfiltered scan whose only job is counting. The filtered callback never sees a device
+            // that does not advertise our service UUID, so on its own it cannot answer the question that
+            // matters when nothing is found: is the radio hearing anything at all, or is the scanner dead?
+            if (advertisements == null) {
+                val now = SystemClock.elapsedRealtime()
+                if (scanStartBudget.tryStart(now, reserve = 2)) {
+                    val counter = object : ScanCallback() {
+                        override fun onScanResult(type: Int, scan: ScanResult) { rawSeen.incrementAndGet() }
+                        override fun onBatchScanResults(results: MutableList<ScanResult>) { rawSeen.addAndGet(results.size) }
+                        override fun onScanFailed(errorCode: Int) {
+                            Log.w("DiRelayCarlink", "ble_scan_counter_failed code=$errorCode")
+                            rawSeen.set(-1); run.scanCounter = null
+                        }
+                    }
+                    run.scanCounter = counter
+                    runCatching { scanner.startScan(emptyList(), settings, counter) }
+                        .onFailure { rawSeen.set(-1); run.scanCounter = null }
+                } else {
+                    diagnostics.traceLink("ble_scan_counter_skipped", mapOf(
+                        "reason" to "scan_budget", "count" to scanStartBudget.count(now).toString()))
+                }
+            }
+            val progress = object : Runnable {
+                override fun run() {
+                    if (run.cancelled || result.isDone) return
+                    Log.i("DiRelayCarlink", "ble_scan_progress elapsed=${(SystemClock.elapsedRealtime() - startedAt) / 1000}s" +
+                        " raw=${if (rawSeen.get() >= 0) rawSeen.get().toString() else if (advertisements != null) "capture" else "off"}" +
+                        " matched=${matched.get()} peer=${peer.get()}")
+                    handler.postDelayed(this, SCAN_PROGRESS_MS)
+                }
+            }
+            run.scanProgress = progress
+            handler.postDelayed(progress, SCAN_PROGRESS_MS)
+            fun startRawScan(raw: ScanCallback) {
+                val now = SystemClock.elapsedRealtime()
+                if (scanStartBudget.tryStart(now, reserve = 2)) {
+                    run.rawScan = raw
+                    scanner.startScan(emptyList(), settings, raw)
+                } else diagnostics.traceLink("ble_raw_skipped", mapOf(
+                    "reason" to "scan_budget", "count" to scanStartBudget.count(now).toString()))
+            }
+            val rawCallback = advertisements?.scan()?.let { trace ->
+                val capture = BleRawCapture(trace)
+                run.rawCapture = capture
+                val rawCallback = object : ScanCallback() {
+                    override fun onScanResult(type: Int, scan: ScanResult) {
+                        if (!run.cancelled && !result.isDone && run.rawScan === this) capture.record(scan)
+                    }
+                    override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                        results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
+                    }
+                    override fun onScanFailed(errorCode: Int) { capture.failed(errorCode) }
+                }
+                try { startRawScan(rawCallback) }
+                catch (_: Exception) { capture.failed(-1) }
+                rawCallback
+            }
+            scanPolicy.restartMs?.let { interval ->
+                val renewal = object : Runnable {
+                    override fun run() {
+                        if (run.cancelled || result.isDone || run.scan !== callback) return
+                        try {
+                            scanner.stopScan(callback)
+                            if (advertisements != null) scanStartBudget.recordStart(SystemClock.elapsedRealtime())
+                            scanner.startScan(filters, settings, callback)
+                            rawCallback?.let { raw ->
+                                try {
+                                    run.rawScan?.let { scanner.stopScan(it) }; run.rawScan = null
+                                    startRawScan(raw)
+                                }
+                                catch (_: Exception) { run.rawCapture?.failed(-1) }
+                            }
+                            handler.postDelayed(this, interval)
+                        } catch (failure: Exception) { result.completeExceptionally(failure) }
+                    }
+                }
+                run.scanRenewal = renewal
+                handler.postDelayed(renewal, interval)
+            }
+            diagnostics.emit(ClinkStage.BLE_SCAN)
+        }
+        try { return await(run, result, scanPolicy.timeoutSeconds) }
+        finally {
+            main {
+                stopScan(run)
+                val outcome = when {
+                    run.cancelled -> "cancelled"
+                    result.isDone && !result.isCompletedExceptionally -> "found"
+                    result.isDone -> "failed"
+                    else -> "timeout"
+                }
+                Log.i("DiRelayCarlink", "ble_scan_end elapsed=${(SystemClock.elapsedRealtime() - startedAt) / 1000}s" +
+                    " raw=${if (rawSeen.get() >= 0) rawSeen.get().toString() else if (advertisements != null) "capture" else "off"}" +
+                    " matched=${matched.get()} peer=${peer.get()} outcome=$outcome")
+            }
+        }
+    }
+    private fun exchange(run: Run, device: BluetoothDevice, carId: String): HeadUnitReply {
+        val key = peers.key(carId, device.address)
+        val choice = peers.choice(key)
+        try {
+            return exchange(run, device, key, choice)
+        } catch (failure: Exception) {
+            // A failure that never reached the subscription says nothing about which subscription works.
+            // Forgetting the persisted choice there makes every later connection pay the CCCD timeout again.
+            if (!run.cancelled && (failure as? ClinkFailure)?.reason !in CONNECT_SIDE_FAILURES) peers.exchangeFailed(key)
+            throw failure
+        }
+    }
+    private fun exchange(run: Run, device: BluetoothDevice, key: String, choice: BlePeerPolicy.Choice): HeadUnitReply {
+        val result = CompletableFuture<HeadUnitReply>()
+        val phone = BleCodec.phoneRequest(PhoneRequest(deviceId, deviceName, deviceModel, 1, phoneAddress(), choice.requestType))
+        main {
+            check(!run.cancelled)
+            var phoneCharacteristic: BluetoothGattCharacteristic? = null
+            var replyCharacteristic: BluetoothGattCharacteristic? = null
+            lateinit var machine: BleExchange
+            var pendingDescriptor: BluetoothGattDescriptor? = null
+            fun cancelCccdTimer() {
+                run.cccdTimer?.let(handler::removeCallbacks)
+                run.cccdTimer = null
+                pendingDescriptor = null
+            }
+            fun cancelVerifyTimer() {
+                run.verifyTimer?.let(handler::removeCallbacks)
+                run.verifyTimer = null
+            }
+            fun serviceChanged() {
+                diagnostics.emit(ClinkDiagnostic.ServiceChanged(machine.state.name.lowercase()))
+                val verifying = machine.state == BleExchange.State.VERIFYING
+                machine.serviceChanged()
+                if (verifying || machine.state != BleExchange.State.VERIFYING) return
+                // Bound the post-request rediscovery; an unconfirmed change fails without switching the type.
+                cancelVerifyTimer()
+                val gatt = run.gatt
+                val timer = Runnable {
+                    run.verifyTimer = null
+                    if (run.gatt === gatt && !run.cancelled) machine.verifyTimeout()
+                }
+                run.verifyTimer = timer
+                handler.postDelayed(timer, 2000)
+            }
+            machine = BleExchange(object : BleExchange.Gatt {
+                override fun requestMtu(size: Int) = run.gatt?.requestMtu(size) == true
+                override fun discover() = run.gatt?.discoverServices() == true
+                override fun subscribeLocally(): Boolean {
+                    val service = run.gatt?.getService(UUID.fromString(BleCodec.GATT_SERVICE))
+                    phoneCharacteristic = service?.getCharacteristic(UUID.fromString(BleCodec.PHONE_CHARACTERISTIC))
+                    replyCharacteristic = service?.getCharacteristic(UUID.fromString(BleCodec.HEAD_UNIT_CHARACTERISTIC))
+                    val notify = if (phoneCharacteristic != null && replyCharacteristic != null)
+                        run.gatt?.setCharacteristicNotification(replyCharacteristic, true) == true else null
+                    if (notify != true) diagnostics.emit(ClinkDiagnostic.Characteristics(phoneCharacteristic != null, replyCharacteristic != null, notify))
+                    return notify == true
+                }
+                override fun subscribeCccd(): Boolean {
+                    val characteristic = replyCharacteristic
+                    val gatt = run.gatt
+                    if (characteristic == null || gatt == null) {
+                        diagnostics.emit(ClinkDiagnostic.Cccd(ClinkDiagnostic.CccdResult.REFUSED))
+                        return false
+                    }
+                    val descriptor = characteristic.getDescriptor(UUID.fromString(BleCodec.CCCD))
+                    val value = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    val accepted = descriptor != null && if (Build.VERSION.SDK_INT >= 33) {
+                        gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        descriptor.value = value
+                        gatt.writeDescriptor(descriptor)
+                    }
+                    if (accepted) {
+                        pendingDescriptor = descriptor
+                        val timer = Runnable {
+                            run.cccdTimer = null
+                            pendingDescriptor = null
+                            if (run.gatt === gatt && !run.cancelled && (machine.state == BleExchange.State.SUBSCRIBING || machine.state == BleExchange.State.REDISCOVERING)) {
+                                diagnostics.emit(ClinkDiagnostic.Cccd(ClinkDiagnostic.CccdResult.TIMEOUT))
+                                machine.cccdTimeout()
+                            }
+                        }
+                        run.cccdTimer = timer
+                        handler.postDelayed(timer, 2000)
+                    } else diagnostics.emit(ClinkDiagnostic.Cccd(ClinkDiagnostic.CccdResult.REFUSED))
+                    return accepted
+                }
+                override fun write(payload: ByteArray): Boolean {
+                    val characteristic = phoneCharacteristic
+                    val gatt = run.gatt
+                    val accepted = characteristic != null && gatt != null && if (Build.VERSION.SDK_INT >= 33) {
+                        gatt.writeCharacteristic(characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        characteristic.value = payload
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                    if (!accepted) diagnostics.emit(ClinkDiagnostic.BleWrite(null))
+                    return accepted
+                }
+                override fun requestUnchanged(): Boolean {
+                    val request = run.gatt?.getService(UUID.fromString(BleCodec.GATT_SERVICE))
+                        ?.getCharacteristic(UUID.fromString(BleCodec.PHONE_CHARACTERISTIC)) ?: return false
+                    // The request went to the old handle; a moved characteristic did not receive it.
+                    return request.instanceId == phoneCharacteristic?.instanceId
+                }
+            }, phone, choice.legacy) { reply, failure ->
+                cancelCccdTimer()
+                cancelVerifyTimer()
+                if (reply != null) {
+                    peers.exchanged(key, choice)
+                    run.peerKey = key
+                    run.peerChoice = choice
+                    diagnostics.traceLink("ble_reply_name", mapOf("name" to reply.name))
+                    diagnostics.emit(ClinkDiagnostic.Peer(reply.name))
+                    diagnostics.emit(ClinkDiagnostic.Reply(reply.type))
+                    diagnostics.emit(ClinkDiagnostic.Exchange(reply.freq))
+                    result.complete(reply)
+                } else {
+                    val exchangeFailure = failure as BleExchange.Failure
+                    exchangeFailure.detail?.let { diagnostics.emit(ClinkDiagnostic.ReplyInvalid(it)) }
+                    val reason = when (exchangeFailure.reason) {
+                        BleExchange.Reason.CCCD_TIMEOUT -> {
+                            peers.cccdTimedOut(key, choice)
+                            // A pending descriptor blocks the GATT queue; the retry must use a fresh connection.
+                            ClinkFailureReason.BLE_CCCD_TIMEOUT
+                        }
+                        BleExchange.Reason.REQUEST_REJECTED -> {
+                            peers.rejected(key, choice)
+                            ClinkFailureReason.BLE_REQUEST_REJECTED
+                        }
+                        BleExchange.Reason.DISCOVERY -> ClinkFailureReason.BLE_DISCOVERY
+                        BleExchange.Reason.SERVICE_MISSING -> ClinkFailureReason.BLE_SERVICE_MISSING
+                        BleExchange.Reason.SUBSCRIBE -> ClinkFailureReason.BLE_SUBSCRIBE
+                        BleExchange.Reason.CCCD -> ClinkFailureReason.BLE_CCCD
+                        BleExchange.Reason.WRITE -> ClinkFailureReason.BLE_WRITE
+                        BleExchange.Reason.REPLY_INVALID -> ClinkFailureReason.BLE_REPLY_INVALID
+                        BleExchange.Reason.VERIFY_TIMEOUT -> ClinkFailureReason.BLE_VERIFY_TIMEOUT
+                        BleExchange.Reason.DISCONNECTED -> ClinkFailureReason.BLE_EXCHANGE
+                    }
+                    result.completeExceptionally(ClinkFailure(reason, failure))
+                }
+            }
+            val callback = object : BluetoothGattCallback() {
+                private fun event(gatt: BluetoothGatt, action: () -> Unit) {
+                    handler.post {
+                        if (!run.cancelled && run.gatt === gatt) try { action() }
+                        catch (error: Exception) { result.completeExceptionally(error) }
+                    }
+                }
+                override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, state: Int) {
+                    handler.post {
+                        if (state == BluetoothProfile.STATE_DISCONNECTED && run.closingGatt === gatt) finishBleClose(run)
+                    }
+                    event(gatt) {
+                        if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) {
+                            diagnostics.emit(ClinkDiagnostic.GattConnection(status, state == BluetoothProfile.STATE_CONNECTED))
+                            result.completeExceptionally(ClinkFailure(ClinkFailureReason.GATT_CONNECT))
+                            machine.fail(BleExchange.Reason.DISCONNECTED)
+                        } else if (state == BluetoothProfile.STATE_CONNECTED) {
+                            diagnostics.emit(ClinkStage.GATT_CONNECTED)
+                            machine.connected()
+                            // When another app's GATT keeps the LE link up, Android reuses it and may never
+                            // report the MTU; continue without it (mtu() ignores a late or duplicate call).
+                            // The fallback must outlast a slow head unit: issuing discover() while the MTU
+                            // exchange is still queued leaves the search stranded in DISCOVER_ST, and the
+                            // session then dies on its 15 s budget with no services at all. 1.8 s responses
+                            // were measured on a G9 (1.5 s fallback fired 318 ms early), so wait well past
+                            // that before giving up on the MTU.
+                            handler.postDelayed({ event(gatt) { if (machine.state == BleExchange.State.MTU) {
+                                diagnostics.emit(ClinkDiagnostic.Mtu(null, null)); machine.mtu(false)
+                            } } }, 4000)
+                        }
+                    }
+                }
+                override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) = event(gatt) {
+                    diagnostics.emit(ClinkDiagnostic.Mtu(mtu, status))
+                    machine.mtu(status == BluetoothGatt.GATT_SUCCESS)
+                }
+                override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) = event(gatt) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) diagnostics.emit(ClinkStage.GATT_SERVICES)
+                    else {
+                        diagnostics.emit(ClinkDiagnostic.GattServices(status))
+                        if (machine.state != BleExchange.State.VERIFYING)
+                            result.completeExceptionally(ClinkFailure(ClinkFailureReason.GATT_SERVICES))
+                    }
+                    if (status == BluetoothGatt.GATT_SUCCESS && gatt.getService(UUID.fromString(BleCodec.GATT_SERVICE)) == null)
+                        machine.serviceRemoved()
+                    else machine.services(status == BluetoothGatt.GATT_SUCCESS)
+                }
+                override fun onServiceChanged(gatt: BluetoothGatt) = event(gatt) { serviceChanged() }
+                override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) = event(gatt) {
+                    if (descriptor === pendingDescriptor && (machine.state == BleExchange.State.SUBSCRIBING || machine.state == BleExchange.State.REDISCOVERING)) {
+                        cancelCccdTimer()
+                        val success = status == BluetoothGatt.GATT_SUCCESS
+                        diagnostics.emit(ClinkDiagnostic.Cccd(if (success) ClinkDiagnostic.CccdResult.SUCCESS else ClinkDiagnostic.CccdResult.FAILED, if (success) null else status))
+                        machine.descriptorWritten(success)
+                    }
+                }
+                override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) = event(gatt) {
+                    if (characteristic.uuid == UUID.fromString(BleCodec.PHONE_CHARACTERISTIC)) {
+                        diagnostics.emit(ClinkDiagnostic.BleWrite(status))
+                        machine.written(status == BluetoothGatt.GATT_SUCCESS)
+                    }
+                }
+                override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+                    val bytes = value.copyOf()
+                    event(gatt) {
+                        if (characteristic.uuid == UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb")) serviceChanged()
+                        else if (characteristic.uuid == UUID.fromString(BleCodec.HEAD_UNIT_CHARACTERISTIC)) machine.indication(bytes)
+                    }
+                }
+                @Deprecated("Android legacy callback")
+                override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+                    onCharacteristicChanged(gatt, characteristic, characteristic.value?.copyOf() ?: byteArrayOf())
+                }
+            }
+            diagnostics.emit(ClinkDiagnostic.BleRequest(choice.requestType, choice.legacy))
+            diagnostics.emit(ClinkStage.GATT_CONNECT)
+            run.gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+            if (run.gatt == null) throw ClinkFailure(ClinkFailureReason.GATT_CONNECT)
+            val activeGatt = run.gatt
+            val monitor = object : Runnable {
+                override fun run() {
+                    if (run.cancelled || result.isDone || run.gatt !== activeGatt) return
+                    // Not while VERIFYING: discoverServices empties Android's service cache until it completes.
+                    if ((machine.state == BleExchange.State.WRITING || machine.state == BleExchange.State.REPLY ||
+                            machine.state == BleExchange.State.SUBSCRIBING) &&
+                        activeGatt?.getService(UUID.fromString(BleCodec.GATT_SERVICE)) == null) {
+                        diagnostics.emit(ClinkDiagnostic.ServiceChanged(machine.state.name.lowercase()))
+                        machine.serviceRemoved()
+                    }
+                    if (!result.isDone) handler.postDelayed(this, 200)
+                }
+            }
+            run.serviceMonitor = monitor
+            handler.postDelayed(monitor, 200)
+        }
+        try { return await(run, result, 15) }
+        finally {
+            main { closeBle(run) }
+            awaitCleanup()
+        }
+    }
+    private fun join(run: Run, reply: HeadUnitReply, budgetMs: Long = REQUEST_TIMEOUT_MS): Pair<String, String> =
+        WifiJoinPolicy.withWifi(readWifiEnabled(context)) { joinWithWifi(run, reply, budgetMs) }
+
+
+    private fun joinWithWifi(run: Run, reply: HeadUnitReply, budgetMs: Long): Pair<String, String> {
+        val reserved = p2pReservation.reservedByCarPlay()
+        var method = WifiJoinPolicy.first(Build.VERSION.SDK_INT, p2p != null && !reserved, reply.type)
+        diagnostics.emit(ClinkDiagnostic.JoinChoice(method, when {
+            method == WifiJoinPolicy.Method.UNSUPPORTED -> ClinkDiagnostic.JoinReason.API_UNSUPPORTED
+            reply.type == 1002 -> ClinkDiagnostic.JoinReason.HEAD_UNIT_SOFT_AP
+            reserved -> ClinkDiagnostic.JoinReason.CARPLAY_RESERVED
+            p2p == null -> ClinkDiagnostic.JoinReason.P2P_UNAVAILABLE
+            else -> ClinkDiagnostic.JoinReason.P2P_AVAILABLE
+        }))
+        if (method == WifiJoinPolicy.Method.P2P_CREDENTIALS) {
+            try { return diagnosed(ClinkStage.WIFI_JOIN, ClinkFailureReason.P2P_TIMEOUT) { joinP2p(run, reply) } }
+            catch (failure: Exception) {
+                main { leaveP2p(run) }
+                if (run.cancelled) throw failure
+                WifiJoinPolicy.withWifi(readWifiEnabled(context)) { Unit }
+                method = WifiJoinPolicy.fallback(Build.VERSION.SDK_INT, method)
+                diagnostics.emit(ClinkDiagnostic.JoinChoice(method, ClinkDiagnostic.JoinReason.P2P_FALLBACK))
+            }
+        }
+        if (method != WifiJoinPolicy.Method.NETWORK_SPECIFIER) throw ClinkFailure(ClinkFailureReason.WIFI_UNAVAILABLE)
+        return if (wifiRecovery) joinRecoverableWifi(run, reply) else joinSpecifier(run, reply, budgetMs)
+    }
+    private fun joinRecoverableWifi(run: Run, reply: HeadUnitReply): Pair<String, String> {
+        val flow = AndroidCarlinkWifi(context, handler, reply, diagnostics) { lost(run) }
+        main {
+            check(!run.cancelled)
+            run.wifiFlow = flow
+            diagnostics.emit(ClinkStage.WIFI_JOIN)
+            flow.start()
+        }
+        val selected = await(run, flow.result, null)
+        main {
+            check(!run.cancelled)
+            run.failure?.let { throw it }
+            run.selectedNetwork = selected.network
+        }
+        return checkNotNull(selected.endpoints)
+    }
+    private fun joinP2p(run: Run, reply: HeadUnitReply): Pair<String, String> {
+        val result = CompletableFuture<Pair<String, String>>()
+        main {
+            check(!run.cancelled)
+            val manager = checkNotNull(p2p)
+            val channel = manager.initialize(context, handler.looper) { if (run.channel != null) lost(run) }
+            run.channel = channel
+            run.expectedSsid = reply.ssid
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (run.ready && intent.action == WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION &&
+                        intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) == WifiP2pManager.WIFI_P2P_STATE_DISABLED) lost(run, radioOff = true)
+                }
+            }
+            run.receiver = receiver
+            val filter = IntentFilter(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
+            if (Build.VERSION.SDK_INT >= 33) context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            else context.registerReceiver(receiver, filter)
+            var expected: Pair<String, String>? = null
+            val monitor = object : Runnable {
+                override fun run() {
+                    if (run.cancelled || run.channel !== channel) return
+                    manager.requestConnectionInfo(channel) { info ->
+                        if (run.cancelled || run.channel !== channel) return@requestConnectionInfo
+                        manager.requestGroupInfo(channel) { group ->
+                            if (run.cancelled || run.channel !== channel) return@requestGroupInfo
+                            val local = group?.`interface`?.let { iface ->
+                                runCatching { NetworkInterface.getByName(iface)?.inetAddresses?.toList()
+                                    ?.filterIsInstance<Inet4Address>()?.firstOrNull()?.hostAddress }.getOrNull()
+                            }
+                            run.headUnitClientGroup = WifiJoinPolicy.mayRemoveGroup(
+                                info.groupFormed, info.isGroupOwner, group?.networkName, reply.ssid)
+                            val endpoints = if (run.headUnitClientGroup)
+                                WifiJoinPolicy.endpoints(info.groupOwnerAddress?.hostAddress, local) else null
+                            if (endpoints != null && !result.isDone) { expected = endpoints; result.complete(endpoints) }
+                            else if (expected != null && endpoints != expected) lost(run)
+                            if (!run.cancelled) handler.postDelayed(this, 1000)
+                        }
+                    }
+                }
+            }
+            run.monitor = monitor
+            val config = WifiP2pConfig.Builder().setNetworkName(reply.ssid).setPassphrase(reply.psk)
+                .enablePersistentMode(false).build()
+            manager.connect(channel, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { handler.post(monitor) }
+                override fun onFailure(reason: Int) { result.completeExceptionally(ClinkFailure(ClinkFailures.p2p(reason))) }
+            })
+        }
+        return await(run, result, 7)
+    }
+    private fun joinSpecifier(run: Run, reply: HeadUnitReply, budgetMs: Long): Pair<String, String> {
+        // The car network is a saved network, so the platform joins it on its own as soon as the AP
+        // shows up — around the moment this stage starts. A WifiNetworkSpecifier request issued into
+        // that window never attaches: the link completes under the system's uid, the request matches
+        // nothing, and it expires unfulfilled after 12 s. That is the measured "first attempt after
+        // getting in the car always fails, the retry succeeds", so adopt the platform's link whenever
+        // it exists and keep watching for it while the request is pending.
+        adoptHeadUnitLink(run, reply.ssid)?.let { return it }
+        // MIUI raises its Wi-Fi picker for every WifiNetworkSpecifier request, and on this build the
+        // picker has no input channel: it can never be answered, so the request expires with the
+        // dialog still on screen. The phone joins the saved head-unit network by itself once a scan
+        // shows the AP, and that link is equivalent for us — ask for the scan and take it. Everything
+        // below stays as the fallback, so non-MIUI devices never enter this branch.
+        if (scanAdoptJoin) platformScanJoin(run, reply.ssid)?.let { return it }
+        // Let the platform see the AP first: a scan result is what makes it start its own join — and
+        // what makes MIUI match the request silently when there is nothing to adopt.
+        val primed = primeScanCache(run, reply.ssid)
+        adoptHeadUnitLink(run, reply.ssid)?.let { return it }
+        // When the scan did show the AP the platform joins it within a second. Adopting that link is
+        // both faster and silent: requestNetwork is what raises MIUI's unanswerable dialog, so give
+        // the platform a quiet window before asking for a network of our own.
+        var quiet = 0L
+        if (primeSawTarget() && miuiRequestsNeedCache) {
+            val started = SystemClock.elapsedRealtime()
+            while (!run.cancelled) {
+                adoptHeadUnitLink(run, reply.ssid)?.let {
+                    Log.i("DiRelayCarlink", "join_adopted waited=${SystemClock.elapsedRealtime() - started}ms")
+                    return it
+                }
+                if (SystemClock.elapsedRealtime() - started >= QUIET_JOIN_MS) break
+                try { Thread.sleep(100) } catch (_: InterruptedException) { break }
+            }
+            quiet = SystemClock.elapsedRealtime() - started
+        }
+        val consumed = primed + quiet
+        val result = CompletableFuture<Pair<String, String>>()
+        main {
+            check(!run.cancelled)
+            val manager = checkNotNull(connectivity)
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                private var selected: Network? = null
+                private var expected: Pair<String, String>? = null
+                override fun onAvailable(network: Network) { selected = network }
+                override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
+                    if (run.cancelled || run.networkCallback !== this || selected != network) return
+                    val local = properties.linkAddresses.firstOrNull { it.address is Inet4Address }?.address?.hostAddress
+                    // DHCP server is exposed directly starting with API 30; API 29 uses WifiManager's DHCP lease.
+                    val peer = if (Build.VERSION.SDK_INT >= 30) properties.dhcpServerAddress?.hostAddress else {
+                        val wifi = context.getSystemService(android.net.wifi.WifiManager::class.java)
+                        val lease = wifi?.dhcpInfo
+                        fun address(value: Int): String = (0..3).joinToString(".") {
+                            ((value ushr (it * 8)) and 255).toString()
+                        }
+                        // Reject a lease from another Wi-Fi interface when concurrent networking is active.
+                        if (lease == null || lease.serverAddress == 0 || address(lease.ipAddress) != local) null
+                        else address(lease.serverAddress)
+                    }
+                    val endpoints = WifiJoinPolicy.endpoints(peer, local)
+                    if (expected != null && endpoints != expected) { lost(run); return }
+                    if (endpoints == null) return
+                    if (!result.isDone) {
+                        bindNetwork(manager, network, run)
+                        run.selectedNetwork = network
+                        expected = endpoints
+                        result.complete(endpoints)
+                    }
+                }
+                override fun onUnavailable() { result.completeExceptionally(ClinkFailure(ClinkFailureReason.WIFI_UNAVAILABLE)) }
+                override fun onLost(network: Network) {
+                    if (selected == network) {
+                        result.completeExceptionally(ClinkFailure(ClinkFailureReason.LINK_LOST))
+                        lost(run)
+                    }
+                }
+            }
+            run.networkCallback = callback
+            val specifier = WifiNetworkSpecifier.Builder().setSsid(reply.ssid).setWpa2Passphrase(reply.psk).build()
+            val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).setNetworkSpecifier(specifier).build()
+            manager.requestNetwork(request, callback, handler,
+                (budgetMs - consumed).coerceAtLeast(MIN_REQUEST_TIMEOUT_MS).toInt())
+            // The system's own join of this saved AP is invisible to the request, so adopt it the
+            // moment it gets an IPv4 lease instead of waiting out the request timeout.
+            val watcher = object : Runnable {
+                override fun run() {
+                    if (result.isDone || run.cancelled) return
+                    val endpoints = runCatching { adoptHeadUnitLink(run, reply.ssid) }.getOrNull()
+                    if (endpoints != null) {
+                        Log.i("DiRelayCarlink", "join_adopted local=${endpoints.second} peer=${endpoints.first}")
+                        runCatching { manager.unregisterNetworkCallback(callback) }
+                        result.complete(endpoints)
+                        return
+                    }
+                    handler.postDelayed(this, ADOPT_POLL_MS)
+                }
+            }
+            run.linkWatcher = watcher
+            handler.postDelayed(watcher, ADOPT_POLL_MS)
+        }
+        try {
+            return await(run, result, 15)
+        } finally {
+            main { run.linkWatcher?.let { handler.removeCallbacks(it) }; run.linkWatcher = null }
+        }
+    }
+
+    /**
+     * Take over a Wi-Fi link the platform already brought up for the head unit's SSID. The relay only
+     * needs the gateway address on that L2, so reusing the link is equivalent to owning a request on
+     * it — and it is the only way to reach a connection the system created for itself.
+     */
+    private fun adoptHeadUnitLink(run: Run, ssid: String): Pair<String, String>? {
+        val manager = connectivity ?: return null
+        val network = headUnitNetwork(manager, ssid) ?: return null
+        val endpoints = endpointsOf(manager, network) ?: return null
+        bindNetwork(manager, network, run)
+        run.selectedNetwork = network
+        return endpoints
+    }
+
+    private fun bindNetwork(manager: ConnectivityManager, network: Network, run: Run) {
+        if (isolateNetwork || run.bound === network) return
+        run.previousBinding = manager.boundNetworkForProcess
+        if (!manager.bindProcessToNetwork(network)) throw ClinkFailure(ClinkFailureReason.WIFI_BIND)
+        run.bound = network
+        watchAdoptedLink(manager, network, run)
+    }
+
+    /**
+     * A link we adopted carries no request callback, so nothing would report its loss: the session
+     * would sit there until TCP noticed. Listen for that network disappearing and report it exactly
+     * as the request path does.
+     */
+    private fun watchAdoptedLink(manager: ConnectivityManager, network: Network, run: Run) {
+        if (run.adoptedCallback != null) return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onLost(gone: Network) {
+                if (gone != network) return
+                run.adoptedCallback?.let { runCatching { manager.unregisterNetworkCallback(it) } }
+                run.adoptedCallback = null
+                run.bound = null
+                lost(run)
+            }
+        }
+        val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+        runCatching { manager.registerNetworkCallback(request, callback) }
+            .onSuccess { run.adoptedCallback = callback }
+    }
+
+    /**
+     * The Wi-Fi network that currently carries [ssid] with an IPv4 lease, if any.
+     *
+     * Stock Android answers this through the default network's transport info. MIUI 10 attaches no
+     * transport info to these agents, so fall back to WifiManager for the SSID and match the lease by
+     * address — that keeps the choice correct on devices running two concurrent STA links.
+     */
+    @Suppress("DEPRECATION")
+    private fun headUnitNetwork(manager: ConnectivityManager, ssid: String): Network? {
+        fun wifiWithIpv4(network: Network): Boolean =
+            manager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                manager.getLinkProperties(network)?.linkAddresses?.any { it.address is Inet4Address } == true
+
+        manager.activeNetwork?.takeIf(::wifiWithIpv4)?.let { active ->
+            val activeInfo = manager.getNetworkCapabilities(active)?.transportInfo as? android.net.wifi.WifiInfo
+            if (activeInfo?.ssid?.trim('"') == ssid) return active
+        }
+        val wifi = context.getSystemService(android.net.wifi.WifiManager::class.java) ?: return null
+        val info = runCatching { wifi.connectionInfo }.getOrNull() ?: return null
+        if (info.ssid?.trim('"') != ssid) return null
+        val currentIp = info.ipAddress.takeIf { it != 0 }?.let { address ->
+            (0..3).joinToString(".") { ((address ushr (it * 8)) and 255).toString() }
+        }
+        return manager.allNetworks.firstOrNull { network ->
+            wifiWithIpv4(network) && (currentIp == null ||
+                manager.getLinkProperties(network)?.linkAddresses
+                    ?.any { it.address.hostAddress == currentIp } == true)
+        }
+    }
+
+    private fun endpointsOf(manager: ConnectivityManager, network: Network): Pair<String, String>? {
+        val properties = manager.getLinkProperties(network) ?: return null
+        val local = properties.linkAddresses.firstOrNull { it.address is Inet4Address }?.address?.hostAddress
+        val peer = (properties.routes.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway
+            as? Inet4Address)?.hostAddress ?: dhcpServer()
+        return WifiJoinPolicy.endpoints(peer, local)
+    }
+
+    /** API 29 has no LinkProperties.dhcpServerAddress; the lease carries the same gateway. */
+    @Suppress("DEPRECATION")
+    private fun dhcpServer(): String? {
+        val lease = context.getSystemService(android.net.wifi.WifiManager::class.java)?.dhcpInfo ?: return null
+        if (lease.serverAddress == 0) return null
+        return (0..3).joinToString(".") { ((lease.serverAddress ushr (it * 8)) and 255).toString() }
+    }
+
+    /**
+     * Xiaomi on Android 10/11 raises a WifiNetworkSpecifier confirmation dialog whose window has no
+     * input channel, so it can never be answered and the request expires unfulfilled. When the
+     * target SSID already sits in the scan cache the framework matches silently instead. Ask for a
+     * fresh scan and wait a bounded moment so the request can match without the dialog.
+     *
+     * Gated to the combination observed failing: other vendors match silently on their own, and
+     * HyperOS ships Android 14+, where the framework handles the match itself.
+     *
+     * Returns how long the wait took, so the caller can keep the whole stage inside its budget.
+     */
+    @Suppress("DEPRECATION")
+    private fun primeScanCache(run: Run, ssid: String): Long {
+        if (!miuiRequestsNeedCache) return 0
+        // One priming per throttle window: the relay retries with a fresh connect() each attempt, so
+        // priming on every attempt would spend the whole shared scan budget.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastPrimeAt < 120_000) return 0
+        lastPrimeAt = now
+        val wifi = context.getSystemService(android.net.wifi.WifiManager::class.java) ?: return 0
+        if (!wifi.isWifiEnabled) return 0
+        // A null list means the location permission is missing; waiting would only add delay.
+        lastPrimeSawAt = 0L
+        val cached = wifi.scanResults ?: return 0
+        if (cached.any { it.SSID == ssid }) {
+            lastPrimeSawAt = SystemClock.elapsedRealtime()
+            Log.i("DiRelayCarlink", "scan_primed hit=cached waited=0")
+            return 0
+        }
+        // Exactly one scan, then wait for *its* results. Asking again before those arrive is coalesced
+        // or refused by the platform, and a refused re-scan says nothing about the scan already in
+        // flight: treating it as failure is what left the cache cold and forced the dialog above.
+        // Spending one scan instead of four also keeps the next attempt's budget intact.
+        val started = SystemClock.elapsedRealtime()
+        val issued = wifi.startScan()
+        var hit = false
+        while (issued && !run.cancelled) {
+            if (SystemClock.elapsedRealtime() - started >= PRIME_BUDGET_MS) break
+            val results = wifi.scanResults ?: break
+            if (results.any { it.SSID == ssid }) { hit = true; lastPrimeSawAt = SystemClock.elapsedRealtime(); break }
+            try { Thread.sleep(100) } catch (_: InterruptedException) { break }
+        }
+        val waited = SystemClock.elapsedRealtime() - started
+        Log.i("DiRelayCarlink", "scan_primed hit=$hit issued=$issued waited=${waited}ms")
+        return waited
+    }
+    private fun logLinkReady(run: Run, stage: String) {
+        val manager = connectivity ?: return
+        runCatching {
+            val network = run.selectedNetwork
+            val properties = network?.let { manager.getLinkProperties(it) }
+            val routes = properties?.routes?.joinToString(",") {
+                it.destination.toString().substringBefore("/") + if (it.isDefaultRoute) "*" else ""
+            } ?: "-"
+            val addresses = properties?.linkAddresses?.joinToString(",") { it.address.hostAddress ?: "-" } ?: "-"
+            val dns = properties?.dnsServers?.joinToString(",") { it.hostAddress ?: "-" } ?: "-"
+            Log.i("DiRelayCarlink", "link_ready stage=$stage iface=${properties?.interfaceName ?: "-"} " +
+                "addrs=$addresses defaultRoute=${properties?.routes?.any { it.isDefaultRoute } ?: false} " +
+                "routes=$routes dns=$dns processBound=${manager.boundNetworkForProcess != null}")
+        }.onFailure { Log.w("DiRelayCarlink", "link_ready stage=$stage failed=${it.javaClass.simpleName}") }
+    }
+    private fun lost(run: Run, radioOff: Boolean = false) {
+        if (run.cancelled) return
+        val failure = ClinkFailure(ClinkFailureReason.LINK_LOST)
+        if (run.failure == null) diagnostics.emit(ClinkFailures.describe(ClinkStage.LINK_LOST,
+            if (radioOff) ClinkFailure(ClinkFailureReason.WIFI_OFF) else failure))
+        run.failure = failure
+        if (run.ready && !run.lossReported) {
+            run.lossReported = true
+            run.lost(failure)
+        }
+    }
+    override fun disconnect() {
+        current?.let(::disconnectRun)
+    }
+    private fun disconnectRun(expected: Run) {
+        val released = CompletableFuture<Unit>()
+        val run = synchronized(this) {
+            val active = current ?: return
+            if (active !== expected) return
+            // Publish the barrier before allowing this instance to connect again. The GATT close has
+            // its own barrier entry, so forcing this one need not wait for it.
+            reconnect.releasing(released) {
+                main { settleRelease(released, listOf({ finishBleClose(active) }, { releaseNetwork(active) }), ::cleanupFailure) }
+            }
+            current = null
+            active
+        }
+        diagnostics.emit(ClinkStage.LINK_STOP)
+        run.cancelled = true
+        run.waits.forEach { it.cancel(false) }
+        // A failed step must neither skip the others nor leave the barrier waiting on [released].
+        main {
+            settleRelease(released, listOf({ closeBle(run) }, { leaveP2p(run) }, { releaseNetwork(run) }),
+                ::cleanupFailure) { run.bleClosed }
+        }
+    }
+    private fun releaseNetwork(run: Run) {
+        run.wifiFlow?.close(); run.wifiFlow = null
+        run.adoptedCallback?.let { runCatching { connectivity?.unregisterNetworkCallback(it) } }
+        run.adoptedCallback = null
+        run.networkCallback?.let {
+            // unregisterNetworkCallback releases the request synchronously. Android does not send
+            // onLost for an unregistered callback, so waiting for it would stall every reconnect.
+            diagnostics.emit(ClinkStage.NETWORK_RELEASE)
+            connectivity?.unregisterNetworkCallback(it)
+            run.networkCallback = null
+            diagnostics.emit(ClinkStage.NETWORK_RELEASED)
+        }
+        if (run.bound != null && connectivity?.boundNetworkForProcess == run.bound)
+            check(connectivity.bindProcessToNetwork(run.previousBinding)) { "Network unbind failed" }
+        run.bound = null
+        run.selectedNetwork = null
+    }
+    private fun leaveP2p(run: Run) {
+        run.monitor?.let(handler::removeCallbacks); run.monitor = null
+        run.receiver?.let { runCatching { context.unregisterReceiver(it) }.onFailure(::cleanupFailure) }; run.receiver = null
+        run.channel?.let { channel ->
+            runCatching { p2p?.cancelConnect(channel, null) }.onFailure(::cleanupFailure)
+            if (run.headUnitClientGroup && !p2pReservation.reservedByCarPlay()) removeObservedGroup(run, channel)
+            else channel.close()
+            run.headUnitClientGroup = false
+        }
+        run.channel = null
+    }
+    private fun removeObservedGroup(run: Run, channel: WifiP2pManager.Channel) {
+        // Revalidate at cleanup: another controller may have replaced the observed group.
+        fun attempt(action: () -> Unit) {
+            try { action() }
+            catch (error: Exception) {
+                diagnostics.emit(ClinkFailures.describe(ClinkStage.LINK_STOP, error))
+                channel.close()
+            }
+        }
+        attempt {
+            p2p?.requestConnectionInfo(channel) { info ->
+                attempt {
+                    p2p?.requestGroupInfo(channel) { group ->
+                        val matches = WifiJoinPolicy.mayRemoveGroup(info.groupFormed,
+                            info.isGroupOwner, group?.networkName, run.expectedSsid ?: "")
+                        if (matches && !p2pReservation.reservedByCarPlay()) attempt {
+                            p2p?.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                                override fun onSuccess() { channel.close() }
+                                override fun onFailure(reason: Int) {
+                                    diagnostics.emit(ClinkFailures.describe(ClinkStage.LINK_STOP,
+                                        ClinkFailure(ClinkFailures.p2p(reason))))
+                                    channel.close()
+                                }
+                            })
+                        } else channel.close()
+                    }
+                }
+            }
+        }
+    }
+    private fun cleanupFailure(error: Throwable) {
+        diagnostics.emit(ClinkFailures.describe(ClinkStage.LINK_STOP, error))
+    }
+    private fun stopScan(run: Run) {
+        run.scanRenewal?.let(handler::removeCallbacks); run.scanRenewal = null
+        run.scanProgress?.let(handler::removeCallbacks); run.scanProgress = null
+        val counter = run.scanCounter
+        run.scanCounter = null
+        counter?.let { callback -> runCatching { run.scanner?.stopScan(callback) }.onFailure(::cleanupFailure) }
+        val raw = run.rawScan
+        run.rawScan = null
+        raw?.let { callback -> runCatching { run.scanner?.stopScan(callback) }.onFailure(::cleanupFailure) }
+        run.rawCapture?.finish(); run.rawCapture = null
+        run.scan?.let { callback -> runCatching { run.scanner?.stopScan(callback) }.onFailure(::cleanupFailure) }
+        run.scan = null; run.scanner = null
+    }
+    private fun closeBle(run: Run) {
+        run.cccdTimer?.let(handler::removeCallbacks); run.cccdTimer = null
+        run.verifyTimer?.let(handler::removeCallbacks); run.verifyTimer = null
+        run.serviceMonitor?.let(handler::removeCallbacks); run.serviceMonitor = null
+        stopScan(run)
+        val gatt = run.gatt ?: return
+        run.gatt = null
+        run.closingGatt = gatt
+        run.bleClosed = CompletableFuture()
+        reconnect.releasing(run.bleClosed) { main { finishBleClose(run) } }
+        diagnostics.emit(ClinkStage.GATT_DISCONNECT)
+        runCatching { gatt.disconnect() }.onFailure { cleanupFailure(it); finishBleClose(run) }
+        handler.postDelayed({ if (run.closingGatt === gatt) {
+            diagnostics.emit(ClinkStage.CLEANUP_FORCE)
+            finishBleClose(run)
+        } }, 5_000)
+    }
+    private fun finishBleClose(run: Run) {
+        val gatt = run.closingGatt ?: return
+        try {
+            gatt.close()
+            run.closingGatt = null
+            run.bleClosed.complete(Unit)
+            diagnostics.emit(ClinkStage.GATT_CLOSED)
+        } catch (failure: Exception) {
+            cleanupFailure(failure)
+            diagnostics.emit(ClinkDiagnostic.Failure(ClinkStage.GATT_DISCONNECT, "gatt_close_failed", failure.javaClass.simpleName))
+            run.bleClosed.completeExceptionally(failure)
+        }
+    }
+    private fun phoneMac(): String {
+        // Android hides hardware MACs from ordinary apps. Use an explicit locally administered identity.
+        val preferences = context.getSharedPreferences("direlay", Context.MODE_PRIVATE)
+        preferences.getString("clinkPhoneMac", null)?.let { return it }
+        val bytes = ByteArray(6).also { java.security.SecureRandom().nextBytes(it) }
+        bytes[0] = ((bytes[0].toInt() or 2) and 254).toByte()
+        val mac = bytes.joinToString(":") { "%02x".format(it.toInt() and 255) }
+        check(preferences.edit().putString("clinkPhoneMac", mac).commit())
+        return mac
+    }
+    private fun main(action: () -> Unit) {
+        if (Looper.myLooper() == handler.looper) { action(); return }
+        val result = CompletableFuture<Unit>()
+        handler.post { try { action(); result.complete(Unit) } catch (failure: Exception) { result.completeExceptionally(failure) } }
+        result.get(5, TimeUnit.SECONDS)
+    }
+}

@@ -1,0 +1,587 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-14
+package top.cabinplay.direlay.settings
+
+import android.content.Context
+import top.cabinplay.stream.core.FrameRatePreference
+import top.cabinplay.stream.clink.ClinkHevcMode
+import top.cabinplay.stream.clink.ClinkPictureSize
+import com.shilapi.xcertplay.AirPlayPersistence
+import com.shilapi.xcertplay.orchestration.MfiTarget
+import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
+
+// DiPlay's default-mode API is internal; keep its existing preference contract here.
+enum class ConnectionMode(val key: String) {
+    USB("usb"), WIRELESS("wireless"), LAST_USED("last_used");
+    fun wireless(lastUsed: Boolean): Boolean = when (this) {
+        USB -> false
+        WIRELESS -> true
+        LAST_USED -> lastUsed
+    }
+}
+
+data class DisplayProfile(val width: Int, val height: Int, val density: Int) {
+    fun validate() {
+        require(width in 320..3840 && height in 240..2160 && width % 2 == 0 && height % 2 == 0) {
+            "Use even dimensions: width 320–3840 px and height 240–2160 px."
+        }
+        require(density in 120..640) { "Density must be 120–640 dpi." }
+    }
+    companion object {
+        val presets = listOf(
+            DisplayProfile(800, 480, 160), DisplayProfile(1024, 600, 160),
+            DisplayProfile(1280, 720, 160), DisplayProfile(1920, 720, 240),
+            DisplayProfile(1920, 1080, 240),
+        )
+    }
+}
+
+enum class VideoCodecSetting(val wire: String) { AUTO("auto"), H265("h265"), H264("h264") }
+
+enum class VideoStatsWindow(val seconds: Int) {
+    OFF(0), SECONDS_5(5), SECONDS_15(15);
+    companion object { fun fromStored(value: String?) = entries.firstOrNull { it.name == value } ?: OFF }
+}
+
+enum class MicrophoneSource { HEAD_UNIT, THIS_DEVICE }
+
+data class RelaySettings(
+    val connectionMode: ConnectionMode,
+    val mfiTarget: MfiTarget,
+    val i2cPath: String,
+    val remoteServer: String,
+    val remoteToken: String,
+    val display: DisplayProfile?,
+    val frameRate: FrameRatePreference = FrameRatePreference.AUTO,
+    val autoStartOnBoot: Boolean,
+    val autoStartWhenReady: Boolean,
+    val localPreview: Boolean,
+    val webPort: Int?,
+    val outputs: Set<RelayOutput> = setOf(RelayOutput.BROWSER),
+    val carlinkDeviceName: String = "CabinPlay",
+    val carlinkDeviceModel: String = "Android relay",
+    val wirelessNetwork: WirelessNetworkSettings = WirelessNetworkSettings(),
+    val playCarPlayAudio: Boolean = false,
+    val microphoneSource: MicrophoneSource = MicrophoneSource.HEAD_UNIT,
+    val vehicleInformation: Boolean = false,
+    val carlinkAutoReconnect: Boolean = true,
+    val carlinkReconnectOnResize: Boolean = false,
+    val displayMode: DisplayMode = if (display == null) DisplayMode.AUTOMATIC else DisplayMode.FIXED,
+    val iphoneAddress: String? = null,
+    val plugins: Boolean = false,
+    val pluginsEnabled: List<String> = emptyList(),
+    val carlinkTrace: Boolean = false,
+    val carlinkHevc: ClinkHevcMode = ClinkHevcMode.STREAM_ONLY,
+    val carlinkPictureSize: ClinkPictureSize = ClinkPictureSize.WINDOW,
+    val carplayResolution: CarPlayResolution = CarPlayResolution.AUTO,
+    val carplayScreenWidth: CarPlayScreenWidth = CarPlayScreenWidth.MM200,
+    val carplayScreenWidthCustomMm: Int? = null,
+    val viewAreas: Boolean = true,
+    val viewAreasMode: ViewAreasMode = ViewAreasMode.AUTOMATIC,
+    val viewAreasFullscreen: PictureSize? = null,
+    val viewAreasWindowed: PictureSize? = null,
+    val car: CarSelection = CarSelection(),
+    val videoCodec: VideoCodecSetting = VideoCodecSetting.AUTO,
+    val videoStats: VideoStatsWindow = VideoStatsWindow.OFF,
+    /** Offer the iPhone no CarPlay audio, so music, navigation and calls stay on its Bluetooth link with the car. */
+    val carBluetoothAudio: Boolean = true,
+    val teslaBrowser: TeslaBrowserMode = TeslaBrowserMode.OFF,
+    val teslaVirtualAddress: String = TeslaAddressPolicy.DEFAULT_VIRTUAL,
+    val teslaPublicAddress: String = TeslaAddressPolicy.DEFAULT_PUBLIC,
+    val teslaMirrorAddress: String = TeslaAddressPolicy.DEFAULT_MIRROR,
+    val teslaAndroidAddress: String = TeslaAddressPolicy.DEFAULT_ANDROID,
+    val dlnaRenderer: DlnaRendererChoice? = null,
+    val wirelessPicture: WirelessPictureMode = WirelessPictureMode.AUTO,
+    val wirelessPictureSize: WirelessPictureSize = WirelessPictureSize(),
+    val carlinkPictureSizes: List<PictureSize> = emptyList(),
+    val carlinkPictureDefault: PictureSize? = null,
+    val miracastStretch: Boolean = false,
+    val experimental: ExperimentalOptions = ExperimentalOptions(),
+    val highPerformance: Boolean = true,
+    /** Optional IPv4 address for directed CarLife discovery; empty uses LAN broadcast. */
+    val carlifeTargetAddress: String = "",
+    val carlifeTransport: CarlifeTransport = CarlifeTransport.AUTO,
+) {
+    val browserOutput get() = RelayOutput.BROWSER in outputs
+    val carlinkOutput get() = RelayOutput.CARLINK in outputs
+    val dlnaOutput get() = RelayOutput.DLNA in outputs
+    val miracastOutput get() = RelayOutput.MIRACAST in outputs
+    val carlifeOutput get() = RelayOutput.CARLIFE in outputs
+
+    fun validate(wireless: Boolean = connectionMode == ConnectionMode.WIRELESS, allowEmptySharedWifi: Boolean = false,
+        phoneAddresses: Set<String> = emptySet()) {
+        require(outputs.isNotEmpty()) { "Choose an output." }
+        require(!CarlifeConnectionPolicy.usbOutput(this) || connectionMode == ConnectionMode.WIRELESS) {
+            "USB CarLife requires wireless CarPlay from the iPhone."
+        }
+        require(validCarlifeAddress(carlifeTargetAddress)) { "Enter a CarLife head-unit IPv4 address, or leave it empty for discovery." }
+        teslaAddress()?.let { require(TeslaAddressPolicy.valid(it, phoneAddresses)) { "Invalid or already assigned Tesla address: $it" } }
+        if (wireless) wirelessNetwork.validate(allowEmptySharedWifi, allowIncompleteHotspot = allowEmptySharedWifi && CarlinkConnectionPolicy.usesWifiDirect(this))
+        for (value in listOf(carlinkDeviceName, carlinkDeviceModel)) {
+            require(value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= 128 &&
+                value.none { Character.isISOControl(it) }) { "Carlink name and model must contain 1–128 UTF-8 bytes without control characters." }
+        }
+        require(top.cabinplay.direlay.plugins.RelayPlugins.validIds(pluginsEnabled)) { "error.plugins" }
+        wirelessPictureSize.validate()
+        require(normalizedCarlinkPictures() == this) { "Invalid Carlink picture sizes or default." }
+        require(carplayScreenWidthCustomMm == null || customScreenWidthValid(carplayScreenWidthCustomMm)) { "Width must be 100–400 mm in 5 mm steps." }
+        viewAreasFullscreen?.validateViewArea()
+        viewAreasWindowed?.validateViewArea()
+        require(!viewAreas || viewAreasMode != ViewAreasMode.MANUAL || viewAreasFullscreen != null || viewAreasWindowed != null) {
+            "Enter at least one size."
+        }
+        display?.validate()
+        require(displayMode != DisplayMode.FIXED || display != null) { "Choose a fixed display profile." }
+        require(webPort == null || webPort in 1024..65535) { "Web port must be 1024–65535, or empty for automatic." }
+        require('\u0000' !in i2cPath && '\u0000' !in remoteServer && '\u0000' !in remoteToken) {
+            "MFi settings must not contain null characters."
+        }
+        if (mfiTarget == MfiTarget.I2C) require(i2cPath.isNotBlank()) { "Enter the Linux I2C device path." }
+        if (mfiTarget == MfiTarget.REMOTE) {
+            val uri = java.net.URI(remoteServer.trim())
+            require(uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank()) {
+                "Enter an http:// or https:// remote MFi server address."
+            }
+        }
+    }
+}
+
+fun RelaySettings.displaySettings() = top.cabinplay.stream.web.DisplaySettings(carplayResolution.wire, carplayScreenWidth.mm, videoCodec.wire, frameRate)
+
+/** Maps relay controls to DiPlay's persistence; only relay-specific values live in direlay. */
+class RelaySettingsStore(private val context: Context) : AutoCloseable, top.cabinplay.stream.web.DisplaySettingsPort {
+    private val displayListeners = java.util.concurrent.CopyOnWriteArrayList<(top.cabinplay.stream.web.DisplaySettings) -> Unit>()
+    override fun current() = cached.value?.displaySettings() ?: top.cabinplay.stream.web.DisplaySettings()
+    @Synchronized override fun set(settings: top.cabinplay.stream.web.DisplaySettings, origin: top.cabinplay.stream.core.Origin) {
+        val current = cached.value ?: load()
+        save(current.copy(
+            frameRate = settings.frameRate,
+            videoCodec = VideoCodecSetting.entries.first { it.wire == settings.videoCodec },
+            carplayResolution = CarPlayResolution.entries.first { it.wire == settings.resolution },
+            carplayScreenWidth = CarPlayScreenWidth.entries.first { it.mm == settings.screenWidth },
+            carplayScreenWidthCustomMm = current.carplayScreenWidthCustomMm.takeIf { settings.screenWidth == current.carplayScreenWidth.mm }))
+    }
+    override fun listen(callback: (top.cabinplay.stream.web.DisplaySettings) -> Unit): AutoCloseable {
+        displayListeners.add(callback)
+        return AutoCloseable { displayListeners.remove(callback) }
+    }
+    private fun publish(value: RelaySettings) {
+        val previous = cached.value?.displaySettings()
+        cached.value = value
+        if (previous != value.displaySettings()) displayListeners.forEach { it(value.displaySettings()) }
+    }
+    private val relay get() = context.getSharedPreferences("direlay", Context.MODE_PRIVATE)
+    private val diplay get() = context.getSharedPreferences("diplay", Context.MODE_PRIVATE)
+
+    init {
+        // Synchronous at runtime construction, before application startup can launch a CarPlay activity or service.
+        CarBluetoothAudioDefaults.apply(context, relay)
+    }
+
+    private val cached = kotlinx.coroutines.flow.MutableStateFlow<RelaySettings?>(null)
+    val snapshot: kotlinx.coroutines.flow.StateFlow<RelaySettings?> = cached
+    private val overrides = kotlinx.coroutines.flow.MutableStateFlow(DeveloperOverrides())
+    private var overridesLoaded = false
+    // Read-modify-write callers must copy persisted choices, even before observation starts.
+    val developerOverrides: kotlinx.coroutines.flow.StateFlow<DeveloperOverrides>
+        @Synchronized get() {
+            if (!overridesLoaded) load()
+            return overrides
+        }
+    private val refreshWorker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "direlay-settings").apply { isDaemon = true }
+    }
+    @Volatile private var closed = false
+    private val refreshQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var initialRead: java.util.concurrent.Future<*>? = null
+    // Keep a strong reference: SharedPreferences holds listeners weakly.
+    private val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        if (!closed && refreshQueued.compareAndSet(false, true)) try { refreshWorker.execute {
+            refreshQueued.set(false)
+            synchronized(this) { if (!closed) publish(load()) }
+        } } catch (_: java.util.concurrent.RejectedExecutionException) { refreshQueued.set(false) }
+    }
+    @Synchronized fun startObserving() {
+        check(!closed)
+        if (initialRead != null) return
+        listOf(relay, diplay, context.getSharedPreferences("xcertplay_airplay", Context.MODE_PRIVATE))
+            .forEach { it.registerOnSharedPreferenceChangeListener(listener) }
+        initialRead = refreshWorker.submit { synchronized(this) { publish(load()) } }
+    }
+    /** Only workers may wait for the first disk-backed preference snapshot. */
+    fun awaitSnapshot(): RelaySettings {
+        startObserving()
+        initialRead!!.get()
+        return checkNotNull(cached.value)
+    }
+
+    override fun close() {
+        closed = true
+        listOf(relay, diplay, context.getSharedPreferences("xcertplay_airplay", Context.MODE_PRIVATE))
+            .forEach { it.unregisterOnSharedPreferenceChangeListener(listener) }
+        displayListeners.clear()
+        refreshWorker.shutdownNow()
+    }
+
+    @Synchronized fun load(): RelaySettings {
+        val stored = loadStored()
+        val remembered = loadDeveloperOverrides(stored)
+        val choices = remembered.remember(stored)
+        val effective = choices.effectiveSettings(stored)
+        if (choices != remembered || effective != stored ||
+            relay.getInt("devPhysicalWidthMm", 0) != choices.effectivePhysicalWidth()) {
+            persistSettings(effective, stored, choices)
+        }
+        overrides.value = choices
+        overridesLoaded = true
+        return effective
+    }
+
+    private fun loadStored(): RelaySettings {
+        // Check each private preference key independently; keep every stored user value.
+        if (!diplay.contains("auto_connect")) diplay.edit().putBoolean("auto_connect", true).apply()
+        val identity = context.getSharedPreferences("xcertplay_airplay", Context.MODE_PRIVATE)
+        AccessoryIdentityDefaults.apply(context, relay)
+        // Settings saved before the guided setup existed mean the relay is already set up. Decided once, before
+        // the guide's own saves could look the same.
+        if (!relay.contains("setupCompleted")) relay.edit().putBoolean("setupCompleted", relay.contains("carlinkOutput") || relay.contains("outputs")).apply()
+        // Migrate an existing choice once, before installing our safe default into DiPlay's store.
+        // Keep the user-choice marker unset until a choice is actually saved.
+        if (!relay.getBoolean("wirelessNetworkInitialized", false)) {
+            val stored = identity.contains("wireless_hotspot_mode")
+            val edit = relay.edit().putBoolean("wirelessNetworkInitialized", true)
+            if (stored) edit.putBoolean("wirelessNetworkChosen", true)
+            edit.apply()
+        }
+        if (!relay.getBoolean("wirelessNetworkChosen", false) &&
+            identity.getString("wireless_hotspot_mode", null) != WirelessHotspotMode.WIFI_P2P.name)
+            AirPlayPersistence.saveWirelessHotspotMode(context, WirelessHotspotMode.WIFI_P2P)
+        val profile = if (relay.getBoolean("customDisplay", false)) {
+            DisplayProfile(relay.getInt("displayWidth", 1280), relay.getInt("displayHeight", 720),
+                relay.getInt("displayDensity", 160)).takeIf { runCatching { it.validate() }.isSuccess }
+        } else null
+        val mode = migratedDisplayMode(relay.getString("displayMode", null), profile)
+        if (relay.getString("displayMode", null) != mode.name) relay.edit().putString("displayMode", mode.name).apply()
+        return RelaySettings(
+            ConnectionMode.entries.firstOrNull { it.key == diplay.getString("default_connection_mode", null) }
+                ?: ConnectionMode.LAST_USED,
+            AirPlayPersistence.loadMfiTarget(context), AirPlayPersistence.loadMfiI2cPath(context),
+            AirPlayPersistence.loadRemoteMfiServer(context), AirPlayPersistence.loadRemoteMfiToken(context),
+            profile, loadFrameRate(), AirPlayPersistence.loadAutoStartOnBoot(context),
+            diplay.getBoolean("auto_connect", true), relay.getBoolean("localPreview", false),
+            relay.getInt("webPort", 0).takeIf { it in 1024..65535 },
+            outputs = if (relay.contains("outputs")) relay.getString("outputs", "").orEmpty().split(',')
+                .mapNotNull { wire -> RelayOutput.entries.firstOrNull { it.wire == wire } }.toSet()
+                .ifEmpty { setOf(RelayOutput.BROWSER) }
+            else OutputSelection.legacy(relay.getBoolean("carlinkOutput", false), relay.getBoolean("bothOutputs", false),
+                relay.getBoolean("dlnaOutput", false), relay.getBoolean("miracastOutput", false)),
+            carlinkDeviceName = relay.getString("carlinkDeviceName", "CabinPlay") ?: "CabinPlay",
+            carlinkDeviceModel = relay.getString("carlinkDeviceModel", "Android relay") ?: "Android relay",
+            wirelessNetwork = WirelessNetworkSettings.load(context),
+            playCarPlayAudio = relay.getBoolean("playCarPlayAudio", false),
+            microphoneSource = MicrophoneSource.entries.firstOrNull { it.name == relay.getString("microphoneSource", null) }
+                ?: MicrophoneSource.HEAD_UNIT,
+            vehicleInformation = relay.getBoolean("vehicleInformation", false),
+            carlinkAutoReconnect = relay.getBoolean("carlinkAutoReconnect", true),
+            carlinkReconnectOnResize = relay.getBoolean("carlinkReconnectOnResize", false),
+            displayMode = mode,
+            iphoneAddress = relay.getString("iphoneAddress", null),
+            dlnaRenderer = relay.getString("dlnaRendererUdn", null)?.let { DlnaRendererChoice(it, relay.getString("dlnaRendererName", "").orEmpty()) },
+            wirelessPicture = WirelessPictureMode.entries.firstOrNull { it.name == relay.getString("wirelessPicture", null) } ?: WirelessPictureMode.AUTO,
+            wirelessPictureSize = WirelessPictureSize(relay.getInt("wirelessPictureWidth", 1280), relay.getInt("wirelessPictureHeight", 720))
+                .takeIf { runCatching { it.validate() }.isSuccess } ?: WirelessPictureSize(),
+            carlinkPictureSizes = CarlinkPictureSizes.decodeSaved(relay.getString("carlinkPictureSizes", "[]").orEmpty()),
+            carlinkPictureDefault = CarlinkPictureSizes.decodeDefault(relay.getString("carlinkPictureDefault", null)),
+            miracastStretch = relay.getBoolean("miracastStretch", false),
+            experimental = loadExperimentalOptions(),
+            highPerformance = relay.getBoolean("highPerformance", true),
+            carlifeTargetAddress = relay.getString("carlifeTargetAddress", "").orEmpty(),
+            carlifeTransport = CarlifeTransport.fromStored(relay.getString("carlifeTransport", null)),
+            carlinkTrace = relay.getBoolean("carlinkTrace", false),
+            carlinkHevc = ClinkHevcMode.entries.firstOrNull { it.name == relay.getString("carlinkHevc", null) } ?: ClinkHevcMode.STREAM_ONLY,
+            carlinkPictureSize = ClinkPictureSize.entries.firstOrNull { it.name == relay.getString("carlinkPictureSize", null) } ?: ClinkPictureSize.WINDOW,
+            viewAreas = relay.getBoolean("carPlayViewAreas", true),
+            viewAreasMode = ViewAreasMode.entries.firstOrNull { it.name == relay.getString("viewAreasMode", null) } ?: ViewAreasMode.AUTOMATIC,
+            viewAreasFullscreen = loadViewAreaSize("viewAreasFullscreen"),
+            viewAreasWindowed = loadViewAreaSize("viewAreasWindowed"),
+            car = CarSelection(relay.getString("carBrand", "").orEmpty(), relay.getString("carBrandText", "").orEmpty(),
+                relay.getString("carModel", "").orEmpty(), relay.getString("carModelText", "").orEmpty(),
+                relay.getString("carYear", "").orEmpty(), relay.getString("carYearText", "").orEmpty()).normalized(),
+            videoStats = VideoStatsWindow.fromStored(relay.getString("videoStats", null)),
+            teslaBrowser = TeslaBrowserMode.entries.firstOrNull { it.name == relay.getString("teslaBrowser", null) } ?: TeslaBrowserMode.OFF,
+            teslaVirtualAddress = relay.getString("teslaVirtualAddress", TeslaAddressPolicy.DEFAULT_VIRTUAL) ?: TeslaAddressPolicy.DEFAULT_VIRTUAL,
+            teslaPublicAddress = relay.getString("teslaPublicAddress", TeslaAddressPolicy.DEFAULT_PUBLIC) ?: TeslaAddressPolicy.DEFAULT_PUBLIC,
+            teslaMirrorAddress = relay.getString("teslaMirrorAddress", TeslaAddressPolicy.DEFAULT_MIRROR) ?: TeslaAddressPolicy.DEFAULT_MIRROR,
+            teslaAndroidAddress = relay.getString("teslaAndroidAddress", TeslaAddressPolicy.DEFAULT_ANDROID) ?: TeslaAddressPolicy.DEFAULT_ANDROID,
+            carBluetoothAudio = AirPlayPersistence.loadCarBluetoothAudio(context),
+            videoCodec = VideoCodecSetting.entries.firstOrNull { it.name == relay.getString("videoCodec", null) } ?: VideoCodecSetting.AUTO,
+            carplayResolution = CarPlayResolution.entries.firstOrNull { it.name == relay.getString("carplayResolution", null) } ?: CarPlayResolution.AUTO,
+            carplayScreenWidth = CarPlayScreenWidth.entries.firstOrNull { it.mm == relay.getInt("carplayScreenWidth", 200) } ?: CarPlayScreenWidth.MM200,
+            carplayScreenWidthCustomMm = relay.getInt("carplayScreenWidthCustomMm", 0).takeIf(::customScreenWidthValid),
+            plugins = relay.getBoolean("plugins", false),
+            pluginsEnabled = runCatching {
+                val ids = org.json.JSONArray(relay.getString("pluginsEnabled", "[]"))
+                (0 until ids.length()).map { ids.getString(it) }.also { require(top.cabinplay.direlay.plugins.RelayPlugins.validIds(it)) }
+            }.getOrDefault(emptyList()),
+        ).normalizedCarlinkPictures()
+    }
+
+    private fun loadViewAreaSize(key: String): PictureSize? =
+        if (!relay.contains("${key}Width")) null else PictureSize(relay.getInt("${key}Width", 0), relay.getInt("${key}Height", 0))
+            .takeIf { runCatching { it.validateViewArea() }.isSuccess }
+
+    private fun loadFrameRate(): FrameRatePreference {
+        val values = relay.all
+        val setting = if ("frameRate" in values) {
+            FrameRatePreference.entries.firstOrNull { it.name == values["frameRate"] }
+        } else if (values["developer.fps.enabled"] == true) {
+            (values["developer.fps"] as? Int)?.let { fps ->
+                FrameRatePreference.entries.firstOrNull { it.name == "FPS_$fps" }
+            }
+        } else null
+        val result = setting ?: FrameRatePreference.AUTO
+        if (values["frameRate"] != result.name || "developer.fps.enabled" in values || "developer.fps" in values) {
+            relay.edit().putString("frameRate", result.name)
+                .remove("developer.fps.enabled").remove("developer.fps").apply()
+        }
+        return result
+    }
+
+    @Synchronized fun save(value: RelaySettings) {
+        val current = load()
+        val choices = overrides.value.remember(value)
+        persistSettings(choices.effectiveSettings(value), current, choices)
+        publish(load())
+    }
+
+    /** Publish the shared editor's settings and remembered overrides together. */
+    @Synchronized fun save(value: RelaySettings, choices: DeveloperOverrides) {
+        val current = load()
+        persistSettings(choices.effectiveSettings(value), current, choices)
+        publish(load())
+    }
+
+    @Synchronized fun saveDeveloperOverrides(value: DeveloperOverrides) {
+        val current = load()
+        persistSettings(value.effectiveSettings(current), current, value)
+        publish(load())
+    }
+
+    private fun persistSettings(value: RelaySettings, current: RelaySettings, choices: DeveloperOverrides) {
+        val settings = value.copy(car = value.car.normalized())
+        // Validate wireless fields when they change or wireless is newly selected; untouched defaults
+        // must not block unrelated settings.
+        val wirelessChanged = settings.wirelessNetwork != current.wirelessNetwork ||
+            settings.connectionMode != current.connectionMode
+        settings.validate(wireless(settings) && wirelessChanged, allowEmptySharedWifi = true)
+        // An unchanged active address belongs to our TUN already; check collisions when choosing a new one.
+        if (settings.teslaAddress() != null && settings.teslaAddress() != current.teslaAddress())
+            settings.validate(wireless = false, allowEmptySharedWifi = true,
+                phoneAddresses = top.cabinplay.direlay.network.phoneIpv4Addresses())
+        val previousDisplay = current.display
+        diplay.edit().putString("default_connection_mode", settings.connectionMode.key)
+            .putBoolean("auto_connect", settings.autoStartWhenReady).apply()
+        // LAST_USED must retain the previous transport rather than silently choosing a new one.
+        if (settings.connectionMode != ConnectionMode.LAST_USED) {
+            AirPlayPersistence.saveWirelessEnabled(context, settings.connectionMode == ConnectionMode.WIRELESS)
+        }
+        settings.wirelessNetwork.save(context)
+        AirPlayPersistence.saveMfiTarget(context, settings.mfiTarget)
+        AirPlayPersistence.saveMfiI2cPath(context, settings.i2cPath)
+        AirPlayPersistence.saveRemoteMfiServer(context, settings.remoteServer.trim())
+        AirPlayPersistence.saveRemoteMfiToken(context, settings.remoteToken)
+        if (settings.display != previousDisplay || settings.displayMode != current.displayMode) {
+            AirPlayPersistence.saveMaximumDetectedDisplay(context, 0, 0)
+        }
+        if (settings.displayMode == DisplayMode.FIXED) settings.display?.let {
+            applyDisplayProfile(it, settings.carplayScreenWidth, settings.carplayScreenWidthCustomMm, choices.effectivePhysicalWidth())
+        }
+        AirPlayPersistence.saveAutoStartOnBoot(context, settings.autoStartOnBoot)
+        // DiPlay reads this when it builds the next session's AirPlay configuration.
+        AirPlayPersistence.saveCarBluetoothAudio(context, settings.carBluetoothAudio)
+        val edit = relay.edit().putString("frameRate", settings.frameRate.name)
+            .putBoolean("highPerformance", settings.highPerformance)
+            .putString("carlifeTargetAddress", settings.carlifeTargetAddress.trim())
+            .putString("carlifeTransport", settings.carlifeTransport.wire)
+            .putBoolean("localPreview", settings.localPreview)
+            .putBoolean("playCarPlayAudio", settings.playCarPlayAudio)
+            .putString("microphoneSource", settings.microphoneSource.name)
+            .putString("outputs", RelayOutput.entries.filter { it in settings.outputs }.joinToString(",") { it.wire })
+            .remove("carlinkOutput").remove("bothOutputs").remove("dlnaOutput").remove("miracastOutput")
+            .putString("dlnaRendererUdn", settings.dlnaRenderer?.udn)
+            .putString("dlnaRendererName", settings.dlnaRenderer?.name)
+            .remove("dlnaPicture")
+            .putString("wirelessPicture", settings.wirelessPicture.name)
+            .putInt("wirelessPictureWidth", settings.wirelessPictureSize.width)
+            .putInt("wirelessPictureHeight", settings.wirelessPictureSize.height)
+            .putString("carlinkPictureSizes", CarlinkPictureSizes.savedJson(settings.carlinkPictureSizes).toString())
+            .putString("carlinkPictureDefault", settings.carlinkPictureDefault?.let { CarlinkPictureSizes.json(it).toString() })
+            .putBoolean("miracastStretch", settings.miracastStretch)
+            .putBoolean("vehicleInformation", settings.vehicleInformation)
+            .putBoolean("carlinkAutoReconnect", settings.carlinkAutoReconnect)
+            .putBoolean("carlinkReconnectOnResize", settings.carlinkReconnectOnResize)
+            .putBoolean("carlinkTrace", settings.carlinkTrace)
+            .putString("carlinkHevc", settings.carlinkHevc.name)
+            .putString("carlinkPictureSize", settings.carlinkPictureSize.name)
+            .putBoolean("carPlayViewAreas", settings.viewAreas)
+            .putString("viewAreasMode", settings.viewAreasMode.name)
+            .putInt("carplayScreenWidthCustomMm", settings.carplayScreenWidthCustomMm ?: 0)
+            .putString("carBrand", settings.car.brand).putString("carBrandText", settings.car.brandText)
+            .putString("carModel", settings.car.model).putString("carModelText", settings.car.modelText)
+            .putString("carYear", settings.car.year).putString("carYearText", settings.car.yearText)
+            .putString("videoCodec", settings.videoCodec.name)
+            .putString("videoStats", settings.videoStats.name)
+            .putString("teslaBrowser", settings.teslaBrowser.name)
+            .putString("teslaVirtualAddress", settings.teslaVirtualAddress)
+            .putString("teslaPublicAddress", settings.teslaPublicAddress)
+            .putString("teslaMirrorAddress", settings.teslaMirrorAddress)
+            .putString("teslaAndroidAddress", settings.teslaAndroidAddress)
+            .putString("carplayResolution", settings.carplayResolution.name)
+            .putInt("carplayScreenWidth", settings.carplayScreenWidth.mm)
+            .putBoolean("plugins", settings.plugins)
+            .putString("pluginsEnabled", org.json.JSONArray(settings.pluginsEnabled).toString())
+            .putString("iphoneAddress", settings.iphoneAddress)
+            .putString("displayMode", settings.displayMode.name)
+            .putString("carlinkDeviceName", settings.carlinkDeviceName)
+            .putString("carlinkDeviceModel", settings.carlinkDeviceModel)
+            .putInt("devPhysicalWidthMm", choices.effectivePhysicalWidth())
+            .putInt("webPort", settings.webPort ?: 0).putBoolean("customDisplay", settings.display != null)
+        settings.display?.let {
+            edit.putInt("displayWidth", it.width).putInt("displayHeight", it.height).putInt("displayDensity", it.density)
+        }
+        for ((key, size) in listOf("viewAreasFullscreen" to settings.viewAreasFullscreen, "viewAreasWindowed" to settings.viewAreasWindowed)) {
+            if (size == null) { edit.remove("${key}Width"); edit.remove("${key}Height") }
+            else { edit.putInt("${key}Width", size.width); edit.putInt("${key}Height", size.height) }
+        }
+        writeDeveloperOverrides(edit, choices)
+        if (settings.experimental != current.experimental) writeExperimentalOptions(edit, settings.experimental)
+        edit.apply()
+    }
+
+    private fun loadExperimentalOptions(): ExperimentalOptions {
+        val legacy = relay.contains("experimental.active") && relay.getInt("experimental.version", 0) < 2
+        val oldActive = relay.getBoolean("experimental.active", true)
+        val value = ExperimentalOptions(
+            active = legacy || oldActive,
+            carlinkWifiRecovery = relay.getBoolean("experimental.carlinkWifiRecovery", true),
+            sendBluetoothAddress = relay.getBoolean("experimental.sendBluetoothAddress", false) && (!legacy || oldActive),
+            bluetoothAddress = relay.getString("experimental.bluetoothAddress", "").orEmpty(),
+        )
+        if (relay.all.keys.any { it.startsWith("experimental.") } && relay.getInt("experimental.version", 0) < 3) relay.edit().also { writeExperimentalOptions(it, value) }.apply()
+        return value
+    }
+
+    private fun writeExperimentalOptions(edit: android.content.SharedPreferences.Editor, value: ExperimentalOptions) {
+        edit.putInt("experimental.version", 3)
+            .putBoolean("experimental.carlinkWifiRecovery", value.carlinkWifiRecovery)
+            .putBoolean("experimental.active", value.active)
+            .putBoolean("experimental.sendBluetoothAddress", value.sendBluetoothAddress)
+            .putString("experimental.bluetoothAddress", value.bluetoothAddress)
+            .remove("experimental.remotePlaybackProof")
+            .remove("experimental.cancelRecoveredRetries")
+            .remove("experimental.startupStatus")
+            .remove("experimental.startupDiagnostics")
+            .remove("experimental.networkObservationBackoff")
+            .remove("experimental.screenSessionIsolation")
+            .remove("experimental.screenReconnectReset")
+            .remove("experimental.screenDeliverySerialization")
+            .remove("experimental.iapChannelWhenOffered")
+            .remove("experimental.releaseBluetoothOnRequest")
+            .remove("experimental.awaitIphoneReconnect")
+            .remove("experimental.radioConflictPrompt")
+            .remove("experimental.stallWatchdog")
+            .remove("experimental.rememberSubscription")
+            .remove("experimental.keepScanning")
+            .remove("experimental.recordAdvertisements")
+            .remove("experimental.isolateCarlinkNetwork")
+            .remove("experimental.waitForCarlink")
+            .remove("experimental.recoverWirelessNetwork")
+    }
+
+    private fun loadDeveloperOverrides(stored: RelaySettings): DeveloperOverrides {
+        if (relay.all.keys.none { it.startsWith("developer.") }) {
+            val choices = DeveloperOverrides.migrate(stored, relay.getInt("devPhysicalWidthMm", 0))
+            val edit = relay.edit()
+            writeDeveloperOverrides(edit, choices)
+            edit.apply()
+            return choices
+        }
+        return DeveloperOverrides(
+            active = relay.getBoolean("developer.active", true),
+            carlinkTrace = relay.getBoolean("developer.carlinkTrace", false),
+            carlinkHevcEnabled = relay.getBoolean("developer.carlinkHevc.enabled", false),
+            carlinkHevc = ClinkHevcMode.entries.firstOrNull { it.name == relay.getString("developer.carlinkHevc", null) } ?: ClinkHevcMode.STREAM_ONLY,
+            carlinkPictureSizeEnabled = relay.getBoolean("developer.carlinkPictureSize.enabled", false),
+            carlinkPictureSize = ClinkPictureSize.entries.firstOrNull { it.name == relay.getString("developer.carlinkPictureSize", null) } ?: ClinkPictureSize.WINDOW,
+            physicalWidthEnabled = relay.getBoolean("developer.physicalWidth.enabled", false),
+            physicalWidthOverrideMm = relay.getInt("developer.physicalWidthMm", 0),
+            localPreview = relay.getBoolean("developer.localPreview", false),
+            playCarPlayAudio = relay.getBoolean("developer.playCarPlayAudio", false),
+            microphoneSourceEnabled = relay.getBoolean("developer.microphoneSource.enabled", false),
+            microphoneSource = MicrophoneSource.entries.firstOrNull { it.name == relay.getString("developer.microphoneSource", null) } ?: MicrophoneSource.HEAD_UNIT,
+            webPortEnabled = relay.getBoolean("developer.webPort.enabled", false),
+            webPort = relay.getInt("developer.webPort", 0).takeIf { it in 1024..65535 },
+            carlinkDeviceModelEnabled = relay.getBoolean("developer.carlinkDeviceModel.enabled", false),
+            carlinkDeviceModel = relay.getString("developer.carlinkDeviceModel", "Android relay") ?: "Android relay",
+        )
+    }
+
+    private fun writeDeveloperOverrides(edit: android.content.SharedPreferences.Editor, value: DeveloperOverrides) {
+        edit.putBoolean("developer.active", value.active)
+            .putBoolean("developer.carlinkTrace", value.carlinkTrace)
+            .putBoolean("developer.carlinkHevc.enabled", value.carlinkHevcEnabled).putString("developer.carlinkHevc", value.carlinkHevc.name)
+            .putBoolean("developer.carlinkPictureSize.enabled", value.carlinkPictureSizeEnabled).putString("developer.carlinkPictureSize", value.carlinkPictureSize.name)
+            .putBoolean("developer.physicalWidth.enabled", value.physicalWidthEnabled).putInt("developer.physicalWidthMm", value.physicalWidthOverrideMm)
+            .putBoolean("developer.localPreview", value.localPreview)
+            .putBoolean("developer.playCarPlayAudio", value.playCarPlayAudio)
+            .putBoolean("developer.microphoneSource.enabled", value.microphoneSourceEnabled).putString("developer.microphoneSource", value.microphoneSource.name)
+            .putBoolean("developer.webPort.enabled", value.webPortEnabled).putInt("developer.webPort", value.webPort ?: 0)
+            .putBoolean("developer.carlinkDeviceModel.enabled", value.carlinkDeviceModelEnabled).putString("developer.carlinkDeviceModel", value.carlinkDeviceModel)
+    }
+
+    fun prepareDisplay(profile: DisplayProfile?, screenWidth: CarPlayScreenWidth = CarPlayScreenWidth.MM200,
+        customMm: Int? = null) {
+        profile?.validate()
+        AirPlayPersistence.saveMaximumDetectedDisplay(context, 0, 0)
+        profile?.let { applyDisplayProfile(it, screenWidth, customMm) }
+    }
+
+    private fun applyDisplayProfile(profile: DisplayProfile, screenWidth: CarPlayScreenWidth, customMm: Int?,
+        widthOverride: Int = physicalWidthOverrideMm) {
+        AirPlayPersistence.saveDisplayScalePercent(context, 100)
+        // DiPlay's persistence API rounds to its own 5 mm grid.
+        AirPlayPersistence.saveWidthPhysicalMm(context, declaredPhysicalWidth(profile, screenWidth, customMm, widthOverride))
+        AirPlayPersistence.savePhysicalSizeBasis(context, com.shilapi.xcertplay.airplay.AirPlayPhysicalSizeBasis.WIDTH)
+    }
+
+    /** Developer calibration: the physical width in mm declared instead of the selected preset, or 0 to use the preset. */
+    var physicalWidthOverrideMm: Int
+        @Synchronized get() { load(); return overrides.value.effectivePhysicalWidth() }
+        @Synchronized set(value) {
+            load()
+            saveDeveloperOverrides(overrides.value.copy(physicalWidthEnabled = value > 0,
+                physicalWidthOverrideMm = value.takeIf { it > 0 } ?: overrides.value.physicalWidthOverrideMm))
+        }
+
+    /** Whether the guided setup has been finished; [load] seeds it once for installs that predate the guide. */
+    var setupCompleted: Boolean
+        get() = relay.getBoolean("setupCompleted", false)
+        set(value) { relay.edit().putBoolean("setupCompleted", value).apply() }
+
+    fun wireless(settings: RelaySettings = cached.value ?: load()): Boolean =
+        settings.connectionMode.wireless(AirPlayPersistence.loadWirelessEnabled(context))
+
+    /** The Carlink runtime block only owns Carlink's platform join. */
+    fun carlinkWifiDirectConflict(settings: RelaySettings = cached.value ?: load()): Boolean =
+        wifiDirectConflict(settings, miracast = false)
+
+    /** Resolve the transport so DiPlay's stale wireless flag cannot block a USB user. */
+    fun wifiDirectConflict(settings: RelaySettings = cached.value ?: load(), miracast: Boolean = settings.miracastOutput): Boolean =
+        CarlinkConnectionPolicy.conflicts(CarlinkConnectionPolicy.enabled(settings), wireless(settings),
+            AirPlayPersistence.loadWirelessHotspotMode(context) == WirelessHotspotMode.WIFI_P2P, miracast)
+
+    fun prepareStart() {
+        AirPlayPersistence.saveWirelessEnabled(context, wireless())
+    }
+}

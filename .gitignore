@@ -1,14 +1,14 @@
 # Rust build output (rebuilt in CI)
 **/target/
 # Generated iOS core (rebuilt by scripts/build-rust-ios.sh in CI)
-OpenXPlay-iOS/generated/liboxp_ios.a
-OpenXPlay-iOS/generated/oxp_ios.h
+CabinPlay-iOS/generated/liboxp_ios.a
+CabinPlay-iOS/generated/oxp_ios.h
 # Xcode build output
-OpenXPlay-iOS/build/
-OpenXPlay-iOS/OpenXPlay.xcodeproj/
+CabinPlay-iOS/build/
+CabinPlay-iOS/CabinPlay.xcodeproj/
 Payload/
 *.ipa
 .DS_Store
-OpenXPlay-iOS/generated/liboxp_clink_ios.a
-OpenXPlay-iOS/generated/liboxp_all.a
-OpenXPlay-iOS/generated/oxp_clink_ios.h
+CabinPlay-iOS/generated/liboxp_clink_ios.a
+CabinPlay-iOS/generated/liboxp_all.a
+CabinPlay-iOS/generated/oxp_clink_ios.h

@@ -1,0 +1,1806 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-14
+package top.cabinplay.direlay.relay
+
+import android.Manifest
+import top.cabinplay.direlay.settings.*
+import top.cabinplay.direlay.carlinkdebug.*
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import top.cabinplay.direlay.network.AndroidNetworkStateReader
+import top.cabinplay.direlay.network.NetworkReadings
+import top.cabinplay.direlay.network.NetworkReadiness
+import top.cabinplay.direlay.clink.*
+import top.cabinplay.stream.clink.*
+import top.cabinplay.stream.cast.*
+import top.cabinplay.direlay.miracast.*
+import top.cabinplay.direlay.settings.StartupPermissions
+import top.cabinplay.direlay.settings.RelaySettingsStore
+import top.cabinplay.direlay.identity.IdentityStore
+import top.cabinplay.direlay.tls.TlsStore
+import top.cabinplay.direlay.network.TeslaAddressVpnService
+import top.cabinplay.direlay.network.phoneIpv4Addresses
+import top.cabinplay.direlay.publicname.hasTrustedNameConfiguration
+import com.shilapi.xcertplay.orchestration.MfiTarget
+import com.shilapi.xcertplay.AirPlayPersistence
+import top.cabinplay.direlay.bridge.DiPlayInput
+import top.cabinplay.direlay.bridge.CastAudioMix
+import top.cabinplay.direlay.video.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import top.cabinplay.stream.core.FrameRatePreference
+import top.cabinplay.stream.core.VideoCodec
+import top.cabinplay.stream.core.DecoderSupport
+import top.cabinplay.stream.core.VideoCodecDecision
+import top.cabinplay.stream.core.VideoCodecPolicy
+import top.cabinplay.stream.core.VideoCodecRestartLimiter
+import top.cabinplay.stream.core.ProjectionOutput
+import top.cabinplay.stream.core.ProjectionHub
+import top.cabinplay.stream.web.WebOutput
+import top.cabinplay.stream.web.WebOutputConfig
+import java.io.File
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import top.cabinplay.direlay.bluetooth.AndroidBondedDevices
+import top.cabinplay.direlay.bluetooth.BondedDevice
+import top.cabinplay.direlay.bluetooth.BondedDevices
+import top.cabinplay.direlay.bluetooth.IphoneSelection
+
+/** Application composition root. File, certificate and network discovery work stays off media threads. */
+class RelayRuntime(private val context: Context,
+    private val clinkDiagnostics: ClinkDiagnostics = AndroidClinkDiagnostics(),
+    val bondedDevices: BondedDevices =
+        AndroidBondedDevices(context.applicationContext),
+    /** One Bluetooth pairing window shared by the app and the admin page. */
+    val pairing: top.cabinplay.direlay.admin.PairingWindow = top.cabinplay.direlay.admin.PairingWindow(
+        top.cabinplay.direlay.admin.AndroidBluetoothVisibility(context.applicationContext) { false }),
+    val keepAlive: RelayKeepAlive = RelayKeepAlive.None,
+    val connectionLog: top.cabinplay.direlay.logs.ConnectionLog = top.cabinplay.direlay.logs.ConnectionLog(
+        journal = top.cabinplay.direlay.logs.TimelineJournal({ java.io.File(context.noBackupFilesDir, "timeline-journal") }))) : AutoCloseable {
+    @Volatile var iphoneBonds: List<BondedDevice> = emptyList()
+        private set
+    fun refreshIphoneBonds() {
+        // Android returns an empty bonded list while Bluetooth is off; that does not unpair a phone.
+        if (networkReader.bluetoothEnabled() != false) iphoneBonds = bondedDevices.read()
+    }
+    fun iphoneSelection(choice: String? = settingsStore.snapshot.value?.iphoneAddress) =
+        IphoneSelection.select(choice, iphoneBonds)
+    private val traceRecorder = lazy { CarlinkTraceRecorder(checkNotNull(context.getExternalFilesDir("carlink-trace")),
+        { line -> Log.i("OXP-CarlinkTrace", line) }, clean = ::cleanTrace) }
+    private val traceRedactor by lazy { top.cabinplay.direlay.logs.LogRedactor(logSecrets) }
+    private fun cleanTrace(line: String) = top.cabinplay.direlay.logs.TracePrivacy.redact(line, traceRedactor)
+    val carlinkTraceRecorder get() = traceRecorder.value
+    private val traceCapture = lazy { CarlinkMediaCapture(checkNotNull(context.getExternalFilesDir("carlink-trace"))) }
+    val carlinkMediaCapture get() = traceCapture.value
+    val settingsStore = RelaySettingsStore(context.applicationContext).also { it.startObserving() }
+    private val carlinkPictures = CarlinkPictureSelection()
+    private val pictureGeneration = java.util.concurrent.atomic.AtomicLong()
+    val carlinkPictureTrial = carlinkPictures.trial
+    private val pictureInUse = MutableStateFlow<CarlinkPictureTrial?>(null)
+    val carlinkPictureEffective = pictureInUse.asStateFlow()
+    private val pictureCanvas = MutableStateFlow<PictureSize?>(null)
+    val carlinkPictureCanvas = pictureCanvas.asStateFlow()
+    @Volatile private var preparedCarlinkPicture: PictureSize? = null
+    private val networkReader = AndroidNetworkStateReader(context)
+    @Volatile var networkReadings = NetworkReadings()
+        private set
+    fun refreshNetworkReadings(): NetworkReadings = networkReader.read().also { networkReadings = it }
+    private val radioObservations = top.cabinplay.direlay.network.RadioObservationStore(context)
+    private val radios = top.cabinplay.direlay.network.RadioConcurrencyObserver(
+        top.cabinplay.direlay.network.platformStaApConcurrency(context), radioObservations.read(), save = radioObservations::write)
+    val radioConcurrency get() = radios.concurrency
+    private val conflict = MutableStateFlow<top.cabinplay.direlay.network.RadioConflict?>(null)
+    /** The setup needs Wi-Fi and the hotspot together on a phone that keeps only one of them; null while its prompt is off. */
+    val radioConflict = conflict.asStateFlow()
+    /** Detected whether or not the prompt shows, so the log always has it. */
+    @Volatile private var detectedConflict: top.cabinplay.direlay.network.RadioConflict? = null
+    /** The conflict the user chose to keep; a manual start clears it so the choice is offered again. */
+    @Volatile var keptRadioConflict: top.cabinplay.direlay.network.RadioConflict? = null
+    @Volatile private var lastTickAt = android.os.SystemClock.elapsedRealtime()
+    /** How long ago the runtime executor last ran its session tick; the watchdog reads it. */
+    fun tickAge(): Long = android.os.SystemClock.elapsedRealtime() - lastTickAt
+    fun networkReadiness(settings: RelaySettings, readings: NetworkReadings = networkReadings) =
+        NetworkReadiness.read(CarlinkConnectionPolicy.enabled(settings), settingsStore.wireless(settings),
+            settings.wirelessNetwork.choice == WirelessNetworkChoice.PHONE_HOTSPOT, readings, miracast = settings.miracastOutput,
+            wifiDirect = settings.wirelessNetwork.choice == WirelessNetworkChoice.WIFI_DIRECT,
+            sharedWifi = settings.wirelessNetwork.choice == WirelessNetworkChoice.EXISTING_WIFI,
+            sharedWifiJoined = settings.wirelessNetwork.choice != WirelessNetworkChoice.EXISTING_WIFI || currentSharedWifi(settings) != null)
+    private val autoStartBoot = AndroidBootIdentity(context)
+    private val autoStartStorage = AndroidAutoStartStorage(context)
+    val startRequest: StartRequestGate = ProcessStartRequestGate()
+    val autoStartGate: AutoStartGate = PersistentAutoStartGate(autoStartBoot, autoStartStorage) {
+        Log.i("CabinPlay Relay", "Automatic start resumed: new boot")
+    }
+    val autoStartSessions = AutoStartSessions(context, autoStartGate, autoStartBoot, autoStartStorage, ::carlinkPictureStopped)
+    private val negotiatedFps = MutableStateFlow<Double?>(null)
+    val negotiatedFrameRate = negotiatedFps.asStateFlow()
+    private val appliedFps = MutableStateFlow(60)
+    val appliedFrameRate = appliedFps.asStateFlow()
+    val input = DiPlayInput(
+        applyFrameRate = ::applyFrameRate,
+        restartCarPlay = { setup.execute { sessionActions.action("restart", manual = false) } },
+        remotePlaybackProof = { settingsStore.snapshot.value?.experimental?.effective()?.remotePlaybackProof == true },
+        startupStatus = { settingsStore.snapshot.value?.experimental?.effective()?.startupStatus == true },
+        automaticHevc = { settingsStore.snapshot.value?.videoCodec == VideoCodecSetting.AUTO && appliedVideoDecision.codec == VideoCodec.H265 },
+        // Media keys follow the audio route: CarPlay audio → forward Carlink method=12 to the iPhone;
+        // car Bluetooth audio → the phone already gets them over AVRCP, so do not double-forward.
+        mediaKeysForwarding = { settingsStore.snapshot.value?.carBluetoothAudio == false },
+    )
+    private val bundledPlugins = top.cabinplay.direlay.plugins.BundledPlugins(context.applicationContext)
+    fun installedPlugins() = runCatching {
+        top.cabinplay.direlay.plugins.RelayPlugins.installed(bundledPlugins.root())
+    }.getOrDefault(emptyList())
+    internal val startupObserver = StartupObserver(input)
+    val carPlayStage = CarPlayStageTracker { settingsStore.wireless() }
+    val carPlayDiagnostics = CarPlayDiagnostics(secrets = {
+        buildList {
+            settingsStore.snapshot.value?.let {
+                add(it.remoteToken)
+                add(it.wirelessNetwork.manualPassphrase)
+                addAll(it.wirelessNetwork.sharedWifiNetworks.map { network -> network.passphrase })
+            }
+            add(AirPlayPersistence.loadManualHotspotPassphrase(context))
+            add(AirPlayPersistence.loadExistingWifiPassphrase(context))
+        }
+    }, timeline = connectionLog, startupEnabled = { settingsStore.snapshot.value?.experimental?.effective()?.startupDiagnostics == true })
+    val iphoneLink = IphoneLinkTracker(wireless = { settingsStore.wireless() }, diagnostics = { carPlayDiagnostics.error })
+    val pluginContext = top.cabinplay.direlay.plugins.PluginContextObserver(input::context)
+    val logSecrets: top.cabinplay.direlay.logs.LogSecrets by lazy {
+        top.cabinplay.direlay.logs.RelayLogSecrets(context.applicationContext, settingsStore, tlsStore) {
+            carlinkPins.redactFailureMessage(carlinkFailureRedactor(it))
+        }.secrets
+    }
+    val logs: top.cabinplay.direlay.logs.LogFiles by lazy { top.cabinplay.direlay.logs.LogFiles(context.applicationContext, logSecrets,
+        journal = connectionLog.journal, flushTimeline = connectionLog::awaitIdle, timelineDropped = { connectionLog.dropped },
+        traceDirectory = { if (settingsStore.snapshot.value?.carlinkTrace == true) context.getExternalFilesDir("carlink-trace") else null }) }
+    val updates: top.cabinplay.direlay.update.UpdateChecker by lazy {
+        val app = context.applicationContext
+        val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
+        top.cabinplay.direlay.update.UpdateChecker(top.cabinplay.direlay.update.GitHubReleaseSource(
+            top.cabinplay.direlay.update.InternetReleaseConnection(app.getSystemService(android.net.ConnectivityManager::class.java)), version),
+            top.cabinplay.direlay.update.UpdatePreferences(app), version)
+    }
+    @Volatile private var configuredPlugins: Pair<Boolean, List<String>> = false to emptyList()
+
+    private fun requestedFrameRate() = CarPlayFrameRate.requested(
+        settingsStore.awaitSnapshot().frameRate, negotiatedFps.value)
+
+    private fun applyFrameRate(negotiated: Double) {
+        negotiatedFps.value = negotiated
+        // A new output negotiation affects the next start, not the running session's displayed rate.
+        AirPlayPersistence.saveFps(context, requestedFrameRate())
+    }
+
+    fun prepareCarPlayFrameRate() {
+        val settings = settingsStore.awaitSnapshot()
+        val requested = CarPlayFrameRate.requested(settings.frameRate, negotiatedFps.value)
+        AirPlayPersistence.saveFps(context, requested)
+        appliedFps.value = requested
+        observedFrameRateSetting = settings.frameRate
+        immediateFrameRateChange = false
+    }
+    private fun redactFailureMessage(text: String): String {
+        val settings = settingsStore.snapshot.value
+        val secrets = buildList {
+            settings?.let {
+                add(it.remoteToken)
+                add(it.wirelessNetwork.manualPassphrase)
+                addAll(it.wirelessNetwork.sharedWifiNetworks.map { network -> network.passphrase })
+            }
+        }
+        val redacted = redactFailureText(text, secrets)
+        return carlinkPins.redactFailureMessage(carlinkFailureRedactor(redacted))
+    }
+    private val browserTimeline = top.cabinplay.direlay.logs.BrowserTimeline(connectionLog)
+    val status = RelayStatus(redactFailure = ::redactFailureMessage, connectionLog = connectionLog,
+        browser = browserTimeline, carPlayStage = carPlayStage, iphoneLink = iphoneLink, playback = { input.playback(it) })
+    private val setup = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "direlay-runtime").apply { isDaemon = true }
+    }
+    private val carDisplayMemory = CarDisplayMemory()
+    internal val displayPolicy = CarDisplayPolicy(observe = { display ->
+        setup.execute { observeWindow(display) }
+    }, wholeScreen = { settingsStore.snapshot.value?.let { it.viewAreas && it.displayMode == DisplayMode.AUTOMATIC } == true },
+        secondary = carDisplayMemory::isWireless) {
+        settingsStore.snapshot.value?.let(WirelessPicturePolicy::resolution) ?: CarPlayResolution.AUTO
+    }
+    private val hub = ProjectionHub(input, policy = displayPolicy, listener = status)
+    private val preferences = context.getSharedPreferences("direlay", Context.MODE_PRIVATE)
+    // This separate private file must not invalidate the user-settings snapshot cache.
+    private val displayPreferences = context.getSharedPreferences("direlay-car-display", Context.MODE_PRIVATE)
+    private val savedHeadUnitStore = SavedHeadUnitStore(displayPreferences)
+    @Volatile private var savedHeadUnit: SavedHeadUnit? = null
+    @Volatile private var preparedPlanningDisplay: HeadUnitDisplay? = null
+    @Volatile private var reportedCarScreen: top.cabinplay.stream.core.DisplayInfo? = null
+    val carScreenReported: Boolean get() = primaryCarScreen != null
+    val primaryCarScreen get() = carDisplayMemory.measuredDisplay(displayPolicy.primaryOutput) ?: reportedCarScreen
+    @Synchronized fun savedCarScreen(settings: RelaySettings): top.cabinplay.stream.core.DisplayInfo? {
+        loadRememberedDisplay()
+        val saved = savedHeadUnitForCar(savedHeadUnit, settings.car) ?: return null
+        return saved.display?.display() ?: top.cabinplay.stream.core.DisplayInfo(
+            saved.canvas.width, saved.canvas.height, saved.canvas.density, 60.0)
+    }
+    private var clearedReport: HeadUnitDisplay? = null
+    @Volatile private var screenPrepared = false
+    @Volatile private var preparedDisplayMode = DisplayMode.AUTOMATIC
+    @Volatile private var preparedViewAreas: Triple<ViewAreasMode, PictureSize?, PictureSize?>? = null
+    @Volatile var carPlayScreen: CarPlayScreen? = null
+        private set
+    @Volatile var carPlayScreenWidthMm: Int? = null
+        private set
+
+    @Synchronized private fun loadRememberedDisplay() {
+        if (savedHeadUnit == null) savedHeadUnit = savedHeadUnitStore.load()
+    }
+
+    @Synchronized private fun rememberCarDisplay() {
+        // Pair the measured report with its canvas before another output can renegotiate.
+        val (measured, canvas, limit) = synchronized(displayPolicy) {
+            Triple(carDisplayMemory.measuredDisplay(displayPolicy.primaryOutput), displayPolicy.carDisplay, displayPolicy.decoderLimit)
+        }
+        val report = measured?.let(HeadUnitDisplay::from) ?: run {
+            if (displayPolicy.primaryDisplay == null) clearedReport = null
+            return
+        }
+        // Clearing while connected must survive periodic refreshes of the same report.
+        if (report == clearedReport) return
+        clearedReport = null
+        val settings = settingsStore.snapshot.value ?: return
+        val saved = SavedHeadUnit(canvas ?: return, report, settings.carplayResolution,
+            settings.viewAreas && settings.displayMode == DisplayMode.AUTOMATIC, limit, settings.car)
+        if (saved == savedHeadUnit) return
+        savedHeadUnitStore.save(saved); savedHeadUnit = saved
+        wirelessUpdate { configureDlna() }
+    }
+
+    fun clearSavedHeadUnit() { setup.execute { synchronized(this) {
+        clearedReport = displayPolicy.primaryDisplay?.let(HeadUnitDisplay::from)
+        savedHeadUnitStore.clear(); savedHeadUnit = null
+    }; configureDlna() } }
+
+    val savedCanvas: CarPlayScreen get() = synchronized(this) {
+        loadRememberedDisplay()
+        val settings = settingsStore.snapshot.value ?: return@synchronized CarPlayScreen(CarDisplayFit.default, "default")
+        checkNotNull(startupCarPlayScreen(settings.copy(displayMode = DisplayMode.AUTOMATIC), null,
+            savedHeadUnitForCar(savedHeadUnit, settings.car), carModels.year(settings.car)))
+    }
+
+    val referenceCanvas: DisplayProfile get() =
+        referenceCarPlayCanvas(autoStartSessions.tracker.running, preparedDisplayMode, carPlayScreen?.profile, savedCanvas.profile)
+
+    @Synchronized fun viewAreaReference(settings: RelaySettings): ViewAreaReference {
+        loadRememberedDisplay()
+        val screen = planningDisplay(settings)?.screen ?: return ViewAreaReference()
+        return ViewAreaPlanner.mostUsed(ViewAreaPlanner.mergeRecords(windowRecords.snapshot(), carModels.year(settings.car)?.screens.orEmpty(), screen))
+    }
+
+    fun wirelessPicture(settings: RelaySettings): WirelessPictureResolution = synchronized(this) {
+        loadRememberedDisplay()
+        WirelessPicturePolicy.resolve(settings, savedHeadUnitForCar(savedHeadUnit, settings.car), carModels.year(settings.car))
+    }
+
+    fun wirelessPictureCanvas(settings: RelaySettings): DisplayProfile? =
+        if (WirelessStandIn.wirelessOnly(settings.outputs))
+            WirelessPicturePolicy.canvas(settings, wirelessPicture(settings), displayPolicy.decoderLimit) else null
+
+    private fun planningDisplay(settings: RelaySettings) = planningDisplay(
+        displayPolicy.primaryDisplay?.let(HeadUnitDisplay::from), savedHeadUnitForCar(savedHeadUnit, settings.car), carModels.year(settings.car))
+
+    val sharedWifiSelection = top.cabinplay.direlay.settings.SharedWifiSelection()
+    private val sharedWifiConnectivity = context.getSystemService(android.net.ConnectivityManager::class.java)
+    private val sharedWifiCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: android.net.Network) { sharedWifiSelection.wifiChanged() }
+        override fun onLost(network: android.net.Network) { sharedWifiSelection.wifiChanged() }
+    }
+    init {
+        sharedWifiConnectivity.registerNetworkCallback(android.net.NetworkRequest.Builder()
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI).build(), sharedWifiCallback)
+    }
+    fun currentSharedWifi(settings: RelaySettings, currentSsid: String? = currentWifiSsid(context)) =
+        sharedWifiSelection.resolve(currentSsid, settings.wirelessNetwork.sharedWifiNetworks)
+
+    private val windowPreferences by lazy { context.getSharedPreferences("direlay-window-sizes", Context.MODE_PRIVATE) }
+    val carModels by lazy { CarModels.parse(context.assets.open("car-models.json").bufferedReader().use { it.readText() }) }
+    val windowRecords by lazy { WindowSizeRecords({ windowPreferences.getString("records", "").orEmpty() },
+        { windowPreferences.edit().putString("records", it).apply() }) }
+    @Volatile var declaredViewAreas: List<ViewAreaSize> = emptyList()
+        private set
+    @Volatile var viewAreaPreference: Boolean? = null
+        private set
+    @Volatile private var activeAreaIndex = 0
+    @Volatile private var activeArea: top.cabinplay.stream.web.ViewArea? = null
+    private val areaListeners = java.util.concurrent.CopyOnWriteArrayList<(top.cabinplay.stream.web.ViewArea) -> Unit>()
+    private val viewAreaPort = object : top.cabinplay.stream.web.ViewAreaPort {
+        override fun current() = activeArea
+        override fun listen(callback: (top.cabinplay.stream.web.ViewArea) -> Unit): AutoCloseable {
+            areaListeners.add(callback); return AutoCloseable { areaListeners.remove(callback) }
+        }
+    }
+    private val areaDebounce = ViewAreaSwitchDebounce()
+    private var pendingAreaSwitch: java.util.concurrent.ScheduledFuture<*>? = null
+    private fun publishArea(index: Int) {
+        val areas = declaredViewAreas
+        val area = areas.getOrNull(index) ?: return
+        activeAreaIndex = index
+        val value = top.cabinplay.stream.web.ViewArea(0, 0, area.width, area.height, areas[0].width, areas[0].height)
+        activeArea = value; updateCarlinkArea(value); areaListeners.forEach { it(value) }
+        connectionLog.transition("browser", "view-area", "view_area", "source=view-area-port clients=aggregate view=${value.width}x${value.height} canvas=${value.canvasWidth}x${value.canvasHeight}")
+    }
+    data class AreaSwitch(val time: Long, val index: Int, val accepted: Boolean)
+    private val areaSwitches = ArrayDeque<AreaSwitch>()
+    fun areaSwitchLog(): List<AreaSwitch> = synchronized(areaSwitches) { areaSwitches.toList() }
+    fun showViewArea(index: Int) { setup.execute {
+        pendingAreaSwitch?.cancel(false); areaDebounce.clear(); switchViewArea(index)
+    } }
+    private fun switchViewArea(index: Int) {
+        val accepted = index in declaredViewAreas.indices && input.showViewArea(index)
+        if (accepted) publishArea(index)
+        synchronized(areaSwitches) {
+            if (areaSwitches.size == 32) areaSwitches.removeFirst()
+            areaSwitches.addLast(AreaSwitch(System.currentTimeMillis(), index, accepted))
+        }
+    }
+    private fun updateCarlinkArea(area: top.cabinplay.stream.web.ViewArea) {
+        carlinkVideoOutput?.setCarlinkArea(area.x, area.y, area.width, area.height, area.canvasWidth, area.canvasHeight)
+    }
+    fun tryCarlinkPicture(size: PictureSize?) = changeCarlinkPictureTrial(CarlinkPictureTrial(size))
+    fun clearCarlinkPictureTrial(restart: Boolean = true) = changeCarlinkPictureTrial(null, restart)
+    @Volatile private var pictureRestartPending = false
+    private fun changeCarlinkPictureTrial(trial: CarlinkPictureTrial?, restart: Boolean = true) {
+        val settings = settingsStore.snapshot.value
+        val generation = pictureGeneration.incrementAndGet()
+        carlinkPictures.choose(trial)
+        if (restart) setup.execute {
+            if (pictureGeneration.get() != generation) return@execute
+            if ((autoStartSessions.tracker.running || sessionActions.restarting) && carlinkPrimary() && settings?.displayMode != DisplayMode.FIXED) {
+                pictureRestartPending = true
+                restartCarlinkPicture()
+            }
+        }
+    }
+    internal fun carlinkPictureStopped() {
+        pictureGeneration.incrementAndGet()
+        carlinkPictures.stopped()
+        pictureRestartPending = false
+        preparedCarlinkPicture = null
+        pictureInUse.value = null
+        pictureCanvas.value = null
+    }
+    private fun selectedCarlinkPicture(settings: RelaySettings, starting: Boolean = false,
+        trial: CarlinkPictureTrial? = carlinkPictureTrial.value) =
+        carlinkPictureScreen(settings, trial, carlinkPrimary(), starting,
+            if (displayPolicy.primaryOutput == null) savedHeadUnitForCar(savedHeadUnit, settings.car)?.maxMacroblocks
+            else displayPolicy.decoderLimit)
+    private fun automaticCarPlayScreen(settings: RelaySettings) = WirelessPicturePolicy.startupScreen(settings, displayPolicy.carDisplay,
+        savedHeadUnitForCar(savedHeadUnit, settings.car), carModels.year(settings.car), displayPolicy.decoderLimit)
+    private fun selectedCarPlayScreen(settings: RelaySettings, starting: Boolean = false): CarPlayScreen? =
+        selectedCarlinkPicture(settings, starting) ?: automaticCarPlayScreen(settings)
+    private fun carlinkPictureInEffect(settings: RelaySettings) =
+        settings.displayMode != DisplayMode.FIXED && carlinkPrimary() &&
+            (selectedCarlinkPicture(settings) != null || preparedCarlinkPicture != null)
+
+    private fun restartCarlinkPicture() {
+        if (!pictureRestartPending || sessionActions.restarting || startRequest.pending) return
+        val settings = settingsStore.snapshot.value ?: return
+        if (!autoStartSessions.tracker.running || !carlinkPrimary() || settings.displayMode == DisplayMode.FIXED ||
+            (selectedCarPlayScreen(settings)?.profile == carPlayScreen?.profile &&
+                (selectedCarlinkPicture(settings) != null) == (preparedCarlinkPicture != null))) {
+            pictureRestartPending = false
+        } else if (sessionActions.action("restart") == null) pictureRestartPending = false
+    }
+    private fun carlinkPrimary() = carlinkScreen != null && displayPolicy.primaryDisplay === carlinkScreen
+    private fun carlinkMatchingArea(settings: RelaySettings): Int? =
+        if (!carlinkPictureInEffect(settings) && carlinkPrimary() && settings.viewAreas && settings.displayMode == DisplayMode.AUTOMATIC)
+            carlinkScreen?.let { display -> display.viewport?.let {
+                ViewAreaPlanner.match(declaredViewAreas, it.width, it.height, display.fullscreen, display.fullscreenPreferred)
+            } } else null
+    private var lastCarlinkWindow: List<Int>? = null
+    private fun recordCarlinkWindow(display: top.cabinplay.stream.core.DisplayInfo?) {
+        val viewport = display?.viewport
+        if (display == null || viewport == null || display.fullscreen == null) { lastCarlinkWindow = null; return }
+        val key = listOf(display.widthPx, display.heightPx, display.densityDpi, viewport.width, viewport.height, if (display.fullscreen == true) 1 else 0)
+        if (key == lastCarlinkWindow) return
+        lastCarlinkWindow = key
+        windowRecords.record(key[0], key[1], key[2], key[3], key[4], display.fullscreen == true, System.currentTimeMillis())
+    }
+    private var lastWindow: List<Int>? = null
+    private fun observeWindow(display: top.cabinplay.stream.core.DisplayInfo?) {
+        carDisplayMemory.measuredDisplay(displayPolicy.primaryOutput)?.let { reportedCarScreen = it }
+        if (display == null) synchronized(this) { clearedReport = null }
+        viewAreaPreference = if (display == null) preparedPlanningDisplay?.preferred else display.fullscreenPreferred
+        val viewport = display?.viewport
+        val areas = declaredViewAreas
+        val candidate = if (viewport != null && settingsStore.snapshot.value?.let { it.viewAreas && it.displayMode == DisplayMode.AUTOMATIC && !carlinkPictureInEffect(it) } == true &&
+            status.session?.phase == top.cabinplay.stream.core.SessionPhase.ACTIVE)
+            ViewAreaPlanner.match(areas, viewport.width, viewport.height, display.fullscreen, display.fullscreenPreferred)?.takeIf { it != activeAreaIndex } else null
+        if (areaDebounce.observe(candidate, android.os.SystemClock.elapsedRealtime())) {
+            pendingAreaSwitch?.cancel(false); pendingAreaSwitch = null
+            if (candidate != null) pendingAreaSwitch = setup.schedule({
+                val index = areaDebounce.ready(android.os.SystemClock.elapsedRealtime())
+                areaDebounce.clear()
+                if (index != null && settingsStore.snapshot.value?.viewAreas == true && declaredViewAreas === areas && index != activeAreaIndex &&
+                    status.session?.phase == top.cabinplay.stream.core.SessionPhase.ACTIVE)
+                    switchViewArea(index)
+            }, 300, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        if (display != null && display === carlinkScreen) { recordCarlinkWindow(display); return }
+        val fullscreen = display?.fullscreen
+        if (display == null || viewport == null || fullscreen == null) { lastWindow = null; return }
+        val key = listOf(display.widthPx, display.heightPx, display.densityDpi, viewport.width, viewport.height, if (fullscreen) 1 else 0)
+        if (key == lastWindow) return
+        lastWindow = key
+        windowRecords.record(key[0], key[1], key[2], key[3], key[4], fullscreen, System.currentTimeMillis())
+    }
+    fun clearWindowRecords() { setup.execute { windowRecords.clear(); lastWindow = null; lastCarlinkWindow = null } }
+    fun planViewAreas(width: Int, height: Int): List<ViewAreaSize>? {
+        val settings = settingsStore.snapshot.value
+        if (settings?.viewAreas != true || settings.displayMode != DisplayMode.AUTOMATIC ||
+            preparedCarlinkPicture != null || selectedCarlinkPicture(settings, starting = !screenPrepared) != null) {
+            declaredViewAreas = emptyList()
+            activeAreaIndex = 0
+            val area = top.cabinplay.stream.web.ViewArea(0, 0, width, height, width, height)
+            activeArea = area; updateCarlinkArea(area); areaListeners.forEach { it(area) }
+            return null
+        }
+        loadRememberedDisplay()
+        val display = if (screenPrepared) preparedPlanningDisplay else planningDisplay(settings)
+        viewAreaPreference = display?.preferred
+        val (mode, full, window) = preparedViewAreas.takeIf { screenPrepared }
+            ?: Triple(settings.viewAreasMode, settings.viewAreasFullscreen, settings.viewAreasWindowed)
+        val areas = planHeadUnitAreas(width, height, display, windowRecords.snapshot(), carModels.year(settings.car), mode, full, window)
+        return areas.also { declaredViewAreas = it; publishArea(0) }
+    }
+    private val displayRefit = DisplayRefit()
+    @Volatile private var appliedDisplay: DisplayTarget? = null
+    /** Shown on the head-unit page next to the page's own version, e.g. "0.1.3 (1003)". */
+    private fun appVersion(): String = context.packageManager.getPackageInfo(context.packageName, 0).let {
+        @Suppress("DEPRECATION") "${it.versionName} (${if (android.os.Build.VERSION.SDK_INT >= 28) it.longVersionCode else it.versionCode.toLong()})"
+    }
+    fun displayRestarted() { displayRefit.restarted(android.os.SystemClock.elapsedRealtime()) }
+
+    /** Called on the start worker; freeze the canvas for this CarPlay session. */
+    @Synchronized fun prepareCarPlayScreen(settings: RelaySettings): CarPlayScreen? {
+        loadRememberedDisplay()
+        displayPolicy.refreshDisplay()
+        rememberCarDisplay()
+        preparedPlanningDisplay = planningDisplay(settings)
+        preparedDisplayMode = settings.displayMode
+        preparedViewAreas = Triple(settings.viewAreasMode, settings.viewAreasFullscreen, settings.viewAreasWindowed)
+        val trial = carlinkPictureTrial.value
+        val picture = selectedCarlinkPicture(settings, starting = true, trial = trial)
+        pictureInUse.value = CarlinkPictureTrial(settings.effectiveCarlinkPicture(trial))
+        preparedCarlinkPicture = picture?.profile?.let { PictureSize(it.width, it.height) }
+        pictureCanvas.value = preparedCarlinkPicture
+        return (picture ?: automaticCarPlayScreen(settings)).also {
+            settingsStore.prepareDisplay(it?.profile, settings.carplayScreenWidth, settings.carplayScreenWidthCustomMm)
+            carPlayScreenWidthMm = AirPlayPersistence.loadWidthPhysicalMm(context)
+            appliedDisplay = it?.let { DisplayTarget(it.profile, settings.carplayResolution, settings.carplayScreenWidth, preparedPlanningDisplay?.screen) }
+            carPlayScreen = it
+            screenPrepared = true
+            if (settings.dlnaOutput || settings.miracastOutput) {
+                val canvas = it ?: context.resources.displayMetrics.let { metrics ->
+                    CarPlayScreen(DisplayProfile(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi), "fixed")
+                }
+                val line = wirelessLogMessage(wirelessCanvasLogLine(canvas, displayPolicy.primaryDisplay, settings))
+                Log.i(if (settings.dlnaOutput) "CabinPlay DLNA" else "CabinPlay Miracast", line)
+            }
+        }
+    }
+
+    fun displayMismatch(running: Boolean, settings: RelaySettings): Boolean {
+        if (carlinkPictureInEffect(settings)) return false
+        val live = displayPolicy.primaryDisplay?.let(HeadUnitDisplay::from)
+        if (settings.viewAreas || declaredViewAreas.isNotEmpty()) return running && settings.displayMode == DisplayMode.AUTOMATIC &&
+            live != null && appliedDisplay != null && carlinkScreenChanged(live.screen, appliedDisplay?.screen,
+                carlinkPrimary(), carlinkMatchingArea(settings))
+        return (settings.carplayResolution in setOf(CarPlayResolution.SCREEN, CarPlayResolution.NATIVE) || live?.visible == null) && carDisplayMismatch(
+            running, settings.displayMode, carPlayScreen?.profile, displayPolicy.carDisplay ?: savedHeadUnitForCar(savedHeadUnit, settings.car)?.canvas)
+    }
+
+    /** The CarPlay canvas as "W × H · D dpi" plus where it came from ("car screen", …, "relay screen"). */
+    val carPlayScreenSummary: Pair<String, String> get() {
+        val settings = settingsStore.snapshot.value
+        val selected = if (screenPrepared) carPlayScreen else settings?.let {
+            selectedCarPlayScreen(it, starting = true)
+        }
+        if (selected != null) return "${selected.profile.width} × ${selected.profile.height} · ${selected.profile.density} dpi" to selected.source
+        val metrics = context.resources.displayMetrics
+        return "${metrics.widthPixels} × ${metrics.heightPixels} · ${metrics.densityDpi} dpi" to "relay screen"
+    }
+
+    @Volatile var webPhase = top.cabinplay.direlay.path.WebPhase.STARTING
+        private set
+    @Volatile var serverState = "Starting web receiver…"
+        private set
+    @Volatile var serverFailureSinceMillis: Long? = null
+        private set
+    @Volatile var serverReason: WebStartReason? = null
+        private set
+    @Volatile var ipv4: Set<String> = emptySet()
+        private set
+    /** Addresses a head unit can reach; Wi-Fi Direct groups (p2p-*) only carry the iPhone link. */
+    @Volatile var carIpv4: Set<String> = emptySet()
+        private set
+    @Volatile var receiverUrls: List<String> = emptyList()
+        private set
+    private val teslaSession = TeslaAddressSession(TeslaAddressVpnService.controller(context.applicationContext))
+    val teslaAddress: TeslaAddress? get() = teslaSession.active
+    val teslaFailure: String? get() = teslaSession.failure
+    @Volatile var teslaStateSinceMillis: Long? = null
+        private set
+
+    fun teslaActivation(settings: RelaySettings, wireless: Boolean = settingsStore.wireless(settings)) =
+        teslaBrowserActivation(settings.teslaBrowser, wireless, settings.wirelessNetwork.choice,
+            publicName.view.value.hasTrustedNameConfiguration(), settings.browserOutput)
+
+    fun needsVpnConsent(settings: RelaySettings, wireless: Boolean = settingsStore.wireless(settings)): Boolean =
+        !wireless || teslaActivation(settings, wireless) == TeslaBrowserActivation.READY
+
+    fun prepareTeslaAddress(settings: RelaySettings, wireless: Boolean) {
+        teslaSession.prepare(settings, wireless)
+        teslaStateSinceMillis = System.currentTimeMillis()
+        publicName.refreshAddress()
+    }
+
+    fun stopTeslaAddress() {
+        try { setup.execute { teslaSession.stop(); publicName.refreshAddress() } }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun refreshTeslaAddress() {
+        val settings = settingsStore.snapshot.value ?: return
+        val before = teslaAddress
+        val beforeFailure = teslaFailure
+        teslaSession.tick(autoStartSessions.tracker.running, settings, settingsStore.wireless(settings),
+            publicName.view.value.hasTrustedNameConfiguration(), ::phoneIpv4Addresses)
+        if (before != teslaAddress || beforeFailure != teslaFailure) teslaStateSinceMillis = System.currentTimeMillis()
+        if (before != teslaAddress) {
+            publicName.refreshAddress()
+            runCatching { updateWebTls() }.onFailure { Log.w("CabinPlay Relay", "Tesla TLS update failed", it) }
+        }
+    }
+
+    private fun webTlsAddresses(): Set<String> {
+        val settings = settingsStore.snapshot.value
+        val addresses = if (settings == null) carIpv4 else teslaTlsAddresses(carIpv4, settings.teslaBrowser, settings.teslaAddress().orEmpty())
+        return addresses + listOfNotNull(teslaAddress?.takeIf { it.mode != TeslaBrowserMode.OFF && !it.mode.usesTrustedName }?.address)
+    }
+    @Volatile var localPreview = false
+        private set
+    @Volatile var playCarPlayAudio = false
+        private set
+    @Volatile var microphoneSource = MicrophoneSource.HEAD_UNIT
+        private set
+    @Volatile private var configuredWebPort: Int? = null
+    @Volatile private var automaticEnabled: Boolean? = null
+    @Volatile private var webEnabled = true
+    private var networkPermissionAvailable = hasNetworkPermission()
+    @Volatile private var closed = false
+    private val lifecycle = Any()
+    private var web: WebOutput? = null
+    val carlinkPins = DialogPinProvider().apply { onSecret = { logSecrets.remember(listOf(it), allowShort = true) } }
+    private val carlinkTrust = PrivateClinkTrustStore(context.noBackupFilesDir)
+    @Volatile var carlinkState = "Disabled"
+        private set
+    @Volatile var carlinkDetail = ""
+        private set
+    @Volatile var carlinkFailed = false
+        private set
+    private val carlinkTrail = StepTrail()
+    @Volatile var carlinkStage: Pair<ClinkStage, Long>? = null
+        private set
+    @Volatile var carlinkStateSinceMillis: Long? = null
+        private set
+    @Volatile var carlinkRetrying = false
+        private set
+    val carlinkReconnectPending: Boolean get() = carlinkRetrying || carlinkRestartPending
+    @Volatile var carlinkName: String? = null
+        private set
+    @Volatile var carlinkWifiPending = false
+    @Volatile var carlinkWifiSsid: String? = null
+    @Volatile var carlinkJoinMethod: WifiJoinPolicy.Method? = null
+        private set
+    @Volatile var carlinkTrusted = false
+        private set
+    val carlinkCode: String? get() = carlinkFailureCode
+    fun carlinkTrail(): List<String> = carlinkErrorTrail.takeIf { carlinkError != null && it.isNotEmpty() } ?: carlinkTrail.snapshot()
+
+    // The running attempt's failure code; a kept error shows its own code until this attempt fails too.
+    @Volatile private var carlinkAttemptDetail = ""
+    @Volatile private var carlinkFailureCode: String? = null
+    @Volatile var carlinkErrorTrail: List<String> = emptyList()
+        private set
+    @Volatile var carlinkErrorAt: Long? = null
+        private set
+    @Volatile var carlinkError: String? = null
+        private set
+    @Volatile private var carlinkFailureRedactor: (String) -> String = { it }
+    // Sensor opt-in belongs to a socket generation and waits for the explicit reconnect action.
+    private data class CarlinkConfig(val enabled: Boolean, val permitted: Boolean, val name: String, val model: String, val blocked: Boolean, val trace: Boolean, val hevc: ClinkHevcMode, val pictureSize: ClinkPictureSize)
+    private var carlinkConfig: CarlinkConfig? = null
+    private val carlinkBlock = CarlinkWifiDirectBlock()
+    private val carlifeLifecycle = RetiringOutputPolicy<top.cabinplay.direlay.settings.CarlifeOutputPlan>()
+    private val carlifeGeneration = java.util.concurrent.atomic.AtomicLong()
+    @Volatile private var carlifeConnection = 0L
+    @Volatile private var carlifeToken: Any? = null
+    @Volatile var carlifeStatus: top.cabinplay.stream.carlife.CarlifeStatus? = null
+        private set
+    @Volatile var carlifeStateSinceMillis: Long? = null
+        private set
+    @Volatile private var carlifeAccessory: top.cabinplay.direlay.carlife.AndroidCarlifeAccessory? = null
+    @Volatile private var carlink: ClinkOutput? = null
+    @Volatile private var carlinkVideoOutput: TranscodingOutput? = null
+    @Volatile var carlinkGeometry: CarlinkGeometry? = null
+        private set
+    @Volatile var carlinkGeometryMode: VideoCompatibility.Mode? = null
+        private set
+    @Volatile var vehicleView = top.cabinplay.direlay.vehicle.VehicleView()
+        private set
+    @Volatile private var collectVehicle = false
+    private var vehicleRegistration: AutoCloseable? = null
+    private val pendingVehicle = linkedMapOf<String, Pair<top.cabinplay.stream.core.VehicleData, Long>>()
+    private var vehicleDeliveryPending = false
+    private var vehicleGeneration = 0L
+    private var vehicleSession: Pair<Boolean, Boolean>? = null
+    @Volatile var sampleVehicleData = false
+        private set
+    private var sampleTick = 0L
+    fun setSampleVehicleData(enabled: Boolean) { setup.execute {
+        val requested = settingsStore.developerOverrides.value.effectiveSampleVehicleData(enabled)
+        if (sampleVehicleData == requested) return@execute
+        sampleVehicleData = requested
+        sampleTick = 0
+        configureVehicle()
+        if (requested) top.cabinplay.direlay.vehicle.sampleVehicleData(sampleTick++).forEach(::queueVehicle)
+    } }
+
+    /** Both real and generated data enter the same bounded, per-type 250 ms mailbox. */
+    private fun queueVehicle(data: top.cabinplay.stream.core.VehicleData) {
+        if (!collectVehicle) return
+        synchronized(pendingVehicle) {
+            pendingVehicle[data.javaClass.name] = data to System.currentTimeMillis()
+            if (vehicleDeliveryPending) return
+            vehicleDeliveryPending = true
+            val generation = vehicleGeneration
+            try { setup.schedule({
+                val reports = synchronized(pendingVehicle) {
+                    if (generation != vehicleGeneration) return@schedule
+                    val values = pendingVehicle.values.toList()
+                    pendingVehicle.clear(); vehicleDeliveryPending = false
+                    values
+                }
+                if (collectVehicle) vehicleRecorder?.let { recorder ->
+                    reports.forEach { (report, at) -> recorder.receive(report, at) }
+                    vehicleView = recorder.view()
+                }
+            }, 250, TimeUnit.MILLISECONDS) }
+            catch (_: java.util.concurrent.RejectedExecutionException) { vehicleDeliveryPending = false }
+        }
+    }
+    private var vehicleRecorder: top.cabinplay.direlay.vehicle.VehicleRecorder? = null
+    val carlinkConnected: Boolean get() = carlink != null && carlinkState !in setOf("Disabled", "ENDED", "Requires Android 10+", "Waiting for permissions")
+    val pinRejected: Int get() = carlinkPins.rejected
+    val pairingSuccess: Int get() = carlinkPins.successes
+
+    private fun configureVehicle(requestedEnabled: Boolean? = null) {
+        if (closed) return
+        val enabled = sampleVehicleData || (requestedEnabled ?: settingsStore.awaitSnapshot().vehicleInformation)
+        collectVehicle = enabled
+        if (vehicleRecorder == null) {
+            try {
+                vehicleRecorder = top.cabinplay.direlay.vehicle.VehicleRecorder(
+                    top.cabinplay.direlay.vehicle.VehicleSnapshotFile(File(context.noBackupFilesDir, "vehicle-history.bin")),
+                    android.os.SystemClock::elapsedRealtime, System::currentTimeMillis)
+            } catch (_: Exception) { vehicleView = vehicleView.copy(storageFailed = true); return }
+        }
+        val recorder = vehicleRecorder ?: return
+        val session = enabled to sampleVehicleData
+        if (session != vehicleSession) synchronized(pendingVehicle) {
+            vehicleGeneration++
+            pendingVehicle.clear()
+            vehicleDeliveryPending = false
+            vehicleSession = session
+        }
+        recorder.enable(enabled, sampleVehicleData)
+        if (!enabled) {
+            vehicleRegistration?.close(); vehicleRegistration = null
+            synchronized(pendingVehicle) { pendingVehicle.clear() }
+        }
+        else if (vehicleRegistration == null) vehicleRegistration = hub.addVehicleListener { origin, data ->
+            if (origin.outputId == "clink" && !sampleVehicleData) queueVehicle(data)
+        }
+        vehicleView = recorder.view()
+    }
+    fun clearVehicleHistory() { setup.execute {
+        try { vehicleRecorder?.clear(); vehicleRecorder?.let { vehicleView = it.view() } }
+        catch (_: Exception) { vehicleView = vehicleView.copy(storageFailed = true) }
+    } }
+
+    private var carlinkLink: ClinkLink? = null
+    fun refreshCarlinkWifi() { wirelessUpdate { (carlinkLink as? AndroidClinkLink)?.refreshWifi() } }
+    @Volatile private var carlinkEnded = false
+    @Volatile private var carlinkRetiring = false
+    @Volatile private var carlinkRestartPending = false
+    private val carlinkResizePolicy = CarlinkResizePolicy()
+
+    private var webStarting = false
+    private var lastWebFailure: String? = null
+    private var bindRetry: java.util.concurrent.ScheduledFuture<*>? = null
+    private var urlRefresh: java.util.concurrent.ScheduledFuture<*>? = null
+    val identityStore = IdentityStore(context.noBackupFilesDir) {
+        AirPlayPersistence.saveMfiTarget(context, MfiTarget.LOCAL)
+    }
+    val tlsStore = TlsStore(context.noBackupFilesDir) { refreshWebTls(); adminService.restartTls() }
+    private val sessionController = RelaySessionActions(context.applicationContext, this)
+    val sessionActions: RelayActions get() = sessionController
+    val carWaitUntilMillis get() = sessionController.carlinkFirst.untilMillis ?: sessionController.carFirst.untilMillis
+    val carlinkReadyForCarPlay: Boolean get() = carlinkState == ClinkState.PLAYING.name &&
+        !carlinkRetiring && !carlinkRestartPending && !carlinkEnded
+    private val pathVideoStats = VideoStats()
+    @Synchronized internal fun pathVideoSnapshot(): VideoStatsSnapshot? {
+        val settings = settingsStore.snapshot.value ?: return null
+        return pathVideoStats.sample(status, settings.videoStats, settings.carlinkOutput,
+            carlinkStatistics, carlinkVideoDecision, carlinkScreen)
+    }
+    val networkStart get() = sessionController.networkStart
+    fun recheckNetworkStart() = sessionController.recheckNetworkStart()
+    fun recheckCarlinkReady() = sessionController.recheckCarlinkReady()
+    fun startAnyway() = sessionController.startAnyway()
+    fun cancelNetworkStart() = sessionController.cancelNetworkStart()
+    val adminService = top.cabinplay.direlay.admin.RelayAdminService(context.applicationContext, this,
+        top.cabinplay.direlay.admin.AdminActions { top.cabinplay.direlay.admin.AdminResult(sessionActions.action(it)) })
+    private fun adminHosts(): Set<String> = listOfNotNull(adminService.advertisedHost).toSet()
+    /** Trusted HTTPS with a free domain name; off by default, and then it requests nothing and serves nothing new. */
+    val publicName = top.cabinplay.direlay.publicname.PublicNameService.create(context.applicationContext,
+        top.cabinplay.direlay.publicname.TlsStoreCertificates(tlsStore),
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty(),
+        addressOverride = { teslaAddress?.let { teslaPublishedAddress(it.mode, it.address) } }) { publicNameCandidates() }
+
+    private val castNetwork = AndroidCastNetwork(context) {
+        ipv4Addresses(includeIphoneLink = false).map { java.net.InetAddress.getByName(it) as Inet4Address }
+    }
+    private val dlnaLifecycle = RetiringOutputPolicy<DlnaOutputPlan>()
+    private val miracastLifecycle = RetiringOutputPolicy<MiracastPicture>()
+    @Volatile private var dlnaToken: Any? = null
+    @Volatile private var miracastToken: Any? = null
+    private val dlnaStatisticsLog = WirelessStatisticsLogLimiter()
+    private val miracastStatisticsLog = WirelessStatisticsLogLimiter()
+    @Volatile var dlnaStateSinceMillis: Long? = null
+        private set
+    @Volatile var dlnaState: CastState? = null
+        private set
+    @Volatile var dlnaRendererName: String? = null
+        private set
+    @Volatile var dlnaFailure: WirelessDisplayFailure? = null
+        private set
+    @Volatile var dlnaStatistics: CastStatistics? = null
+        private set
+    @Volatile var miracastStateSinceMillis: Long? = null
+        private set
+    @Volatile var miracastState: MiracastState? = null
+        private set
+    @Volatile var miracastDisplay: MiracastDisplay? = null
+        private set
+    @Volatile var miracastFailure: WirelessDisplayFailure? = null
+        private set
+
+    init {
+        connectionLog.filterWith(::cleanTrace)
+        prepareCarPlay()
+        hub.addOutput(status)
+        hub.start()
+        setup.execute {
+            loadRememberedDisplay()
+            val initial = WirelessStandIn.effective(settingsStore.awaitSnapshot(), settingsStore.developerOverrides.value)
+            connectionLog.event("relay", "settings_loaded")
+            connectionLog.event("network", "radio_concurrency", radioFacts())
+            configuredPlugins = initial.plugins to initial.pluginsEnabled
+            runCatching { bundledPlugins.root() }
+                .onFailure { Log.w("CabinPlay Relay", "Plugin bundle installation failed", it) }
+            microphoneSource = initial.microphoneSource
+            localPreview = initial.localPreview
+            playCarPlayAudio = initial.playCarPlayAudio
+            automaticEnabled = initial.autoStartWhenReady
+            configuredWebPort = initial.webPort
+            webEnabled = initial.browserOutput
+            updateKeepAlive(initial)
+            prepareCarPlay()
+            ipv4 = ipv4Addresses(); carIpv4 = ipv4Addresses(includeIphoneLink = false)
+            startWeb()
+            publicName.start()
+            configureVehicle()
+            configureCarlink()
+            configureDlna(); configureMiracast(); configureCarlife()
+            connectionLog.event("relay", "runtime_ready")
+        }
+        setup.scheduleWithFixedDelay({
+            try {
+                ipv4 = ipv4Addresses(); carIpv4 = ipv4Addresses(includeIphoneLink = false)
+                if (tlsStore.ensureDefault(webTlsAddresses(), adminHosts())) updateWebTls()
+                publicName.refreshAddress()
+            }
+            catch (_: Exception) { /* Retain the last interface snapshot. */ }
+            if (!closed && webEnabled && web == null && !webStarting && bindRetry == null) startWeb()
+        }, 0, 5, TimeUnit.SECONDS)
+    }
+
+    private val sessionTick = setup.scheduleWithFixedDelay({
+        lastTickAt = android.os.SystemClock.elapsedRealtime()
+        refreshNetworkReadings()
+        // Diagnostics only: a failure here must never cancel the tick.
+        runCatching { observeRadios() }.onFailure { Log.w("CabinPlay Relay", "Radio observation failed", it) }
+        autoStartSessions.refresh()
+        refreshTeslaAddress()
+        sessionController.observeNetworkSession(autoStartSessions.tracker.running,
+            status.session?.phase == top.cabinplay.stream.core.SessionPhase.ACTIVE)
+        sessionController.recoverRadio(networkReadings)
+        sessionController.recheckNetworkStart()
+        sessionController.recheckCarlinkReady()
+        // A session start or stop can block or release Carlink without a settings change.
+        if (carlinkBlock.sessionChanged(autoStartSessions.tracker.running)) enqueueCarlink()
+    }, 0, 500, TimeUnit.MILLISECONDS)
+
+    private fun observeRadios() {
+        val readings = networkReadings
+        radios.observe(readings.wifi, readings.hotspot, android.os.SystemClock.elapsedRealtime(), System.currentTimeMillis())?.let {
+            connectionLog.event("network", "radio_concurrency", "exclusive=${it.exclusive} evidence=${it.evidence} ${radioFacts()}")
+        }
+        val settings = settingsStore.snapshot.value ?: return
+        val next = top.cabinplay.direlay.network.radioConflict(radios.concurrency, settingsStore.wireless(settings),
+            settings.wirelessNetwork.choice, settings.carlinkOutput || settings.miracastOutput, readings)
+        val prompt = settings.experimental.effective().radioConflictPrompt
+        if (next != detectedConflict) {
+            detectedConflict = next
+            if (next == null) connectionLog.event("relay", "radio_conflict_cleared")
+            else connectionLog.event("relay", "radio_conflict", "${next.line()} network=${settings.wirelessNetwork.choice.name.lowercase()} " +
+                "wireless=${settingsStore.wireless(settings)} carlink=${settings.carlinkOutput} miracast=${settings.miracastOutput} prompt=$prompt")
+        }
+        conflict.value = next.takeIf { prompt }
+    }
+    /** "platform=false observed=exclusive@2026-10-29T09:05:30Z effective=exclusive" */
+    fun radioFacts(): String = "platform=${radios.platform ?: "unknown"} observed=" +
+        (radios.observation?.let { "${if (it.exclusive) "exclusive" else "both"}@${java.time.Instant.ofEpochMilli(it.atMillis)}" } ?: "none") +
+        " effective=${radios.concurrency.name.lowercase()}"
+    /** Volatile reads only: the watchdog's heartbeat must never wait for the runtime. */
+    fun watchFacts(): Map<String, String> = mapOf(
+        "session" to (status.session?.phase?.name?.lowercase() ?: "none"),
+        "start_pending" to startRequest.pending.toString(),
+        "waits" to sessionController.waitSummary.ifEmpty { "none" },
+        "radios" to radios.concurrency.name.lowercase(),
+        "conflict" to (detectedConflict?.kind?.name?.lowercase() ?: "none"),
+        "carlink" to carlinkState,
+        "tick_age" to tickAge().toString())
+
+    private val codecRestarts = VideoCodecRestartLimiter()
+    @Volatile var videoDecision = VideoCodecPolicy.resolve(emptyList())
+        private set
+    @Volatile var appliedVideoDecision = videoDecision
+        private set
+    @Volatile private var sessionRestartPending = false
+    @Volatile private var observedCodecSetting: VideoCodecSetting? = null
+    @Volatile private var immediateCodecChange = false
+    @Volatile private var observedFrameRateSetting: FrameRatePreference? = null
+    @Volatile private var immediateFrameRateChange = false
+    @Volatile private var carlinkDecoders: List<DecoderSupport> = emptyList()
+    private var hevcFailed = false
+    private var rememberedCodec: VideoCodec? = null
+    private var rememberedCodecLoaded = false
+    private fun currentVideoCodecDecision(): VideoCodecDecision {
+        input.hevcFailure()?.let { failure ->
+            if (!hevcFailed) {
+                hevcFailed = true
+                immediateCodecChange = true
+                Log.w("CabinPlay Relay", "H.265 failed: $failure")
+            }
+        }
+        if (!rememberedCodecLoaded) {
+            rememberedCodec = when (preferences.getString("automaticVideoCodec", null)) {
+                "H265" -> VideoCodec.H265
+                "H264" -> VideoCodec.H264
+                else -> null
+            }
+            rememberedCodecLoaded = true
+        }
+        return relayVideoCodec(settingsStore.snapshot.value?.videoCodec ?: VideoCodecSetting.AUTO,
+            displayPolicy.activeOutputs, carlinkRequiresAvc(carlinkConnected, carlinkDecoders), hevcFailed, rememberedCodec,
+            carlinkHevc = carlinkConnected && VideoCompatibility.hasHevc(carlinkDecoders))
+    }
+    private fun refreshVideoSettings() {
+        val setting = settingsStore.snapshot.value?.videoCodec ?: return
+        if (observedCodecSetting != null && observedCodecSetting != setting) immediateCodecChange = true
+        observedCodecSetting = setting
+        val frameRate = settingsStore.snapshot.value?.frameRate ?: FrameRatePreference.AUTO
+        if (observedFrameRateSetting != null && observedFrameRateSetting != frameRate) immediateFrameRateChange = true
+        observedFrameRateSetting = frameRate
+        val requestedFps = CarPlayFrameRate.requested(frameRate, negotiatedFps.value)
+        if (requestedFps == appliedFps.value) immediateFrameRateChange = false
+        val next = currentVideoCodecDecision()
+        if (setting == VideoCodecSetting.AUTO && next.reason != "remembered-codec" && next.reason != "no-main-screen-output" && next.codec != rememberedCodec) {
+            rememberedCodec = next.codec
+            preferences.edit().putString("automaticVideoCodec", next.codec.name).apply()
+        }
+        if (next != videoDecision) {
+            if (next.codec != videoDecision.codec) codecRestarts.changed(android.os.SystemClock.elapsedRealtime())
+            videoDecision = next
+            Log.i("CabinPlay Relay", "video codec ${next.codec} reason=${next.reason}")
+        }
+        if (autoStartSessions.tracker.running && !sessionActions.restarting && !startRequest.pending &&
+            !sessionRestartPending && ((immediateFrameRateChange && requestedFps != appliedFps.value) ||
+                (next.codec != appliedVideoDecision.codec &&
+                    (immediateCodecChange || codecRestarts.allow(android.os.SystemClock.elapsedRealtime()))))) {
+            sessionRestartPending = true
+            if (sessionActions.action("restart", manual = false) != null) sessionRestartPending = false
+            else { immediateCodecChange = false; immediateFrameRateChange = false }
+        }
+        if (next.codec == appliedVideoDecision.codec) immediateCodecChange = false
+    }
+    private fun refreshDisplay() {
+        // A page can connect before the phone declares its areas; reconsider its latest report once active.
+        observeWindow(displayPolicy.primaryDisplay)
+        displayPolicy.refreshDisplay()
+        rememberCarDisplay()
+        val settings = settingsStore.snapshot.value ?: return
+        val picture = carlinkPictureInEffect(settings)
+        if (picture && preparedCarlinkPicture == null && pictureInUse.value?.size != null &&
+            pictureInUse.value?.size == settings.effectiveCarlinkPicture(carlinkPictureTrial.value)) pictureRestartPending = true
+        restartCarlinkPicture()
+        val desiredScreen = selectedCarPlayScreen(settings)
+        val automatic = desiredScreen?.let { DisplayTarget(it.profile, settings.carplayResolution, settings.carplayScreenWidth,
+            displayPolicy.primaryDisplay?.let(HeadUnitDisplay::from)?.screen?.let { screen ->
+                if (!carlinkScreenChanged(screen, appliedDisplay?.screen, carlinkPrimary(), carlinkMatchingArea(settings)))
+                    appliedDisplay?.screen ?: screen else screen
+            } ?: appliedDisplay?.screen) }
+        val desired = carlinkPictureRefitTarget(appliedDisplay, automatic, settings.carplayScreenWidth, picture)
+        if (displayRefit.due(android.os.SystemClock.elapsedRealtime(), autoStartSessions.tracker.running,
+                settings.displayMode, appliedDisplay, desired, !picture && displayPolicy.primaryDisplay?.viewport != null, settings.viewAreas || declaredViewAreas.isNotEmpty()) &&
+            !sessionActions.restarting && !startRequest.pending) sessionActions.action("restart", manual = false)
+    }
+    private val displayTick = setup.scheduleWithFixedDelay({ refreshDisplay(); refreshVideoSettings() }, 0, 250, TimeUnit.MILLISECONDS)
+
+    private val vehicleTick = setup.scheduleWithFixedDelay({
+        try {
+            if (sampleVehicleData) top.cabinplay.direlay.vehicle.sampleVehicleData(sampleTick++).forEach(::queueVehicle)
+            if (collectVehicle) vehicleRecorder?.let { it.tick(); vehicleView = it.view() }
+        } catch (_: Exception) { vehicleView = vehicleView.copy(storageFailed = true) }
+    }, 1, 1, TimeUnit.SECONDS)
+
+    fun prepareCarPlay(chooseVideoCodec: Boolean = false) {
+        input.microphoneAvailable(microphoneSource == MicrophoneSource.HEAD_UNIT &&
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+        if (!chooseVideoCodec) return
+        carlinkBlock.carPlayStarting(AirPlayP2pReservation(context).reservedByCarPlay())
+        enqueueCarlink()
+        synchronized(this) {
+            val decision = currentVideoCodecDecision()
+            observedCodecSetting = settingsStore.snapshot.value?.videoCodec
+            immediateCodecChange = false
+            videoDecision = decision
+            appliedVideoDecision = decision
+            sessionRestartPending = false
+            AirPlayPersistence.saveHevcEnabled(context, decision.codec == VideoCodec.H265)
+            Log.i("CabinPlay Relay", "video codec ${decision.codec} reason=${decision.reason}")
+        }
+    }
+
+    fun setLocalPreview(enabled: Boolean) {
+        localPreview = enabled
+        preferences.edit().putBoolean("localPreview", enabled).apply()
+    }
+
+    fun reloadSettings() {
+        val requested = settingsStore.snapshot.value ?: return
+        if (!settingsStore.developerOverrides.value.active) {
+            setSampleVehicleData(false)
+            if (traceCapture.isInitialized() && carlinkMediaCapture.capturing) carlinkMediaCapture.stop()
+        }
+        if (automaticEnabled == false && requested.autoStartWhenReady) autoStartSessions.resume("Automatic enabled")
+        automaticEnabled = requested.autoStartWhenReady
+        val vehicleEnabled = requested.vehicleInformation
+        collectVehicle = vehicleEnabled || sampleVehicleData
+        try { setup.execute {
+            configureVehicle(vehicleEnabled); configureCarlink(); configureDlna(); configureMiracast(); configureCarlife()
+            refreshTeslaAddress()
+            publicName.refreshAddress()
+        } }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+        val settings = WirelessStandIn.effective(requested, settingsStore.developerOverrides.value)
+        localPreview = settings.localPreview
+        playCarPlayAudio = settings.playCarPlayAudio
+        microphoneSource = settings.microphoneSource
+        prepareCarPlay()
+        val plugins = settings.plugins to settings.pluginsEnabled
+        val pluginsChanged = plugins != configuredPlugins
+        if (pluginsChanged) {
+            configuredPlugins = plugins
+            pluginContext.configure(false)
+        }
+        val port = settings.webPort
+        val networkGranted = hasNetworkPermission()
+        val enabled = settings.browserOutput
+        if (pluginsChanged || port != configuredWebPort || networkGranted != networkPermissionAvailable || enabled != webEnabled) {
+            webEnabled = enabled
+            configuredWebPort = port
+            networkPermissionAvailable = networkGranted
+            restartWeb()
+        }
+        updateKeepAlive(settings)
+    }
+
+    private fun updateKeepAlive(settings: RelaySettings) = synchronized(lifecycle) {
+        keepAlive.update(RelayKeepAlivePolicy.needed(!closed, webEnabled, settings.carlinkOutput,
+            settings.dlnaOutput, settings.miracastOutput, settings.carlifeOutput))
+    }
+
+    /** Blocking discovery; callers must use an I/O worker. */
+    fun searchDlnaRenderers(): List<CastRenderer> = CastDiscovery(castNetwork).search()
+
+    private fun wirelessUpdate(block: () -> Unit) {
+        try { setup.execute { if (!closed) block() } }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+    private fun wirelessLogMessage(message: String): String = wirelessLogLine(redactFailureMessage(message))
+
+    private fun carlifeLog(connection: Long, event: String, detail: String = "") {
+        connectionLog.event("carlife", event, "connection=$connection " + redactFailureMessage(detail))
+    }
+
+    fun refreshCarlifeUsb() { wirelessUpdate { carlifeAccessory?.refresh() } }
+
+    /** The shell owns platform codecs and USB; CarLife itself only sees OXP media and controls. */
+    private fun configureCarlife() {
+        if (closed) return
+        val settings = settingsStore.awaitSnapshot()
+        val requested = top.cabinplay.direlay.settings.CarlifeConnectionPolicy.output(settings)
+        when (carlifeLifecycle.update(requested)) {
+            OutputChange.KEEP -> return
+            OutputChange.REMOVE -> {
+                carlifeLog(carlifeConnection, "output_remove", "cause=${if (requested == null) "disabled" else "transport_or_target_changed"}")
+                carlifeAccessory?.close(); carlifeAccessory = null
+                hub.removeOutput("carlife")
+                return
+            }
+            OutputChange.ADD -> Unit
+        }
+        val plan = requireNotNull(requested)
+        val token = Any()
+        val connection = carlifeGeneration.incrementAndGet()
+        carlifeConnection = connection
+        carlifeToken = token
+        carlifeLog(connection, "output_config", "transport=${plan.transport.wire} discovery=${if (!plan.transport.tcp) "off" else if (plan.targetAddress.isBlank()) "broadcast" else "directed"} " +
+            "target=${plan.targetAddress.takeIf(String::isNotBlank) ?: "-"} fpsCeiling=60 " +
+            "sourceCodec=${settings.videoCodec.wire} sourceFps=${settings.frameRate} " +
+            "selectedScreen=${carPlayScreen?.profile?.let { "${it.width}x${it.height}" } ?: "-"}")
+        carlifeStatus = null
+        carlifeStateSinceMillis = System.currentTimeMillis()
+        val destination = top.cabinplay.stream.carlife.CarlifeOutput(
+            top.cabinplay.stream.carlife.CarlifeConfig(targetAddress = plan.targetAddress.takeIf(String::isNotBlank),
+                tcp = plan.transport.tcp, discovery = plan.transport.tcp, fps = 60),
+            top.cabinplay.stream.carlife.CarlifeDeviceInfo(android.os.Build.BRAND, android.os.Build.MODEL, android.os.Build.VERSION.SDK),
+            object : top.cabinplay.stream.carlife.CarlifeListener {
+                override fun onStatus(state: top.cabinplay.stream.carlife.CarlifeStatus) = wirelessUpdate {
+                    if (carlifeToken !== token) return@wirelessUpdate
+                    if (carlifeStatus?.state != state.state) {
+                        carlifeStateSinceMillis = System.currentTimeMillis()
+                        carlifeLog(connection, "state", "state=${state.state} frames=${state.frames} " +
+                            "width=${state.width} height=${state.height} reason=${redactFailureMessage(state.reason.orEmpty())}")
+                    } else if (state.frames != carlifeStatus?.frames && (state.frames == 1L || state.frames % 300L == 0L)) {
+                        carlifeLog(connection, "video_sent", "frames=${state.frames} width=${state.width} height=${state.height}")
+                    }
+                    carlifeStatus = state
+                }
+                override fun diagnostic(event: String) {
+                    if (carlifeToken === token) carlifeLog(connection, "protocol", event)
+                }
+            })
+        val accessory = if (plan.transport.usb) top.cabinplay.direlay.carlife.AndroidCarlifeAccessory(context.applicationContext, destination) { message ->
+            carlifeLog(connection, "usb", message)
+        } else null
+        carlifeAccessory = accessory
+        val converted = carlifeVideoOutput(destination) { event, detail ->
+            if (carlifeToken === token) carlifeLog(connection, event, detail)
+        }
+        val output = object : ProjectionOutput by converted {
+            override fun open(host: top.cabinplay.stream.core.OutputHost) {
+                carlifeLog(connection, "output_open", "transport=${plan.transport.wire}")
+                converted.open(host)
+                accessory?.start()
+            }
+            override fun close() {
+                carlifeLog(connection, "output_close", "by=local")
+                try { accessory?.close(); converted.close() }
+                finally { wirelessUpdate {
+                    if (carlifeToken === token) {
+                        carlifeToken = null
+                        carlifeAccessory = null
+                        carlifeStatus = null
+                        carlifeLifecycle.ended()
+                        configureCarlife()
+                    }
+                } }
+            }
+        }
+        try {
+            carlifeLog(connection, "output_add", "id=${output.id}")
+            hub.addOutput(output)
+        }
+        catch (failure: Exception) {
+            accessory?.close()
+            carlifeLifecycle.ended()
+            carlifeLog(connection, "start_failed", "error=${failure.javaClass.simpleName} ${failure.message.orEmpty()}")
+        }
+    }
+
+    private var dlnaLogConnection = 0L
+    private fun configureDlna() {
+        if (closed) return
+        val settings = settingsStore.awaitSnapshot()
+        val requested = WirelessOutputPolicy.dlna(settings, wirelessPicture(settings))
+        if (requested == null) {
+            dlnaState = null; dlnaStateSinceMillis = null; dlnaRendererName = null; dlnaFailure = null; dlnaStatistics = null
+        }
+        when (dlnaLifecycle.update(requested)) {
+            OutputChange.KEEP -> return
+            OutputChange.REMOVE -> {
+                connectionLog.castEvent("output_stop", "by=local cause=${if (requested == null) "stopped" else "replaced"}", dlnaLogConnection)
+                hub.removeOutput("cast"); return
+            }
+            OutputChange.ADD -> Unit
+        }
+        val plan = checkNotNull(requested)
+        val logConnection = ++dlnaLogConnection
+        connectionLog.castEvent("output_start", connection = logConnection)
+        val token = Any(); dlnaToken = token
+        dlnaStateSinceMillis = System.currentTimeMillis()
+        dlnaState = CastState.SEARCHING; dlnaRendererName = settings.dlnaRenderer?.name
+        dlnaFailure = null; dlnaStatistics = null
+        val listener = object : CastListener {
+            private var reportedState: CastState? = null
+            override fun state(state: CastState, renderer: CastRenderer?) = wirelessUpdate {
+                if (dlnaToken !== token) return@wirelessUpdate
+                if (reportedState != state) {
+                    reportedState = state
+                    Log.i("CabinPlay DLNA", wirelessLogMessage("state $state renderer=${renderer?.friendlyName ?: "-"}"))
+                }
+                if (state == CastState.ENDED) {
+                    hub.removeOutput("cast")
+                    dlnaLifecycle.ended(); dlnaToken = null
+                    dlnaState = null; dlnaStateSinceMillis = null; dlnaRendererName = null; dlnaStatistics = null; dlnaFailure = null
+                    configureDlna()
+                } else if (!dlnaLifecycle.retiring) {
+                    if (dlnaState != state) dlnaStateSinceMillis = System.currentTimeMillis()
+                    dlnaState = state; dlnaRendererName = renderer?.friendlyName ?: settingsStore.snapshot.value?.dlnaRenderer?.name
+                    if (state == CastState.PLAYING) dlnaFailure = null
+                }
+            }
+            override fun failure(failure: CastFailure) {
+                connectionLog.cast("failed link=renderer code=${failure.code} ${failure.detail}", logConnection)
+                wirelessUpdate { if (dlnaToken === token && !dlnaLifecycle.retiring) {
+                    dlnaFailure = WirelessDisplayFailure(failure.code, redactFailureMessage(failure.detail), System.currentTimeMillis())
+                    Log.w("CabinPlay DLNA", wirelessLogMessage("failure ${failure.code}: ${failure.detail}"))
+                } }
+            }
+            override fun diagnostic(message: String) {
+                connectionLog.cast(message, logConnection)
+                wirelessUpdate { if (dlnaToken === token) Log.i("CabinPlay DLNA", wirelessLogMessage(message)) }
+            }
+            override fun statistics(statistics: CastStatistics) = wirelessUpdate {
+                if (dlnaToken === token && !dlnaLifecycle.retiring) {
+                    dlnaStatistics = statistics
+                    if (dlnaStatisticsLog.allow(System.nanoTime())) Log.i("CabinPlay DLNA", wirelessLogMessage(
+                        "stats clients=${statistics.clients} video=${statistics.videoFrames} audio=${statistics.audioFrames} " +
+                            "silent=${statistics.silentFrames} bytes=${statistics.bytesSent} dropped=${statistics.droppedFrames} " +
+                            "overflows=${statistics.overflows} renderer=${statistics.rendererState ?: "-"} lag=${statistics.rendererLagMs ?: "-"}"))
+                }
+            }
+        }
+        try {
+            val output = CastOutput(CastOutputConfig(plan.udn, plan.size.width, plan.size.height, fps = 30, audio = true),
+                castNetwork, listener)
+            hub.addOutput(carDisplayMemory.exclude(WirelessOutputPolicy.declareDlna(CastAudioMix(output), plan)))
+        } catch (failure: Exception) {
+            connectionLog.linkEnded("cast", top.cabinplay.direlay.logs.LinkEnd("renderer", "opening", "local", "connect_failed",
+                "${failure.javaClass.simpleName}: ${redactFailureMessage(failure.message.orEmpty())}"), logConnection)
+            dlnaToken = null; dlnaLifecycle.ended()
+            dlnaFailure = WirelessDisplayFailure("output_failed", failureText(failure, ::redactFailureMessage), System.currentTimeMillis())
+            Log.w("CabinPlay DLNA", wirelessLogMessage("failure output_failed: ${dlnaFailure?.detail}"))
+        }
+    }
+
+    private fun configureMiracast() {
+        if (closed) return
+        val requested = WirelessOutputPolicy.miracast(settingsStore.awaitSnapshot())
+        if (requested == null) { miracastState = null; miracastStateSinceMillis = null; miracastDisplay = null; miracastFailure = null }
+        when (miracastLifecycle.update(requested)) {
+            OutputChange.KEEP -> return
+            OutputChange.REMOVE -> { hub.removeOutput("miracast"); return }
+            OutputChange.ADD -> Unit
+        }
+        val token = Any(); miracastToken = token
+        miracastStateSinceMillis = System.currentTimeMillis()
+        miracastState = MiracastState.WAITING_FOR_DISPLAY; miracastDisplay = null; miracastFailure = null
+        val listener = object : MiracastListener {
+            private var reportedState: Pair<MiracastState, MiracastDisplay?>? = null
+            override fun state(state: MiracastState, display: MiracastDisplay?) = wirelessUpdate {
+                if (miracastToken !== token) return@wirelessUpdate
+                val next = state to display
+                if (reportedState != next) {
+                    reportedState = next
+                    val target = display?.let { "${it.id}:${it.name}:${it.width}x${it.height}" } ?: "-"
+                    Log.i("CabinPlay Miracast", wirelessLogMessage("state $state display=$target"))
+                }
+                if (state == MiracastState.ENDED) {
+                    hub.removeOutput("miracast")
+                    miracastLifecycle.ended(); miracastToken = null
+                    miracastState = null; miracastStateSinceMillis = null; miracastDisplay = null; miracastFailure = null
+                    configureMiracast()
+                } else if (!miracastLifecycle.retiring) {
+                    if (miracastState != state) miracastStateSinceMillis = System.currentTimeMillis()
+                    miracastState = state; miracastDisplay = display
+                    if (state == MiracastState.SHOWING) miracastFailure = null
+                }
+            }
+            override fun failure(code: String, detail: String) = wirelessUpdate {
+                if (miracastToken === token && !miracastLifecycle.retiring) {
+                    miracastFailure = WirelessDisplayFailure(code, redactFailureMessage(detail), System.currentTimeMillis())
+                    Log.w("CabinPlay Miracast", wirelessLogMessage("failure $code: $detail"))
+                }
+            }
+            override fun diagnostic(message: String) = wirelessUpdate {
+                if (miracastToken === token) Log.i("CabinPlay Miracast", wirelessLogMessage(message))
+            }
+            override fun statistics(statistics: MiracastStatistics) = wirelessUpdate {
+                if (miracastToken === token && !miracastLifecycle.retiring && miracastStatisticsLog.allow(System.nanoTime()))
+                    Log.i("CabinPlay Miracast", "stats decoded=${statistics.decodedFrames} dropped=${statistics.droppedFrames} " +
+                        "codec=${statistics.codec ?: "-"} ${statistics.width}x${statistics.height}")
+            }
+        }
+        try { hub.addOutput(carDisplayMemory.exclude(MiracastOutput(context.applicationContext, listener, picture = checkNotNull(requested)))) }
+        catch (failure: Exception) {
+            miracastToken = null; miracastLifecycle.ended()
+            miracastFailure = WirelessDisplayFailure("output_failed", failureText(failure, ::redactFailureMessage), System.currentTimeMillis())
+            Log.w("CabinPlay Miracast", wirelessLogMessage("failure output_failed: ${miracastFailure?.detail}"))
+        }
+    }
+
+    fun reconnectCarlink() { status.clearFailure(); carPlayDiagnostics.clear(); enqueueCarlink(true) }
+
+    fun cancelCarlinkPairing() {
+        carlinkPins.cancel()
+        try { setup.execute {
+            carlinkRestartPending = false
+            carlinkRetrying = false
+            carlink?.let {
+                carlinkRetiring = !carlinkEnded
+                hub.removeOutput(it.id)
+            }
+            carlinkLink?.disconnect()
+            carlink = null; carlinkLink = null
+            carlinkState = "ENDED"
+        } } catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun enqueueCarlink(force: Boolean = false) {
+        try { setup.execute { configureCarlink(force) } }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun configureCarlink(force: Boolean = false) {
+        if (closed) return
+        configureVehicle()
+        val settings = settingsStore.awaitSnapshot()
+        updateKeepAlive(settings)
+        carlinkResizePolicy.enabled = settings.carlinkReconnectOnResize
+        if (!settings.carlinkTrace && traceCapture.isInitialized()) carlinkMediaCapture.stop()
+        val permitted = StartupPermissions.carlink(Build.VERSION.SDK_INT, true).all {
+            context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+        val requested = CarlinkConfig(settings.carlinkOutput, permitted,
+            settings.carlinkDeviceName, settings.carlinkDeviceModel,
+            carlinkBlock.blocked(CarlinkConnectionPolicy.enabled(settings),
+                settingsStore.carlinkWifiDirectConflict(settings), autoStartSessions.tracker.running), settings.carlinkTrace, settings.carlinkHevc, settings.carlinkPictureSize)
+        // Picture size is frozen until the next connection. Experimental choices are captured below,
+        // outside this comparison, so editing them never restarts a running link.
+        if (!force && requested.copy(pictureSize = carlinkConfig?.pictureSize ?: requested.pictureSize) == carlinkConfig && !carlinkRestartPending) return
+        connectionLog.transition("relay", "carlink_output", "carlink_output", if (requested.enabled) "enabled" else "disabled")
+        carlinkConfig = requested
+        if (carlinkRetiring) { carlinkRestartPending = true; return }
+        carlink?.let { output ->
+            connectionLog.carlink("decision link=session by=local cause=${if (requested.enabled) "replaced" else "stopped"} reached=${carlinkState.lowercase()}", carlinkLogConnection)
+            carlinkRetiring = !carlinkEnded
+            carlinkRestartPending = carlinkRetiring
+            carlinkPins.retire()
+            hub.removeOutput(output.id)
+            // ClinkOutput.close stops the session; explicitly cancel a pending platform join too.
+            carlinkLink?.disconnect()
+            carlink = null
+            carlinkVideoOutput = null; carlinkGeometry = null; carlinkGeometryMode = null
+            carlinkLink = null
+            if (carlinkRetiring) return
+        }
+        carlinkRestartPending = false
+        carlinkRetrying = requested.enabled && carlinkError != null
+        carlinkStage = null
+        carlinkStateSinceMillis = System.currentTimeMillis()
+        carlinkName = null; carlinkWifiSsid = null; carlinkWifiPending = false; carlinkJoinMethod = null; carlinkTrusted = false
+        carlinkAttemptDetail = ""
+        if (!requested.enabled || carlinkError == null) {
+            carlinkDetail = ""
+            carlinkFailed = false
+            carlinkError = null; carlinkErrorTrail = emptyList(); carlinkErrorAt = null; carlinkFailureCode = null
+        }
+        carlinkFailureRedactor = { it }
+        carlinkVideoDetail = ""
+        carlinkVideoFailed = false
+        carlinkVideoError = null
+        if (!requested.enabled) { carlinkState = "Disabled"; carlinkRetrying = false; return }
+        if (requested.blocked) {
+            carlinkRetrying = false
+            carlinkState = "Blocked"
+            carlinkFailed = true
+            carlinkDetail = CarlinkConnectionPolicy.REASON
+            return
+        }
+        if (Build.VERSION.SDK_INT < 29) { carlinkRetrying = false; carlinkState = "Requires Android 10+"; return }
+        if (!permitted) { carlinkRetrying = false; carlinkState = "Waiting for permissions"; return }
+        val id = preferences.getString("clinkDeviceId", null) ?: java.util.UUID.randomUUID().toString().also {
+            check(preferences.edit().putString("clinkDeviceId", it).commit())
+        }
+        val logConnection = ++carlinkLogConnection
+        val summary = CarlinkSummaryTrace(
+            mirror = { line -> top.cabinplay.direlay.logs.LogcatLines.split(line).forEach { Log.i("OXP-Carlink", it) } },
+            clean = ::cleanTrace, timeline = { connectionLog.carlink(it, logConnection) },
+            car = { connectionLog.carlink("car $it", logConnection) }, emitEvents = !settings.carlinkTrace)
+        carlinkSummary?.close(); carlinkSummary = summary
+        val full = runCatching { CarlinkTraceRecorder.select(settings.carlinkTrace) { carlinkTraceRecorder } }
+            .onFailure { connectionLog.transition("relay", "full_trace_failure", "logging_unavailable", "component=carlink_trace") }
+            .getOrDefault(top.cabinplay.stream.clink.trace.ClinkTrace.NONE)
+        val traceSession = java.util.concurrent.atomic.AtomicLong()
+        val trace = top.cabinplay.stream.clink.trace.ClinkTrace { event ->
+            if (event.session > 0) traceSession.set(event.session)
+            runCatching { summary.record(event) }
+            if (full !== top.cabinplay.stream.clink.trace.ClinkTrace.NONE) runCatching { full.record(event) }
+        }
+        val diagnostics = TracingClinkDiagnostics(ClinkDiagnostics { event ->
+            connectionLog.carlink(event.line(), logConnection)
+            if (logConnection != carlinkLogConnection) return@ClinkDiagnostics
+            val now = System.currentTimeMillis()
+            carlinkTrail.record(event.line(), event == ClinkStage.LINK_START, now, System.nanoTime())
+            when (event) {
+                is ClinkStage -> carlinkStage = event to now
+                is ClinkDiagnostic.Peer -> event.name.filterNot { it.isISOControl() }.trim().take(80).takeIf { it.isNotEmpty() }?.let { carlinkName = it }
+                is ClinkDiagnostic.Trusted -> carlinkTrusted = event.trusted
+                is ClinkDiagnostic.Retry -> carlinkRetrying = true
+                is ClinkDiagnostic.JoinChoice -> carlinkJoinMethod = event.method
+                is ClinkDiagnostic.Handoff -> carlinkWifiSsid = event.ssid
+                is ClinkDiagnostic.WifiRecovery -> when (event.event) {
+                    "identifying", "request_started" -> carlinkWifiPending = true
+                    "network_selected", "closed" -> carlinkWifiPending = false
+                    else -> Unit
+                }
+                else -> Unit
+            }
+            if (event is ClinkDiagnostic.Failure) {
+                carlinkAttemptDetail = event.code
+                carlinkFailureCode = event.code
+                carlinkErrorAt = now
+                carlinkErrorTrail = carlinkTrail.snapshot()
+                if (carlinkError == null) carlinkDetail = event.code
+            }
+            clinkDiagnostics.emit(event)
+        }, trace, traceSession::get)
+        val reservation = AirPlayP2pReservation(context)
+        val experiments = settings.experimental.effective(settings.carlinkTrace)
+        val link = AndroidClinkLink(context, id, requested.name, requested.model, diagnostics, reservation,
+            onSecret = { logSecrets.remember(listOf(it)) }, experimental = experiments)
+        val sessionDiagnostics = ClinkSessionDiagnostics(carlinkPins, carlinkTrust, diagnostics)
+        carlinkResizePolicy.startSession()
+        var resizePlaying = false
+        fun observeResize(change: () -> Unit) {
+            try { setup.execute {
+                if (closed || carlinkLink !== link || carlinkRetiring || carlinkEnded) return@execute
+                // Read the live snapshot before resolving a pending reconnect or making a new decision.
+                carlinkResizePolicy.enabled = settingsStore.snapshot.value?.carlinkReconnectOnResize == true
+                change()
+                carlinkResizePolicy.reconnect(resizePlaying)?.let { resize ->
+                    Log.i("DiRelayCarlink", "view resized window=${resize.window.width}x${resize.window.height} view=${resize.view.width}x${resize.view.height}; reconnecting")
+                    reconnectCarlink()
+                }
+            } } catch (_: java.util.concurrent.RejectedExecutionException) { }
+        }
+        val output = ClinkOutput(link, sessionDiagnostics.pinProvider, sessionDiagnostics.trustStore,
+            deviceId = id, deviceName = requested.name,
+            vehicleData = settings.vehicleInformation,
+            hevc = requested.hevc, pictureSize = requested.pictureSize, trace = trace, mediaTap = if (settings.carlinkTrace) carlinkMediaCapture else null,
+            listener = object : ClinkListener {
+                override fun state(state: ClinkState) {
+                    observeResize { resizePlaying = state == ClinkState.PLAYING }
+                    sessionDiagnostics.state(state)
+                    carlinkState = state.name
+                    carlinkStateSinceMillis = System.currentTimeMillis()
+                    if (state == ClinkState.NEGOTIATING) {
+                        carlinkPins.paired()
+                        link.authenticated()
+                    }
+                    // A reconnected session clears the previous failure shown on the status screens.
+                    if (state == ClinkState.PLAYING) {
+                        carlinkBackoff.succeeded()
+                        carlinkRetrying = false
+                        carlinkAttemptDetail = ""
+                        carlinkError = null; carlinkErrorTrail = emptyList(); carlinkErrorAt = null; carlinkFailureCode = null
+                        carlinkFailed = carlinkVideoFailed
+                        carlinkDetail = carlinkVideoDetail
+                    }
+                    if (state == ClinkState.ENDED) {
+                        carlinkRetrying = false
+                        carlinkStatistics = null; carlinkVideoDecision = null; carlinkScreen = null
+                        carlinkGeometry = null; carlinkGeometryMode = null
+                        carlinkEnded = true
+                        try { setup.execute {
+                            carlinkRetiring = false
+                            if (carlinkRestartPending) configureCarlink(true) else scheduleCarlinkReconnect()
+                        } } catch (_: java.util.concurrent.RejectedExecutionException) { }
+                    }
+                }
+                override fun error(error: Throwable) {
+                    carlinkError = failureText(error) { redactFailureMessage(link.redactFailureMessage(it)) }
+                    carlinkFailed = true
+                    // Code locations only (no messages, which may carry platform details), except protocol codes.
+                    val root = generateSequence(error) { it.cause }.last()
+                    val code = root.message?.takeIf { it.matches(Regex("[a-z0-9_]{3,64}")) }?.let { " ($it)" }.orEmpty()
+                    android.util.Log.w("DiRelayCarlink", "session error ${root.javaClass.simpleName}$code at " +
+                        root.stackTrace.take(8).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" })
+                    sessionDiagnostics.error(error)
+                    carlinkDetail = carlinkAttemptDetail.ifBlank { carlinkDetail }
+                    carlinkErrorTrail = carlinkTrail.snapshot()
+                    carlinkErrorAt = System.currentTimeMillis()
+                    val rejected = generateSequence(error) { it.cause }.any { it.message in setOf("auth_rejected", "auth_pin_proof_failed") }
+                    if (rejected) carlinkPins.reject(::reconnectCarlink)
+                    else carlinkPins.cancel()
+                }
+                // E3 also puts AUTH diagnostics on the Carlink trail and trace.
+                override fun diagnostic(message: String) {
+                    link.sessionDiagnostic(message)
+                    connectionLog.carlinkDiagnostic(message, logConnection)
+                    connectionLog.diagnostic(message)
+                }
+                override fun statistics(stats: ClinkStatistics) {
+                    carlinkStatistics = stats
+                    summary.video(stats.codec?.name ?: "unknown", stats.width, stats.height, stats.liveFrames)
+                }
+                override fun viewSize(width: Int, height: Int) {
+                    summary.view(width, height)
+                    observeResize { carlinkResizePolicy.viewSize(width, height) }
+                }
+                override fun profileMismatch(inputCodec: String, decoders: List<String>) {
+                    carlinkFailed = true
+                    carlinkDetail = (carlinkVideoDetail.takeIf { carlinkVideoFailed }
+                        ?: "Head unit cannot decode this video") + "\ninput=$inputCodec decoders=${decoders.joinToString()}"
+                    Log.w("DiRelayCarlink", "video encoder mismatch input=$inputCodec decoders=${decoders.joinToString()}")
+                }
+            })
+        carlinkStatistics = null; carlinkVideoDecision = null; carlinkScreen = null
+        carlinkEnded = false
+        carlinkPins.resumeRequests()
+        carlinkState = "CONNECTING"
+        carlinkFailureRedactor = link::redactFailureMessage
+        carlinkLink = link
+        carlink = output
+        val videoOutput = TranscodingOutput(output, MediaCodecPipeline.factory, report = { format, decision, failed ->
+            carlinkVideoDecision = CarlinkVideoDecision(format, decision)
+            val source = when {
+                format.codec == top.cabinplay.stream.core.VideoCodec.H265 -> "H.265"
+                format.codecString.substringAfter("avc1.").startsWith("64") -> "H.264 High"
+                format.codecString.substringAfter("avc1.").startsWith("4D", true) -> "H.264 Main"
+                else -> "H.264 Baseline"
+            }
+            val target = when (decision.target?.profile) { 66 -> "Baseline"; 77 -> "Main"; 100 -> "High"; else -> "H.265" }
+            carlinkVideoFailed = failed || decision.mode == VideoCompatibility.Mode.UNSUPPORTED
+            if (!failed) carlinkVideoError = null
+            val reason = VideoCompatibility.reportKey(format, decision, failed).reason
+            carlinkVideoDetail = when {
+                carlinkVideoFailed -> listOfNotNull("Head unit cannot decode this video", reason, carlinkVideoError).joinToString("\n")
+                decision.mode == VideoCompatibility.Mode.TRANSCODE -> "Transcoding $source → $target for the head unit"
+                else -> "Video passthrough"
+            }
+            if (carlinkError == null || carlinkState == ClinkState.PLAYING.name) {
+                carlinkFailed = carlinkVideoFailed
+                carlinkDetail = carlinkVideoDetail
+                if (!carlinkVideoFailed) { carlinkError = null; carlinkErrorTrail = emptyList(); carlinkErrorAt = null; carlinkFailureCode = null }
+            }
+            Log.i("DiRelayCarlink", "video decision=${decision.mode} input=${format.codecString} size=${format.width}x${format.height} target=${decision.target?.codecString} reason=$reason failed=$failed")
+        }, observeCapabilities = { caps ->
+            val screen = caps?.displays?.get(top.cabinplay.stream.core.ScreenId.MAIN)
+            carlinkScreen = screen
+            try { setup.execute { recordCarlinkWindow(screen) } }
+            catch (_: java.util.concurrent.RejectedExecutionException) { }
+            if (screen != null) observeResize { carlinkResizePolicy.windowSize(screen.widthPx, screen.heightPx) }
+            val decoders = caps?.decoders.orEmpty()
+            if (carlinkDecoders != decoders) {
+                carlinkDecoders = decoders
+                try { setup.execute { refreshVideoSettings() } }
+                catch (_: java.util.concurrent.RejectedExecutionException) { }
+            }
+            Log.i("DiRelayCarlink", "video decoders=${decoders.joinToString { it.codecString }}")
+        // Only advertised HEVC sessions accept H.265; Off keeps H.264 delivery.
+        }, deliveryCodecs = if (requested.hevc == ClinkHevcMode.OFF) setOf(top.cabinplay.stream.core.VideoCodec.H264)
+            else setOf(top.cabinplay.stream.core.VideoCodec.H264, top.cabinplay.stream.core.VideoCodec.H265),
+            onFailure = { _, failure -> carlinkVideoError = failureText(failure) { redactFailureMessage(link.redactFailureMessage(it)) } },
+            carlinkGeometry = true, reportGeometry = { geometry, mode ->
+                carlinkGeometry = geometry; carlinkGeometryMode = mode
+            })
+        carlinkVideoOutput = videoOutput
+        activeArea?.let(::updateCarlinkArea)
+        hub.addOutput(videoOutput)
+    }
+
+    private var carlinkSummary: CarlinkSummaryTrace? = null
+    private var carlinkLogConnection = 0L
+    @Volatile var carlinkStatistics: ClinkStatistics? = null
+        private set
+    @Volatile var carlinkVideoDecision: CarlinkVideoDecision? = null
+        private set
+    @Volatile var carlinkScreen: top.cabinplay.stream.core.DisplayInfo? = null
+        private set
+    @Volatile private var carlinkVideoFailed = false
+    @Volatile private var carlinkVideoDetail = ""
+    @Volatile private var carlinkVideoError: String? = null
+    private val carlinkBackoff = AndroidClinkLink.retryBackoff
+
+    /** Reconnects an ended Carlink session with backoff when the user enabled automatic reconnection. */
+    private fun scheduleCarlinkReconnect() {
+        val settings = settingsStore.snapshot.value ?: return
+        if (closed || !settings.carlinkAutoReconnect || !settings.carlinkOutput) return
+        carlinkRetrying = true
+        val delay = carlinkBackoff.next()
+        carlinkTrail.record(ClinkDiagnostic.Retry(delay).line(), false, System.currentTimeMillis(), System.nanoTime())
+        connectionLog.carlink(ClinkDiagnostic.Retry(delay).line(), carlinkLogConnection)
+        runCatching { clinkDiagnostics.emit(ClinkDiagnostic.Retry(delay)) }
+        try { setup.schedule({ if (carlinkEnded && !closed) configureCarlink(true) }, delay, java.util.concurrent.TimeUnit.MILLISECONDS) }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun hasNetworkPermission(): Boolean = Build.VERSION.SDK_INT < 37 ||
+        context.checkSelfPermission("android.permission.ACCESS_LOCAL_NETWORK") == PackageManager.PERMISSION_GRANTED
+
+    fun reportInvalidVideo(type: Int, failure: Exception) {
+        try { setup.execute { Log.w("CabinPlay Relay", "Invalid video stream $type", failure) } }
+        catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun updateWebTls() {
+        web?.updateTls(tlsStore.webContext(webTlsAddresses(), adminHosts()))
+    }
+
+    private fun refreshWebTls() {
+        try { setup.execute {
+            if (!closed) runCatching { updateWebTls() }
+                .onFailure { Log.w("CabinPlay Relay", "TLS update failed", it) }
+        } } catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private fun startWeb(bindAttempt: Int = 0) {
+        bindRetry = null
+        if (closed || webStarting || web != null) return
+        if (!webEnabled) { webPhase = top.cabinplay.direlay.path.WebPhase.OFF; serverReason = null; serverState = "Web receiver disabled"; return }
+        webStarting = true
+        webPhase = top.cabinplay.direlay.path.WebPhase.STARTING
+        val requestedAt = android.os.SystemClock.elapsedRealtime()
+        val port = configuredWebPort ?: TlsStore.port(true)
+        try {
+            carIpv4 = ipv4Addresses(includeIphoneLink = false)
+            val ssl = tlsStore.webContext(webTlsAddresses(), adminHosts())
+            val root = installReceiver()
+            val settings = settingsStore.awaitSnapshot()
+            val plugins = if (!settings.plugins) null else runCatching {
+                top.cabinplay.direlay.plugins.RelayPlugins.configuration(settings, bundledPlugins.root(), context.filesDir)
+            }.onFailure { Log.w("CabinPlay Relay", "Plugin packages unavailable", it) }.getOrNull()
+            val output = WebOutput(WebOutputConfig(
+                // Includes the local Tesla TUN address; no interface-specific listener is needed.
+                bindAddress = "0.0.0.0", port = port, sslContext = ssl,
+                staticAssetRoot = root.toPath(), plugins = plugins, hostUi = true,
+                displaySettings = top.cabinplay.direlay.logs.TimelineDisplaySettingsPort(settingsStore, connectionLog), viewArea = viewAreaPort,
+                sourceUrl = "https://github.com/CabinPlay/CabinPlay-Relay",
+                relay = top.cabinplay.stream.web.RelayInfo("Android", appVersion()),
+            ))
+            synchronized(lifecycle) {
+                if (closed) return
+                web = output
+                val observed = top.cabinplay.direlay.logs.TimelineWebOutput(output, browserTimeline)
+                val destination = if (plugins == null) observed else top.cabinplay.direlay.plugins.AndroidPluginOutput(observed)
+                hub.addOutput(TranscodingOutput(destination, MediaCodecPipeline.factory))
+            }
+            output.awaitListening()
+            connectionLog.event("relay", "web_listening", "port=$port ms=${android.os.SystemClock.elapsedRealtime() - requestedAt}")
+            if (closed) return
+            serverReason = null
+            lastWebFailure = null
+            pluginContext.configure(plugins != null, status.session?.phase == top.cabinplay.stream.core.SessionPhase.ACTIVE)
+            val assetsState = if (File(root, "receiver/index.html").isFile) "" else "\nReceiver assets missing; build Stream web/dist and rebuild the APK."
+            webPhase = top.cabinplay.direlay.path.WebPhase.LISTENING
+            serverState = "TLS enabled · HTTPS/WSS :$port" + assetsState
+            urlRefresh = setup.scheduleWithFixedDelay({
+                try {
+                    val addresses = ipv4Addresses()
+                    receiverUrls = (listOf("localhost") + addresses).map { "https://$it:$port/" }
+                }
+                catch (_: Exception) { /* Retain the last network snapshot. */ }
+            }, 0, 5, TimeUnit.SECONDS)
+        } catch (failure: Exception) {
+            pluginContext.configure(false)
+            webPhase = top.cabinplay.direlay.path.WebPhase.FAILED
+            serverFailureSinceMillis = System.currentTimeMillis()
+            serverReason = webStartReason(failure, port)
+            connectionLog.event("relay", "web_failed", "reason=$serverReason by=local cause=connect_failed " +
+                "next=${if (!closed && webEnabled) "retry" else "stop"} nextInMs=${if (!closed && webEnabled) webStartRetryDelay(bindAttempt).toString() else "-"}" +
+                top.cabinplay.direlay.logs.quotedDetail(redactFailureMessage("${failure.javaClass.simpleName}: ${failure.message.orEmpty()}")))
+            val root = generateSequence<Throwable>(failure) { it.cause }.last()
+            val reason = "$serverReason: ${root.javaClass.name}: ${root.message}"
+            if (reason != lastWebFailure) {
+                Log.w("CabinPlay Relay", "Web receiver start failed: $reason", failure)
+                lastWebFailure = reason
+            }
+            serverState = "Web receiver unavailable: ${failureText(failure, ::redactFailureMessage)}"
+            receiverUrls = emptyList()
+            urlRefresh?.cancel(false)
+            urlRefresh = null
+            web?.let { hub.removeOutput(it.id) }
+            web = null
+            if (!closed && webEnabled) {
+                bindRetry = setup.schedule({ startWeb((bindAttempt + 1).coerceAtMost(4)) },
+                    webStartRetryDelay(bindAttempt), TimeUnit.MILLISECONDS)
+            }
+        } finally { webStarting = false }
+    }
+
+    private fun installReceiver(): File {
+        val version = context.packageManager.getPackageInfo(context.packageName, 0).let {
+            "${it.versionCode}:${it.lastUpdateTime}"
+        }
+        val root = File(context.filesDir, "web")
+        if (preferences.getString("receiverVersion", null) == version && File(root, "receiver/index.html").isFile) return root
+        val staging = File(context.filesDir, "web-staging")
+        check(!staging.exists() || staging.deleteRecursively()) { "Could not clear receiver staging" }
+        check(staging.mkdirs()) { "Could not create receiver staging" }
+        fun copy(asset: String, target: File) {
+            val children = context.assets.list(asset).orEmpty()
+            if (children.isNotEmpty()) {
+                check(target.isDirectory || target.mkdirs())
+                children.forEach { copy("$asset/$it", File(target, it)) }
+            } else {
+                context.assets.open(asset).use { source -> target.outputStream().use { source.copyTo(it) } }
+            }
+        }
+        context.assets.list("web").orEmpty().forEach { copy("web/$it", File(staging, it)) }
+        check(!root.exists() || root.deleteRecursively()) { "Could not replace receiver assets" }
+        check(staging.renameTo(root)) { "Could not install receiver assets" }
+        check(preferences.edit().putString("receiverVersion", version).commit()) { "Could not persist receiver version" }
+        return root
+    }
+
+    private fun restartWeb() {
+        try {
+            setup.execute {
+                synchronized(lifecycle) {
+                    if (closed) return@execute
+                    bindRetry?.cancel(false)
+                    bindRetry = null
+                    urlRefresh?.cancel(false)
+                    urlRefresh = null
+                    receiverUrls = emptyList()
+                    pluginContext.configure(false)
+                    web?.let {
+                        connectionLog.event("relay", "web_stop", "by=local cause=${if (webEnabled) "replaced" else "stopped"}")
+                        hub.removeOutput(it.id)
+                    }
+                    web = null
+                    serverReason = null
+                    webPhase = if (webEnabled) top.cabinplay.direlay.path.WebPhase.STARTING else top.cabinplay.direlay.path.WebPhase.OFF
+                    status.clearWebClients()
+                    serverState = "Starting web receiver…"
+                }
+                startWeb()
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    /** The head-unit page under the public name, while its certificate is valid and the name points at this relay. */
+    fun publicNameUrl(): String? = publicName.status.value.trustedName?.let { "https://$it:${configuredWebPort ?: TlsStore.port(true)}/" }
+
+    fun teslaUrl(): String? {
+        if (!webEnabled || webPhase != top.cabinplay.direlay.path.WebPhase.LISTENING) return null
+        val active = teslaAddress ?: return null
+        val host = if (active.mode.usesTrustedName)
+            publicName.status.value.takeIf { it.address == active.address }?.trustedName
+        else active.address
+        if (host == null) return null
+        return "https://$host:${configuredWebPort ?: TlsStore.port(true)}/"
+    }
+
+    /** One ordering for Home and the running page, including a Wi-Fi Direct-only Tesla session. */
+    fun headUnitUrls(): List<String> {
+        val car = carIpv4
+        val activeAddress = teslaAddress?.address
+        val urls = receiverUrls.filterNot { it.contains("://localhost:") || activeAddress != null && it.contains("://$activeAddress:") }
+            .filter { url -> car.any { url.contains("://$it:") } }
+        val tesla = teslaUrl()
+        return (listOfNotNull(tesla, publicNameUrl()?.takeIf { urls.isNotEmpty() || tesla != null }) + urls).distinct()
+    }
+
+    /**
+     * The car-facing addresses, each marked when it sits on this phone's own hotspot: a tethering
+     * interface is no network of ConnectivityManager (Android 15 may list it as a local-only network).
+     */
+    @Suppress("DEPRECATION")
+    private fun publicNameCandidates(): List<top.cabinplay.direlay.publicname.AddressCandidate> {
+        val car = carIpv4
+        val upstream = runCatching {
+            sharedWifiConnectivity.allNetworks.filter { network ->
+                Build.VERSION.SDK_INT < 35 || sharedWifiConnectivity.getNetworkCapabilities(network)
+                    ?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_LOCAL_NETWORK) != true
+            }.mapNotNull { sharedWifiConnectivity.getLinkProperties(it)?.interfaceName }.toSet()
+        }.getOrNull()
+        val marked = runCatching {
+            NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().flatMap { network ->
+                network.inetAddresses.toList().filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }.filter { it in car }
+                    .map { top.cabinplay.direlay.publicname.AddressCandidate(it, hotspot = upstream != null && network.name !in upstream) }
+            }
+        }.getOrDefault(emptyList())
+        return marked + (car - marked.map { it.address }.toSet()).map { top.cabinplay.direlay.publicname.AddressCandidate(it, false) }
+    }
+
+    /** Without the iPhone link it is the car-facing set: mobile data sits behind the carrier's NAT and is left out too. */
+    private fun ipv4Addresses(includeIphoneLink: Boolean = true): Set<String> {
+        val cellular = if (includeIphoneLink) emptySet() else cellularInterfaces()
+        return NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+            .filter { it.isUp && !it.isLoopback && (includeIphoneLink || !it.name.startsWith("p2p") && it.name !in cellular && !isCellularName(it.name)) }
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>().filter { !it.isLoopbackAddress && !it.isAnyLocalAddress }
+            .mapNotNull { it.hostAddress }.toSortedSet()
+    }
+    private fun isCellularName(name: String) = listOf("rmnet", "ccmni", "v4-rmnet", "pdp", "wwan").any(name::startsWith)
+    @Suppress("DEPRECATION")
+    private fun cellularInterfaces(): Set<String> = runCatching {
+        sharedWifiConnectivity.allNetworks.mapNotNull { network ->
+            val cellular = sharedWifiConnectivity.getNetworkCapabilities(network)
+                ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true
+            if (cellular) sharedWifiConnectivity.getLinkProperties(network)?.interfaceName else null
+        }.toSet()
+    }.getOrDefault(emptySet())
+
+    override fun close() {
+        synchronized(lifecycle) {
+            if (closed) return
+            closed = true
+            connectionLog.phoneDecision(top.cabinplay.direlay.logs.LinkEnd(
+                if (settingsStore.wireless()) "wireless_run" else "usb", "starting", "local", "stopped"), "stop")
+            connectionLog.carlink("decision link=session by=local cause=stopped reached=${carlinkState.lowercase()}", carlinkLogConnection)
+            keepAlive.update(false)
+            teslaSession.close()
+            sharedWifiConnectivity.unregisterNetworkCallback(sharedWifiCallback)
+            publicName.close()
+            adminService.close()
+            sessionController.close()
+            carlinkPictureStopped()
+            carlinkPins.cancel()
+            carlinkLink?.disconnect()
+            collectVehicle = false
+            vehicleRegistration?.close()
+            vehicleRegistration = null
+            carlifeAccessory?.close(); carlifeAccessory = null
+            setup.shutdownNow()
+            pluginContext.close()
+            if (traceCapture.isInitialized()) carlinkMediaCapture.close()
+            if (traceRecorder.isInitialized()) carlinkTraceRecorder.close()
+            carlinkSummary?.close()
+            hub.stop()
+            input.close()
+            // Output close is asynchronous; process-lived diagnostics retain the final callbacks.
+            settingsStore.close()
+        }
+    }
+}

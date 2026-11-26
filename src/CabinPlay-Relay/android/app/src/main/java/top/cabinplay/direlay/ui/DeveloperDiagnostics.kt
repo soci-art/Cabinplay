@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-21
+package top.cabinplay.direlay.ui
+
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import top.cabinplay.direlay.ui.design.*
+import top.cabinplay.direlay.R
+
+@Composable
+fun DeveloperDiagnostics(view: DeveloperView, sample: Boolean, setSample: (Boolean) -> Unit,
+    openVehicle: () -> Unit, reconnect: () -> Unit, copy: (String) -> Unit, enabled: Boolean = true) {
+    SettingsGroup("sample", R.drawable.symbol_car, IconHue.DEVELOPER, stringResource(R.string.dev_sample_vehicle), menuToggleSummary(sample), initiallyExpanded = true, footer = stringResource(R.string.dev_sample_hint)) {
+        SettingsToggleRow(icon = R.drawable.symbol_car, tile = IconHue.DEVELOPER, title = stringResource(R.string.dev_sample_vehicle), checked = sample && enabled, enabled = enabled, onChange = setSample)
+        InsetRow(R.drawable.symbol_car, IconHue.CAR, stringResource(R.string.vehicle_title),
+            stringResource(R.string.dev_sample_open), onClick = openVehicle)
+    }
+    SettingsGroup("runtime", R.drawable.symbol_activity, IconHue.DEVELOPER, stringResource(R.string.dev_runtime), view.rows.firstOrNull()?.let {
+        if (it.valueKey == 0) it.value else stringResource(it.valueKey, *it.valueArguments.toTypedArray())
+    } ?: stringResource(R.string.dev_unavailable), initiallyExpanded = false) {
+        InsetRow(title = stringResource(R.string.dev_connected_clients), value = stringResource(R.string.dev_unavailable))
+        view.rows.forEach { row ->
+            InsetDivider()
+            InsetRow(title = stringResource(row.label, row.argument),
+                value = if (row.valueKey == 0) row.value else stringResource(row.valueKey, *row.valueArguments.toTypedArray()))
+        }
+        OutlinedButton(onClick = reconnect, Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.direlay_carlink_reconnect)) }
+    }
+    SettingsGroup("urls", R.drawable.symbol_globe, IconHue.NETWORK, stringResource(R.string.dev_urls), view.urls.firstOrNull() ?: stringResource(R.string.dev_unavailable), initiallyExpanded = false) {
+        view.urls.forEach { KeyValue(stringResource(R.string.dev_url), it, copy) }
+    }
+}

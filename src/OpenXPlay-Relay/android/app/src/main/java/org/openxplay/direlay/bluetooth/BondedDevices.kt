@@ -1,9 +1,0 @@
-// SPDX-FileCopyrightText: 2026 OpenXPlay.org
-// SPDX-License-Identifier: AGPL-3.0-only
-// Created by riko chen on 2026-10-15
-package org.openxplay.direlay.bluetooth
-
-interface BondedDevices {
-    fun read(): List<BondedDevice>
-    fun localName(): String?
-}

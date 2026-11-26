@@ -1,0 +1,201 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: AGPL-3.0-only
+// Created by riko chen on 2026-10-14
+package top.cabinplay.direlay
+
+import android.app.Application
+import android.app.Activity
+import android.app.ActivityOptions
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Display
+import com.shilapi.xcertplay.AirPlayPersistence
+import com.shilapi.xcertplay.airplay.MediaSinkDecorator
+import com.shilapi.xcertplay.airplay.MediaSinkDecoratorProvider
+import top.cabinplay.direlay.admin.AndroidBluetoothVisibility
+import top.cabinplay.direlay.admin.PairingWindow
+import top.cabinplay.direlay.bridge.StreamBridgeSink
+import top.cabinplay.direlay.bridge.toScreenSessionPolicy
+import top.cabinplay.direlay.presentation.sampledPathInput
+import top.cabinplay.direlay.relay.RelayRuntime
+import top.cabinplay.direlay.service.AndroidRelayKeepAlive
+
+class DiRelayApplication : Application(), com.shilapi.xcertplay.orchestration.CarPlayEventObserverProvider, com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider, com.shilapi.xcertplay.airplay.ScreenSessionPolicyProvider, MediaSinkDecoratorProvider, com.shilapi.xcertplay.CarPlayCanvasProvider, com.shilapi.xcertplay.CarPlayViewAreaProvider, com.shilapi.xcertplay.CarPlayPhoneProvider, com.shilapi.xcertplay.CarPlayHostOverlayProvider, com.shilapi.xcertplay.orchestration.CarPlayHostUiHandler {
+    lateinit var runtime: RelayRuntime
+        private set
+    lateinit var keepAlive: AndroidRelayKeepAlive
+        private set
+
+    override val wirelessNetworkRecoveryEnabled: Boolean
+        get() = ::runtime.isInitialized && runtime.settingsStore.snapshot.value?.experimental?.effective()?.recoverWirelessNetwork == true
+
+    private fun startupOptions() = if (::runtime.isInitialized) runtime.settingsStore.snapshot.value?.experimental?.effective() else null
+    override val cancelRecoveredRetries: Boolean get() = startupOptions()?.cancelRecoveredRetries == true
+    override val iapChannelOnlyWhenOffered: Boolean get() = startupOptions()?.iapChannelWhenOffered == true
+    override val releaseBluetoothOnHandoffRequest: Boolean get() = startupOptions()?.releaseBluetoothOnRequest == true
+    override val awaitIphoneReconnect: Boolean get() = startupOptions()?.awaitIphoneReconnect == true
+    override val startupDiagnosticsEnabled: Boolean get() = startupOptions()?.startupDiagnostics == true
+    override val networkObservationBackoffEnabled: Boolean get() = startupOptions()?.networkObservationBackoff == true
+
+    override val screenSessionPolicy: com.shilapi.xcertplay.airplay.ScreenSessionPolicy
+        get() = (startupOptions() ?: top.cabinplay.direlay.settings.ExperimentalOptions()).toScreenSessionPolicy()
+
+    override val carPlayEventObserver: com.shilapi.xcertplay.orchestration.CarPlayEventObserver?
+        get() = if (::runtime.isInitialized) top.cabinplay.direlay.relay.CompositeCarPlayObserver(
+            runtime.carPlayDiagnostics,
+            runtime.pluginContext.takeIf { runtime.settingsStore.snapshot.value?.plugins == true },
+            stage = runtime.carPlayStage,
+            link = runtime.iphoneLink,
+            startup = runtime.startupObserver,
+        ) else null
+
+    private var networkTimeline: top.cabinplay.direlay.logs.NetworkTimeline? = null
+    private var watchdog: top.cabinplay.direlay.logs.RelayWatchdog? = null
+    @Volatile private var connectionContext: top.cabinplay.direlay.logs.AndroidConnectionContext? = null
+    @Volatile private var startedActivities = 0
+    override fun onCreate() {
+        val connectionLog = top.cabinplay.direlay.logs.ConnectionLog(journal = top.cabinplay.direlay.logs.TimelineJournal({
+            java.io.File(noBackupFilesDir, "timeline-journal")
+        }), context = {
+            connectionContext?.snapshot()?.line() ?: top.cabinplay.direlay.logs.ConnectionContext().line()
+        })
+        connectionLog.event("relay", "process_start")
+        super.onCreate()
+        installOutOfMemoryDump()
+        keepAlive = AndroidRelayKeepAlive(this)
+        runtime = RelayRuntime(this, pairing = PairingWindow(AndroidBluetoothVisibility(this, ::showRelayScreen)),
+            keepAlive = keepAlive, connectionLog = connectionLog)
+        connectionContext = top.cabinplay.direlay.logs.AndroidConnectionContext(this,
+            target = { runtime.iphoneSelection().address },
+            active = { runtime.autoStartSessions.tracker.running }).also { it.start() }
+        // Log recording must never stop the relay itself.
+        if (android.os.Build.VERSION.SDK_INT < 28 || Application.getProcessName() == packageName) runCatching {
+            runtime.logs.start()
+            connectionLog.event("relay", "recorder_start")
+            networkTimeline = top.cabinplay.direlay.logs.NetworkTimeline(this, connectionLog).also { it.start() }
+            val stallWatch = { runtime.settingsStore.snapshot.value?.experimental?.effective()?.stallWatchdog }
+            runtime.logs.recorder.watchSilence = { stallWatch() == true }
+            val watched = top.cabinplay.direlay.logs.RelayWatchdog(this, connectionLog, runtime::tickAge,
+                facts = { runtime.watchFacts() + ("visible" to (startedActivities > 0).toString()) }, pathLine = ::watchedPathLine,
+                enabled = stallWatch)
+            watchdog = watched.also { it.start() }
+            runtime.logs.details = { "Wi-Fi with hotspot: ${runtime.radioFacts()}\n" + watched.details() }
+        }
+            .onFailure { android.util.Log.e("OXP-Logs", "Log recorder unavailable", it) }
+        runtime.carlinkPins.onPending = { showPendingPin() }
+        runtime.carlinkPins.onCancel = runtime::cancelCarlinkPairing
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) { foreground = activity; showPendingPin() }
+            override fun onActivityPaused(activity: Activity) { if (foreground === activity) foreground = null }
+            override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) { visibility(activity, +1) }
+            override fun onActivityStopped(activity: Activity) { visibility(activity, -1) }
+            override fun onActivitySaveInstanceState(activity: Activity, state: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) { if (foreground === activity) foreground = null }
+        })
+        connectionLog.event("relay", "app_ready")
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder()
+                .detectDiskReads().detectDiskWrites().detectCustomSlowCalls().penaltyLog().build())
+        }
+    }
+
+    /** Started activities, not resumed ones: a dialog or the notification shade does not hide the app. */
+    private fun visibility(activity: Activity, change: Int) {
+        startedActivities = (startedActivities + change).coerceAtLeast(0)
+        runtime.connectionLog.transition("relay", "visibility", if (startedActivities > 0) "app_visible" else "app_hidden",
+            "activity=${activity.javaClass.simpleName}")
+    }
+
+    /** The connection path as Home would show it, sampled by the watchdog off the main thread. */
+    private fun watchedPathLine(): String? {
+        val settings = runtime.settingsStore.snapshot.value ?: return null
+        val version = packageManager.getPackageInfo(packageName, 0).versionName.orEmpty()
+        return top.cabinplay.direlay.path.presentPath(runtime.sampledPathInput(this, settings, null, null, version)).diagnostic
+    }
+
+    override fun onHostUiRequested(): Boolean {
+        if (::runtime.isInitialized) runtime.input.hostUiRequested()
+        return true
+    }
+
+    override fun carPlayHostOverlay(activity: androidx.activity.ComponentActivity): android.view.View? =
+        top.cabinplay.direlay.presentation.createCarPlayHostOverlay(activity, runtime)
+
+    override fun carPlayPhoneAddress(): String? {
+        val settings = runtime.settingsStore.awaitSnapshot()
+        runtime.refreshIphoneBonds()
+        return runtime.iphoneSelection(settings.iphoneAddress).address
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    @Volatile private var foreground: Activity? = null
+    private fun showPendingPin() {
+        main.post { if (runtime.carlinkPins.pending != null) bringRelayActivity() }
+    }
+
+    /** Any thread: brings the relay screen forward for a Bluetooth pairing prompt; false in the background. */
+    private fun showRelayScreen(): Boolean {
+        if (foreground == null) return false
+        main.post(::bringRelayActivity)
+        return true
+    }
+
+    private fun bringRelayActivity() {
+        val activity = foreground ?: return
+        if (activity is RelayActivity || activity.isFinishing) return
+        // The DiPlay host may be on a virtual display; pairing always belongs on the relay screen.
+        runCatching {
+            activity.startActivity(RelayActivity.intent(activity),
+                ActivityOptions.makeBasic().setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle())
+        }
+    }
+
+    /** CarPlay draws at the car's size (Automatic or a fixed profile), not the relay phone's window. */
+    override fun carPlayCanvas(): Pair<Int, Int>? = runtime.carPlayScreen?.profile?.let { it.width to it.height }
+
+    override fun carPlayViewAreas(canvasWidth: Int, canvasHeight: Int): List<com.shilapi.xcertplay.airplay.AirPlayViewArea>? =
+        runtime.planViewAreas(canvasWidth, canvasHeight)?.map { com.shilapi.xcertplay.airplay.AirPlayViewArea(it.width, it.height) }
+
+    override val mediaSinkDecorator = MediaSinkDecorator { sink, control ->
+        runtime.prepareCarPlay()
+        // Local preview stays a DiPlay sink, never a ProjectionOutput: its relay-phone display
+        // must not participate in Stream's primary-output selection, even when preview is enabled.
+        StreamBridgeSink(runtime.input, sink, control,
+            playAudioLocally = { runtime.playCarPlayAudio },
+            microphoneSource = { runtime.microphoneSource },
+            localPreview = { runtime.localPreview },
+            fpsHint = { runtime.appliedFrameRate.value.toDouble() },
+            reportInvalid = runtime::reportInvalidVideo,
+        )
+    }
+
+    override fun onTerminate() {
+        if (android.os.Build.VERSION.SDK_INT < 28 || Application.getProcessName() == packageName) runCatching { runtime.logs.recorder.close() }
+        runCatching { networkTimeline?.close() }
+        runCatching { watchdog?.close() }
+        runCatching { connectionContext?.close() }
+        runtime.close()
+        super.onTerminate()
+    }
+
+    /**
+     * Diagnostics (2026-10-15): the heap once grew by ~100 MB/s until OutOfMemoryError, too fast to
+     * sample. Dump the heap once, at the failure, into the app's external files directory (readable
+     * with adb; contains no credentials beyond what the process holds in memory), then crash as before.
+     */
+    private fun installOutOfMemoryDump() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        val dumped = java.util.concurrent.atomic.AtomicBoolean()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            if (generateSequence(error) { it.cause }.any { it is OutOfMemoryError } && dumped.compareAndSet(false, true)) {
+                runCatching {
+                    val dir = getExternalFilesDir(null) ?: return@runCatching
+                    android.os.Debug.dumpHprofData(java.io.File(dir, "oom.hprof").absolutePath)
+                }
+            }
+            previous?.uncaughtException(thread, error)
+        }
+    }
+}

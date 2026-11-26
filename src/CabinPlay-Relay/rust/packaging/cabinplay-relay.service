@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 OpenXPlay.org
+# SPDX-License-Identifier: AGPL-3.0-only
+# Created by riko chen on 2026-10-15
+[Unit]
+Description=CabinPlay wireless CarPlay relay
+# Bluetooth is wanted but not waited for: the relay brings its access point and web pages up
+# first and follows BlueZ until the adapter is ready.
+After=NetworkManager.service
+Wants=bluetooth.service NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+StateDirectory=cabinplay
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=-/usr/lib/cabinplay-relay/clock-guard
+ExecStart=/opt/cabinplay/bin/cabinplay-relay --state-dir /var/lib/cabinplay --identity-dir /var/lib/cabinplay/mfi --oxp-relay /opt/cabinplay/bin/oxp-relay --web-root /opt/cabinplay/share/web --admin-root /opt/cabinplay/share/admin
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

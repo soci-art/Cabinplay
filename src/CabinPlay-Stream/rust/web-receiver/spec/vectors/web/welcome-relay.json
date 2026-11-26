@@ -1,0 +1,16 @@
+{
+  "type": "welcome",
+  "version": 0,
+  "clientId": "browser-1",
+  "session": {
+    "id": "42",
+    "phase": "ACTIVE"
+  },
+  "sourceUrl": "https://github.com/CabinPlay/CabinPlay-Stream",
+  "attribution": "Powered by CabinPlay.",
+  "projectUrl": "https://github.com/CabinPlay/CabinPlay-Stream",
+  "relay": {
+    "name": "CabinPlay Linux",
+    "version": "0.1.3"
+  }
+}

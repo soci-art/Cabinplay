@@ -1,11 +1,11 @@
-# Codemagic cloud build for OpenXPlay iOS (iPhone direct-connect receiver).
+# Codemagic cloud build for CabinPlay iOS (iPhone direct-connect receiver).
 # Builds an UNSIGNED .ipa on a Codemagic Mac: first the Rust receiver core
 # (oxp-ios, aarch64-apple-ios), then the SwiftUI app via XcodeGen.
 # No Apple account or signing secret is required; sign the IPA yourself.
-# Place this file at the repository root (next to OpenXPlay-iOS/ and src/).
+# Place this file at the repository root (next to CabinPlay-iOS/ and src/).
 workflows:
   ios-unsigned:
-    name: OpenXPlay iOS unsigned IPA
+    name: CabinPlay iOS unsigned IPA
     instance_type: mac_mini_m2
     max_build_duration: 60
     environment:
@@ -22,7 +22,7 @@ workflows:
       - name: Build Rust receiver core for iOS
         script: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          cd OpenXPlay-iOS
+          cd CabinPlay-iOS
           ./scripts/build-rust-ios.sh
           ls -lh generated/
       - name: Generate Xcode project
@@ -30,13 +30,13 @@ workflows:
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen
           fi
-          cd OpenXPlay-iOS
+          cd CabinPlay-iOS
           xcodegen generate
       - name: Build unsigned app
         script: |
-          cd OpenXPlay-iOS
-          xcodebuild -project OpenXPlay.xcodeproj \
-            -scheme OpenXPlay \
+          cd CabinPlay-iOS
+          xcodebuild -project CabinPlay.xcodeproj \
+            -scheme CabinPlay \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -derivedDataPath build \
@@ -45,14 +45,14 @@ workflows:
             CODE_SIGN_IDENTITY=""
       - name: Check app bundle contents
         script: |
-          APP="OpenXPlay-iOS/build/Build/Products/Release-iphoneos/OpenXPlay.app"
+          APP="CabinPlay-iOS/build/Build/Products/Release-iphoneos/CabinPlay.app"
           ls -lh "$APP"
           echo "--- identity files in bundle ---"
           find "$APP" -name "identity.pk8" -o -name "certificate.p7b"
       - name: Package unsigned IPA
         script: |
           mkdir -p Payload
-          cp -r "OpenXPlay-iOS/build/Build/Products/Release-iphoneos/OpenXPlay.app" Payload/
-          zip -r OpenXPlay-unsigned.ipa Payload
+          cp -r "CabinPlay-iOS/build/Build/Products/Release-iphoneos/CabinPlay.app" Payload/
+          zip -r CabinPlay-unsigned.ipa Payload
     artifacts:
-      - OpenXPlay-unsigned.ipa
+      - CabinPlay-unsigned.ipa
