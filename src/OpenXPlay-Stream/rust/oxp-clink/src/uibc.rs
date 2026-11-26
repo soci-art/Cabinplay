@@ -45,16 +45,16 @@ impl TouchCalSource {
     }
 }
 
-/// 触控换算模式（设置页三档，取证用）：Calibrated 是现状（有校准
-/// 按矩形、没有走居中模型）；Centered 强制居中模型、无视校准记
-/// 录；Passthrough 直通——原始坐标按触控面归一化后原样转发、一
-/// 点不校正。三档在同一台车上各点一轮，日志里原始/换算成对可
-/// 比，哪个模型对一算便知，不再靠猜。
+/// 触控换算模式：取证三档（直通/居中/按校准）已完成使命——车主
+/// 实测居中模型最准并定稿，校准功能整套撤销。现行口径：默认就是
+/// Centered，宿主 FFI 也已钉死居中，任何路径都回不到按校准/直
+/// 通。Passthrough/Calibrated 两个变体只作核心内部的历史换算路
+/// 径保留（各自有单测锚住行为），App 层不再能选中它们。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TouchMode {
     Passthrough,
-    Centered,
     #[default]
+    Centered,
     Calibrated,
 }
 
@@ -707,6 +707,9 @@ mod tests {
     /// Per-car calibration (the UNI-V preset shape: picture flush right,
     /// full height on a 1920×720 surface): the rect edges map to 0/1 and
     /// the rect center maps to 0.5, replacing the centered drift model.
+    /// The mode is named explicitly: the TouchMode default changed from
+    /// Calibrated to Centered when calibration was retired app-side,
+    /// and this test anchors the Calibrated path itself, not the default.
     #[test]
     fn calibration_rect_maps_edges_and_center() {
         let state = Arc::new(Mutex::new(TouchCalState {
@@ -719,6 +722,7 @@ mod tests {
                 },
                 TouchCalSource::Preset,
             )),
+            mode: TouchMode::Calibrated,
             capture: false,
             ..Default::default()
         }));

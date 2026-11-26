@@ -413,20 +413,16 @@ pub extern "C" fn clink_set_touch_capture(enabled: u32) {
     });
 }
 
-/// Set the touch conversion mode (settings three-way switch, for
-/// model evidence gathering): 0 = passthrough (raw, no correction),
-/// 1 = centered drift model, anything else = calibrated (preset or
-/// manual rectangle, falling back to centered). Default is
-/// calibrated. Takes effect immediately; the switch itself is logged.
+/// Touch conversion mode entry point. The evidence-gathering three-
+/// way switch is retired: the owner tested all three models on device,
+/// the centered model won, and calibration was removed app-side. The
+/// mode is therefore pinned to Centered here — the argument is kept
+/// only for ABI compatibility and ignored, so no caller can select
+/// passthrough or calibrated ever again. The pin itself is logged.
 #[no_mangle]
-pub extern "C" fn clink_set_touch_mode(mode: u32) {
-    let mode = match mode {
-        0 => oxp_clink::uibc::TouchMode::Passthrough,
-        1 => oxp_clink::uibc::TouchMode::Centered,
-        _ => oxp_clink::uibc::TouchMode::Calibrated,
-    };
-    touch_cal_state().lock().unwrap().mode = mode;
-    log(&format!("触控模式已切换：{}（立即生效）", mode.label()));
+pub extern "C" fn clink_set_touch_mode(_mode: u32) {
+    touch_cal_state().lock().unwrap().mode = oxp_clink::uibc::TouchMode::Centered;
+    log("触控模式已固定为居中模型（校准功能已撤销，不再有可切换的档）");
 }
 
 /// Re-print the touch anchor on demand (Swift calls this once per
