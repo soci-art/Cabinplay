@@ -83,6 +83,26 @@ struct ContentView: View {
     @State private var joiner = UCarNetworkJoiner()
     @State private var joinGeneration = 0
 
+    // clink 候选真连接试序＋被拒重试（流程内部行为，不受用户点按守卫影响）。
+    // 参数：同候选原地重试间隔 2 秒、同候选最多 4 次、单次尝试 8 秒看门狗、
+    // 含候选切换的总预算 30 秒。命中口径：状态走到协商（negotiating）或
+    // 出画（playing）才算；只到配对认证就断的不算（14:03 就是这种）。
+    private static let clinkMaxAttemptsPerCandidate = 4
+    private static let clinkRetryGap: TimeInterval = 2.0
+    private static let clinkAttemptTimeout: TimeInterval = 8.0
+    private static let clinkLoopBudget: TimeInterval = 30.0
+    @State private var clinkCandidates: [String] = []
+    @State private var clinkCandidateIndex = 0
+    @State private var clinkAttemptsOnCandidate = 0
+    @State private var clinkLoopDeadline: Date?
+    @State private var clinkLoopActive = false
+    @State private var clinkAttemptHit = false
+    @State private var clinkAttemptSettled = true
+    @State private var clinkLastError = ""
+    @State private var clinkCallbacksWired = false
+    @State private var clinkRetryWork: DispatchWorkItem?
+    @State private var clinkWatchdogWork: DispatchWorkItem?
+
     var body: some View {
         TabView(selection: $tab) {
             NavigationStack {
@@ -210,41 +230,35 @@ struct ContentView: View {
         return dir.path
     }
 
-    /// 启 clink 前现取现验：车机/本机都必须是合法 IPv4，且本机地址必须
-    /// 是当前某个网卡上真实存在的地址（13:24 实测：空串/旧地址直达 Rust
-    /// 报 invalid IPv4 address syntax）。
-    private func startCarLink() {
-        let carIP = flowCarIP
-        let localIP = flowLocalIP
-        guard UCarNetworkJoiner.isValidIPv4(carIP) else {
-            appendLog("CarLink 启动中止：车机地址「\(carIP)」不是合法 IPv4，不往下传")
-            carLinkDetail = "启动失败：车机地址不合法"
-            return
-        }
-        let currentAddresses = ReceiverConfiguration.localIPv4Addresses()
-        guard UCarNetworkJoiner.isValidIPv4(localIP), currentAddresses.contains(localIP) else {
-            appendLog("CarLink 启动中止：本机地址「\(localIP.isEmpty ? "(空)" : localIP)」不是当前网卡上的真实地址（当前：\(currentAddresses.joined(separator: "、"))），不把空值/旧地址传给核心")
-            carLinkDetail = "启动失败：本机地址已失效，重新走一遍连接流程"
-            return
-        }
-        // 配对码只用蓝牙卡那一个输入框的值；令牌免码轮次字段为空就传空串，
-        // TCP 鉴权走已存配对（QUICK）。
-        let pin = blePin.trimmingCharacters(in: .whitespaces)
-        let clinkPin = pin.count == 6 ? pin : ""
+    /// clink 回调只接一次线：状态既驱动界面，也喂候选试序的成败判定。
+    private func wireCarLinkCallbacks() {
+        guard !clinkCallbacksWired else { return }
+        clinkCallbacksWired = true
         let core = CarLinkCore.shared
-        core.onLog = { appendLog($0) }
+        core.onLog = { line in
+            if line.hasPrefix("CarLink 错误：") { clinkLastError = line }
+            appendLog(line)
+        }
         core.onState = { state in
             carLinkState = state
             carLinkRunning = (state != .idle && state != .ended)
+            if state == .negotiating || state == .playing {
+                markClinkAttemptHit(state)
+            }
             if state == .playing {
-                carLinkDetail = "车机 \(carIP) · 本机 \(localIP) · 正在输出"
+                carLinkDetail = "车机 \(flowCarIP) · 本机 \(flowLocalIP) · 正在输出"
                 // UCar 顺序（CarWith 实证）：57209 鉴权成功之后才经 BLE
                 // …103 回告本机地址。BLE 若已被车机 30 秒看门狗断开，
                 // writeClientAddress 内部会打日志说明，不卡主流程。
-                bleProbe.writeClientAddress(localIP: localIP)
+                bleProbe.writeClientAddress(localIP: flowLocalIP)
             }
             if state == .ended {
-                carLinkDetail = "会话已结束：车机 \(carIP) · 本机 \(localIP)"
+                if clinkLoopActive && !clinkAttemptHit && !clinkAttemptSettled {
+                    settleClinkAttemptFailure(reason: clinkLastError.isEmpty
+                        ? "会话刚启动就结束（没走到协商）" : clinkLastError)
+                } else if !clinkLoopActive {
+                    carLinkDetail = "会话已结束：车机 \(flowCarIP) · 本机 \(flowLocalIP)"
+                }
             }
             // 帧桥：进入出画才推帧（补配置+请求关键帧），离开即停推。
             localSession.carLinkPlayingChanged(state == .playing)
@@ -255,23 +269,161 @@ struct ContentView: View {
         core.onKey = { code, down in
             localSession.keyFromCarLink(code: code, down: down)
         }
-        carLinkRunning = core.start(headUnit: carIP, local: localIP,
+    }
+
+    /// 入网成功后进入候选试序：按入网给的顺序逐个启 clink 真连接试。
+    private func beginClinkAttempts(candidates: [String], localIP: String) {
+        guard !candidates.isEmpty else {
+            appendLog("CarLink 启动中止：没有车机地址候选")
+            carLinkDetail = "启动失败：没有车机地址候选"
+            return
+        }
+        wireCarLinkCallbacks()
+        cancelClinkLoopWork()
+        clinkCandidates = candidates
+        clinkCandidateIndex = 0
+        clinkAttemptsOnCandidate = 0
+        clinkLoopDeadline = Date().addingTimeInterval(Self.clinkLoopBudget)
+        clinkLoopActive = true
+        clinkAttemptHit = false
+        flowLocalIP = localIP
+        appendLog("CarLink 候选试序开始：\(candidates.joined(separator: " → "))——逐个用真连接试（同候选被拒先原地重试，间隔 \(Int(Self.clinkRetryGap)) 秒、最多 \(Self.clinkMaxAttemptsPerCandidate) 次；含切换总预算 \(Int(Self.clinkLoopBudget)) 秒）")
+        runClinkAttempt()
+    }
+
+    /// 启 clink 前现取现验：车机/本机都必须是合法 IPv4，且本机地址必须
+    /// 是当前某个网卡上真实存在的地址（13:24 实测：空串/旧地址直达 Rust
+    /// 报 invalid IPv4 address syntax）。
+    private func runClinkAttempt() {
+        guard clinkLoopActive, !clinkAttemptHit else { return }
+        if let deadline = clinkLoopDeadline, Date() > deadline {
+            abandonClinkAttempts(reason: "\(Int(Self.clinkLoopBudget)) 秒重试预算用完")
+            return
+        }
+        let carIP = clinkCandidates[clinkCandidateIndex]
+        let localIP = flowLocalIP
+        flowCarIP = carIP
+        clinkAttemptsOnCandidate += 1
+        clinkAttemptSettled = false
+        clinkLastError = ""
+        guard UCarNetworkJoiner.isValidIPv4(carIP) else {
+            settleClinkAttemptFailure(reason: "车机地址「\(carIP)」不是合法 IPv4")
+            return
+        }
+        let currentAddresses = ReceiverConfiguration.localIPv4Addresses()
+        guard UCarNetworkJoiner.isValidIPv4(localIP), currentAddresses.contains(localIP) else {
+            // 本机地址失效是全局问题，换候选也没用，整轮放弃。
+            appendLog("CarLink 启动中止：本机地址「\(localIP.isEmpty ? "(空)" : localIP)」不是当前网卡上的真实地址（当前：\(currentAddresses.joined(separator: "、"))），不把空值/旧地址传给核心")
+            carLinkDetail = "启动失败：本机地址已失效，重新走一遍连接流程"
+            clinkLoopActive = false
+            return
+        }
+        carLinkDetail = "车机 \(carIP) · 本机 \(localIP) · 连接中（候选 \(clinkCandidateIndex + 1)/\(clinkCandidates.count) 第 \(clinkAttemptsOnCandidate) 次）"
+        appendLog("CarLink 真连接试候选 \(carIP)（候选 \(clinkCandidateIndex + 1)/\(clinkCandidates.count)，本候选第 \(clinkAttemptsOnCandidate)/\(Self.clinkMaxAttemptsPerCandidate) 次）")
+        // 配对码只用蓝牙卡那一个输入框的值；令牌免码轮次字段为空就传空串，
+        // TCP 鉴权走已存配对（QUICK）。
+        let pin = blePin.trimmingCharacters(in: .whitespaces)
+        let clinkPin = pin.count == 6 ? pin : ""
+        let started = CarLinkCore.shared.start(headUnit: carIP, local: localIP,
                                     pin: clinkPin, stateDir: clinkStateDirectory,
                                     width: UInt32(targetSize.0), height: UInt32(targetSize.1),
                                     deviceID: BleProbe.persistentPhoneId(),
                                     model: BleProbe.deviceMarketName())
-        appendLog(carLinkRunning
+        appendLog(started
             ? "CarLink 已启动：车机 \(carIP)，本机 \(localIP)，配对码 \(clinkPin.isEmpty ? "走已存配对（免码）" : "用蓝牙卡输的码")"
             : "CarLink 启动失败")
-        if !carLinkRunning {
-            carLinkDetail = "启动失败：车机 \(carIP) · 本机 \(localIP)"
+        guard started else {
+            settleClinkAttemptFailure(reason: "clink 启动即失败")
+            return
         }
+        // 单次尝试看门狗：迟迟走不到协商、也不结束，就停掉算失败，
+        // 别把 30 秒预算耗在一次干等上。先置 settled 再停 core——停的
+        // 过程中 core 可能同步回 .ended，回调看到 settled 就不会重复判。
+        let watchdog = DispatchWorkItem { [self] in
+            guard clinkLoopActive, !clinkAttemptHit, !clinkAttemptSettled else { return }
+            clinkAttemptSettled = true
+            clinkWatchdogWork = nil
+            appendLog("CarLink 候选 \(carIP) 本次尝试 \(Int(Self.clinkAttemptTimeout)) 秒没走到协商，停掉算失败")
+            CarLinkCore.shared.stop()
+            decideAfterClinkFailure(reason: "\(Int(Self.clinkAttemptTimeout)) 秒没走到协商（超时）")
+        }
+        clinkWatchdogWork = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.clinkAttemptTimeout, execute: watchdog)
+    }
+
+    /// 命中：状态走到协商/出画，这个候选就是车机地址，试序结束。
+    private func markClinkAttemptHit(_ state: CarLinkCore.State) {
+        guard clinkLoopActive, !clinkAttemptHit else { return }
+        clinkAttemptHit = true
+        clinkAttemptSettled = true
+        clinkWatchdogWork?.cancel()
+        clinkWatchdogWork = nil
+        clinkLoopActive = false
+        appendLog("CarLink 候选 \(flowCarIP) 命中（状态已到「\(state.text)」）——车机地址定为 \(flowCarIP)")
+    }
+
+    /// 本次尝试判失败的入口：置 settled、撤看门狗，再走统一决策。
+    private func settleClinkAttemptFailure(reason: String) {
+        guard clinkLoopActive, !clinkAttemptHit, !clinkAttemptSettled else { return }
+        clinkAttemptSettled = true
+        clinkWatchdogWork?.cancel()
+        clinkWatchdogWork = nil
+        decideAfterClinkFailure(reason: reason)
+    }
+
+    /// 失败决策（settled 已置位）：同候选先原地重试（间隔 2 秒、最多
+    /// 4 次），用满再换下一个候选；候选与预算都用完才整轮放弃。
+    private func decideAfterClinkFailure(reason: String) {
+        let candidate = clinkCandidates[clinkCandidateIndex]
+        appendLog("CarLink 候选 \(candidate) 第 \(clinkAttemptsOnCandidate) 次没成：\(reason)")
+        if let deadline = clinkLoopDeadline, Date() > deadline {
+            abandonClinkAttempts(reason: "\(Int(Self.clinkLoopBudget)) 秒重试预算用完")
+            return
+        }
+        if clinkAttemptsOnCandidate < Self.clinkMaxAttemptsPerCandidate {
+            appendLog("CarLink \(Int(Self.clinkRetryGap)) 秒后原地重试候选 \(candidate)（车机鉴权口可能刚被占/还没重开）")
+            scheduleClinkNext(after: Self.clinkRetryGap) { runClinkAttempt() }
+        } else if clinkCandidateIndex + 1 < clinkCandidates.count {
+            let next = clinkCandidates[clinkCandidateIndex + 1]
+            appendLog("CarLink 候选 \(candidate) 重试 \(Self.clinkMaxAttemptsPerCandidate) 次都没成，换下一个候选 \(next)")
+            clinkCandidateIndex += 1
+            clinkAttemptsOnCandidate = 0
+            scheduleClinkNext(after: 1.0) { runClinkAttempt() }
+        } else {
+            abandonClinkAttempts(reason: "所有候选都试满了")
+        }
+    }
+
+    private func scheduleClinkNext(after delay: TimeInterval, _ action: @escaping () -> Void) {
+        clinkRetryWork?.cancel()
+        let work = DispatchWorkItem { action() }
+        clinkRetryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func abandonClinkAttempts(reason: String) {
+        guard clinkLoopActive else { return }
+        clinkLoopActive = false
+        cancelClinkLoopWork()
+        appendLog("CarLink 全部候选与重试都失败了（\(reason)；试过 \(clinkCandidates.joined(separator: "、"))）——这一轮停在这里，把日志发回来看")
+        carLinkDetail = "连接失败：车机地址都试过了（\(reason)）"
+    }
+
+    private func cancelClinkLoopWork() {
+        clinkRetryWork?.cancel()
+        clinkRetryWork = nil
+        clinkWatchdogWork?.cancel()
+        clinkWatchdogWork = nil
     }
 
     private func stopCarLink() {
         joiner.cancel()
         joinGeneration += 1
         joinPhase = .idle
+        // 候选试序一并停：撤掉待发的重试与看门狗，别在用户断开后又自己启。
+        clinkLoopActive = false
+        clinkAttemptSettled = true
+        cancelClinkLoopWork()
         CarLinkCore.shared.stop()
         carLinkRunning = false
         carLinkState = .idle
@@ -296,6 +448,10 @@ struct ContentView: View {
             appendLog("UCar 连接：CarLink 已在跑，这份 ServerInfo 不重复启流程")
             return
         }
+        if clinkLoopActive {
+            appendLog("UCar 连接：CarLink 正在逐个候选真连接尝试中，这份 ServerInfo 不重复启流程")
+            return
+        }
         if joinPhase == .joining {
             appendLog("UCar 连接：组网已在进行中，这份 ServerInfo 不重复触发")
             return
@@ -314,9 +470,8 @@ struct ContentView: View {
                 return
             }
             joinPhase = .idle
-            flowCarIP = result.carIP
             flowLocalIP = result.localIP
-            carLinkDetail = "车机 \(result.carIP) · 本机 \(result.localIP) · 正在鉴权"
+            carLinkDetail = "本机 \(result.localIP) · 正在连接车机"
             // 入网换了本机 IP：本机 CarPlay 会话还绑在旧地址上就重开一次
             // （单 Wi-Fi 接口的必经之路，不是故障）。
             if localSession.isRunning, localSession.boundAddress != result.localIP {
@@ -324,7 +479,8 @@ struct ContentView: View {
                 stopLocalSession()
                 startLocalSession()
             }
-            startCarLink()
+            // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选）。
+            beginClinkAttempts(candidates: result.candidates, localIP: result.localIP)
         }
     }
 

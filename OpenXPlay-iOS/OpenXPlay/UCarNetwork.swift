@@ -23,11 +23,13 @@
 //
 // 车机地址不再写死：入网后按实际网段推导候选——ServerInfo 的 ipAddress
 // （有才算）→ 本机新网段的 .1（DHCP 网关惯例）→ 192.168.49.1（P2P 组主
-// 恒定地址，与首选不同才试）；逐个实连 57209，谁先通谁是车机地址，
-// 推导与每个候选的连接结果全打日志。
+// 恒定地址，与首选不同才试）。候选只负责排序，逐个由上层用 clink 真
+// 连接去试（14:03 真机日志教训：曾用 NWConnection 只连不发数据的试探
+// 连接选地址，试探连通后紧接着 clink 真连接被 Connection refused——
+// 疑似试探连接占掉了车机鉴权口的唯一连接名额，试探一断车机就关口。
+// 从此禁止任何对 57209 的裸 TCP 试探）。
 
 import Foundation
-import Network
 import NetworkExtension
 import SystemConfiguration.CaptiveNetwork
 
@@ -38,7 +40,9 @@ final class UCarNetworkJoiner {
 
     struct Result {
         let localIP: String
-        let carIP: String
+        /// 车机地址候选（已排序、已去重）：由上层逐个启 clink 真连接试，
+        /// 谁先走到协商/出画谁就是车机地址。本类不再做任何 TCP 试探。
+        let candidates: [String]
     }
 
     private var pollTimer: Timer?
@@ -51,8 +55,7 @@ final class UCarNetworkJoiner {
     /// apply 回了 alreadyAssociated：系统认定已连在目标网络上，轮询时可
     /// 直接采信当前地址（SSID 读不到时这是唯一的「已入网」证据）。
     private var applyClaimedAssociated = false
-    private var probing = false
-    private var activeProbe: PortProbe?
+    private var didJoin = false
     private var completion: ((Result?) -> Void)?
     private var finished = false
 
@@ -64,8 +67,6 @@ final class UCarNetworkJoiner {
     func cancel() {
         pollTimer?.invalidate()
         pollTimer = nil
-        activeProbe?.cancel()
-        activeProbe = nil
         completion = nil
         finished = true
     }
@@ -124,7 +125,7 @@ final class UCarNetworkJoiner {
         cancel()
         finished = false
         warnedSlow = false
-        probing = false
+        didJoin = false
         applyClaimedAssociated = false
         self.completion = completion
 
@@ -200,7 +201,7 @@ final class UCarNetworkJoiner {
     }
 
     private func pollOnce() {
-        guard !finished, !probing else { return }
+        guard !finished, !didJoin else { return }
         let addresses = Self.en0Addresses()
         let ssidNow = Self.currentSSID()
         let newAddresses = addresses.filter {
@@ -248,10 +249,13 @@ final class UCarNetworkJoiner {
         }
     }
 
-    /// 已确认入网：停轮询，按实际网段推导车机地址候选并逐个实连 57209。
+    /// 已确认入网：停轮询，按实际网段推导车机地址候选（排序后交给上层）。
+    /// 注意：这里不再对候选做任何 TCP 试探——14:03 日志里 NWConnection
+    /// 的试探连接疑似占掉了鉴权口的唯一名额，真连接随后被 refused。
+    /// 候选改由上层逐个启 clink 真连接试，谁先走到协商/出画谁命中。
     private func joined(localIP: String, via: String) {
-        guard !finished, !probing else { return }
-        probing = true
+        guard !finished, !didJoin else { return }
+        didJoin = true
         pollTimer?.invalidate()
         pollTimer = nil
 
@@ -270,44 +274,14 @@ final class UCarNetworkJoiner {
             candidates.append(Self.p2pGroupOwnerIP)
             derivations.append("\(Self.p2pGroupOwnerIP)＝P2P 组主恒定地址")
         }
-        onLog?("UCar 入网：入网成功（依据：\(via)），本机地址 \(localIP)。车机地址候选依次实连 57209 试：\(derivations.joined(separator: "；"))")
+        onLog?("UCar 入网：入网成功（依据：\(via)），本机地址 \(localIP)。车机地址候选（按此顺序由 CarLink 真连接逐个试，不再试探）：\(derivations.joined(separator: "；"))")
         guard !candidates.isEmpty else {
             onLog?("UCar 入网：推不出任何车机地址候选，入网判失败")
             onStatus?("入网失败：推不出车机地址")
             finish(nil)
             return
         }
-        probeCandidate(index: 0, candidates: candidates, localIP: localIP)
-    }
-
-    /// 逐个候选实连 57209：谁先通谁是车机地址；全不通则用首选候选启
-    /// CarLink 让核心自己连（车机可能还没起监听，探测不通不等于地址错）。
-    private func probeCandidate(index: Int, candidates: [String], localIP: String) {
-        guard !finished else { return }
-        guard index < candidates.count else {
-            let fallback = candidates[0]
-            onLog?("UCar 入网：车机地址候选全部试连 57209 不通，先用首选 \(fallback) 启 CarLink 让核心自己连（推导与探测结果都在上面几行）")
-            finish(localIP: localIP, carIP: fallback)
-            return
-        }
-        let candidate = candidates[index]
-        onLog?("UCar 入网：试连车机地址候选 \(candidate):57209（第 \(index + 1)/\(candidates.count) 个）…")
-        let probe = PortProbe(host: candidate, port: 57209, timeout: 2.5) { [weak self] ok, note in
-            guard let self, !self.finished else { return }
-            self.activeProbe = nil
-            if ok {
-                self.onLog?("UCar 入网：候选 \(candidate):57209 连通（\(note)）——车机地址定为 \(candidate)")
-                self.finish(localIP: localIP, carIP: candidate)
-            } else {
-                self.onLog?("UCar 入网：候选 \(candidate):57209 不通（\(note)），试下一个")
-                self.probeCandidate(index: index + 1, candidates: candidates, localIP: localIP)
-            }
-        }
-        activeProbe = probe
-    }
-
-    private func finish(localIP: String, carIP: String) {
-        finish(Result(localIP: localIP, carIP: carIP))
+        finish(Result(localIP: localIP, candidates: candidates))
     }
 
     private func finish(_ result: Result?) {
@@ -315,56 +289,8 @@ final class UCarNetworkJoiner {
         finished = true
         pollTimer?.invalidate()
         pollTimer = nil
-        activeProbe?.cancel()
-        activeProbe = nil
         let completion = self.completion
         self.completion = nil
         DispatchQueue.main.async { completion?(result) }
-    }
-}
-
-/// 一次性的 TCP 连通探测：连上（.ready）即通，报错或超时即不通。
-/// 只做 connect 就断开，不发任何数据。
-private final class PortProbe {
-    private var connection: NWConnection?
-    private var done = false
-    private let completion: (Bool, String) -> Void
-
-    init(host: String, port: UInt16, timeout: TimeInterval,
-         completion: @escaping (Bool, String) -> Void) {
-        self.completion = completion
-        let conn = NWConnection(host: NWEndpoint.Host(host),
-                                port: NWEndpoint.Port(rawValue: port) ?? 57209,
-                                using: .tcp)
-        connection = conn
-        conn.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.finish(true, "连接已建立")
-            case .failed(let error):
-                self?.finish(false, "失败：\(error.localizedDescription)")
-            default:
-                break
-            }
-        }
-        conn.start(queue: .main)
-        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
-            self?.finish(false, "\(timeout) 秒没连上")
-        }
-    }
-
-    /// 外部取消：不再回调 completion。
-    func cancel() {
-        done = true
-        connection?.cancel()
-        connection = nil
-    }
-
-    private func finish(_ ok: Bool, _ note: String) {
-        guard !done else { return }
-        done = true
-        connection?.cancel()
-        connection = nil
-        completion(ok, note)
     }
 }
