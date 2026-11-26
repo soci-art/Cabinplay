@@ -14,7 +14,7 @@ import Foundation
 final class BonjourAdvertiser: NSObject, NetServiceDelegate {
     private var service: NetService?
 
-    func start(deviceId: String, port: Int32, model: String = "OpenXPlay iOS") {
+    func start(deviceId: String, port: Int32, model: String = "CabinPlay") {
         stop()
         let txt: [String: Data] = [
             "deviceid": Data(deviceId.utf8),
@@ -25,7 +25,7 @@ final class BonjourAdvertiser: NSObject, NetServiceDelegate {
             "flags": Data("0x4".utf8),
             "pk": Data("0".utf8),
             "pi": Data("b0e9f7d1-3d7a-4d3e-9a44-92c1e2b6c001".utf8),
-            "manufacturer": Data("OpenXPlay".utf8),
+            "manufacturer": Data("CabinPlay".utf8),
         ]
         let service = NetService(domain: "", type: "_airplay._tcp.", name: model, port: port)
         service.delegate = self

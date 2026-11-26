@@ -303,9 +303,9 @@ fn start_inner(
     let pairings: Arc<dyn PairingStore> = Arc::new(MemoryPairings::default());
 
     let mut config = AirPlayConfig::linux_receiver(device_id.to_string(), bt_mac.to_string());
-    config.device_name = "OpenXPlay".to_string();
-    config.model = "OpenXPlay iOS".to_string();
-    config.manufacturer = "OpenXPlay".to_string();
+    config.device_name = "CabinPlay".to_string();
+    config.model = "CabinPlay".to_string();
+    config.manufacturer = "CabinPlay".to_string();
     config.port = if port == 0 { 7000 } else { port };
     config.main = AirPlayDisplayConfig::new(width.max(640), height.max(360));
     config.main.fps = fps.max(30);
