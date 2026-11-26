@@ -139,8 +139,9 @@ final class CarPlayAudio {
                 // playAndRecord 类别下蓝牙 A2DP 连候选资格都没有。
                 // 通话流不掺和：这里从不设 .allowBluetooth（HFP），
                 // 抢不到通话路由，通话维持手机扬声器＋手机麦克风。
-                let needsDuplexCategory = microphone != nil || Self.hasSpeakerOverride
-                    || (routeHasCarAudio && !routeHasA2DP)
+                // 只有真在跑麦克风流才需要双工类别；音乐流一律 .playback，
+                // 否则 playAndRecord + defaultToSpeaker 会把蓝牙 A2DP 挤掉。
+                let needsDuplexCategory = microphone != nil
                 var options: AVAudioSession.CategoryOptions = needsDuplexCategory ? [.defaultToSpeaker] : []
                 options.insert(.allowBluetoothA2DP)
                 if BackgroundKeepAlive.holdsAudioSession { options.insert(.mixWithOthers) }
@@ -150,6 +151,7 @@ final class CarPlayAudio {
                 }
                 try session.setActive(true)
                 Self.installRouteObserverIfNeeded()
+                Self.installInterruptionObserverIfNeeded()
                 Self.routeLogSink = { [weak self] message in self?.onLog?(message) }
                 if let failure = Self.reevaluateRouteOverride(reason: "起播") {
                     Self.deactivateSessionIfIdle()
@@ -178,7 +180,11 @@ final class CarPlayAudio {
                 firstTimestamp = packet.timestamp
                 onLog?(CWL("原生 {1} 播放已开始：{2} Hz，{3} 声道", [String(describing: format.name), String(describing: format.sampleRate), String(describing: format.channels)]))
                 #if os(iOS)
-                onLog?(CWL("音频输出路由：{1}", [String(describing: AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ", "))]))
+                onLog?(CWL("音频输出路由：{1}（模式 {2}，A2DP {3}）", [
+                    AudioOutputPolicy.routeSummary,
+                    AudioOutputPolicy.mode.rawValue,
+                    AudioOutputPolicy.hasA2DP() ? "在线" : "不在线"
+                ]))
                 #endif
             }
             guard let player else { return }
@@ -292,7 +298,8 @@ final class CarPlayAudio {
         let hasCarAudio = outputs.contains { $0.portType == .carAudio }
         let hasA2DP = outputs.contains { $0.portType == .bluetoothA2DP }
         let log = routeLogSink
-        if hasCarAudio && !hasA2DP {
+        let mode = AudioOutputPolicy.mode
+        if AudioOutputPolicy.shouldPinSpeaker(hasCarAudio: hasCarAudio, hasA2DP: hasA2DP) {
             guard !hasSpeakerOverride else { return nil }
             do {
                 try session.overrideOutputAudioPort(.speaker)
@@ -310,9 +317,45 @@ final class CarPlayAudio {
             log?(CWL("音频路由评估（{1}）：路由已离开 CarPlay 独占，松开扬声器钉子，输出按系统路由走", [reason]))
         }
         if hasA2DP {
-            log?(CWL("音频路由评估（{1}）：路由含蓝牙 A2DP，不钉扬声器，放行蓝牙输出", [reason]))
+            log?(CWL("音频路由评估（{1}）：路由含蓝牙 A2DP（{2}），按 {3} 放行车机输出", [reason, AudioOutputPolicy.routeSummary, mode.rawValue]))
+        } else if mode == .bluetooth {
+            log?(CWL("音频路由评估（{1}）：优先蓝牙模式，但当前没有 A2DP（{2}）——请确认车机蓝牙已连上媒体音频", [reason, AudioOutputPolicy.routeSummary]))
         }
         return nil
+    }
+
+    /// 中断（来电、系统抢占）结束后重新激活会话并把播放器接回去；
+    /// 旧实现被中断一次就整场静音，只能重连。
+    private static var interruptionObserverInstalled = false
+
+    private static func installInterruptionObserverIfNeeded() {
+        guard !interruptionObserverInstalled else { return }
+        interruptionObserverInstalled = true
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
+        ) { notification in
+            guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            let log = routeLogSink
+            switch type {
+            case .began:
+                log?(CWL("音频被系统中断（来电/抢占），暂停输出"))
+            case .ended:
+                renderQueue.async {
+                    guard playingStreams > 0 else { return }
+                    let session = AVAudioSession.sharedInstance()
+                    let keepAlive = BackgroundKeepAlive.holdsAudioSession
+                    var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+                    if keepAlive { options.insert(.mixWithOthers) }
+                    try? session.setCategory(.playback, mode: .default, options: options)
+                    try? session.setActive(true)
+                    _ = reevaluateRouteOverride(reason: "中断结束")
+                    log?(CWL("音频中断结束，已重新激活输出（{1}）", [AudioOutputPolicy.routeSummary]))
+                }
+            @unknown default:
+                break
+            }
+        }
     }
 
     /// 路由变化监听（只装一次）：离开 carAudio 落到 A2DP 时松钉、
