@@ -1,3 +1,4 @@
+
 name: build
 
 on:
@@ -21,11 +22,18 @@ jobs:
           rustc -V
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
       - name: oxp-clink tests
-        run: cd src/OpenXPlay-Stream/rust && cargo test -p oxp-clink
-      - name: oxp-clink-ios build
-        run: cd src/OpenXPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
-      - name: oxp-ios build
-        run: cd src/OpenXPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
+        run: |
+          set -o pipefail
+          cd src/OpenXPlay-Stream/rust
+          if ! cargo test -p oxp-clink 2>&1 | tee /tmp/rust.log; then
+            echo "::error::$(tail -n 20 /tmp/rust.log | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          fi
+      - name: rust builds
+        run: |
+          set -o pipefail
+          cd src/OpenXPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
+          cd ../../OpenXPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
 
   ios:
     name: ios-simulator-build
@@ -55,5 +63,9 @@ jobs:
         run: cd OpenXPlay-iOS && xcodegen generate
       - name: Build (no signing)
         run: |
+          set -o pipefail
           cd OpenXPlay-iOS
-          xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          if ! xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee /tmp/xcode.log; then
+            echo "::error::$(grep -E 'error:' /tmp/xcode.log | head -n 4 | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          fi
