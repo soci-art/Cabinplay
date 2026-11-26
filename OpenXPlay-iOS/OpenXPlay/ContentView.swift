@@ -64,6 +64,7 @@ struct ContentView: View {
     @State private var blePin = ""
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
+    @State private var netMonitor: NetworkChangeMonitor?
 
     // 分辨率改自动（不再有手动菜单）：阶梯从高往低，连接时先用这台
     // 车上次协商定案的档（存 UserDefaults），没有就从最高档起步；
@@ -494,6 +495,8 @@ struct ContentView: View {
             }
             if state == .playing {
                 carLinkDetail = "车机 \(flowCarIP) · 本机 \(flowLocalIP) · 正在输出"
+                appendLog(AudioDiagnostics.snapshot(width: targetSize.0, height: targetSize.1))
+                startNetworkMonitorIfNeeded()
                 // 触控定锚防丢：每轮车机会话出画后重打一行（声明几何
                 // ＋当前换算方式）——日志从会话中段导出时，开头那份
                 // 定锚会被 400 行上限滚掉，这一行为中段导出兜底。
@@ -634,6 +637,31 @@ struct ContentView: View {
         }
         clinkWatchdogWork = watchdog
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.clinkAttemptTimeout, execute: watchdog)
+    }
+
+    /// 会话期网络监控：车机热点重启/换网后 clink 会对着旧地址发呆，
+    /// 这里发现地址变了就停掉 clink，用新地址重走候选试序（各带看门狗）。
+    private func startNetworkMonitorIfNeeded() {
+        if netMonitor != nil { return }
+        let monitor = NetworkChangeMonitor()
+        monitor.start { signature in
+            DispatchQueue.main.async {
+                appendLog("网络变化：当前网卡地址变为 [\(signature)]")
+                guard carLinkRunning || clinkLoopActive else { return }
+                let current = ReceiverConfiguration.localIPv4Addresses()
+                guard let local = current.first(where: { UCarNetworkJoiner.isValidIPv4($0) }) else {
+                    appendLog("网络变化：拿不到可用的本机地址，暂不重连")
+                    return
+                }
+                appendLog("网络变化：停掉当前 CarLink，用新地址 \(local) 重走候选试序")
+                CarLinkCore.shared.stop()
+                carLinkState = .idle
+                carLinkRunning = false
+                flowLocalIP = local
+                beginClinkAttempts(candidates: clinkCandidates, localIP: local)
+            }
+        }
+        netMonitor = monitor
     }
 
     /// 命中：状态走到协商/出画，这个候选就是车机地址，试序结束。
@@ -873,7 +901,7 @@ struct ContentView: View {
     private func appendLog(_ line: String) {
         let stamp = DateFormatter.logFormatter.string(from: Date())
         log.append("[\(stamp)] \(line)")
-        if log.count > 400 { log.removeFirst(log.count - 400) }
+        if log.count > 1200 { log.removeFirst(log.count - 1200) }
     }
 }
 
