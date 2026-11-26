@@ -73,6 +73,19 @@ final class BleProbe: NSObject, ObservableObject {
         }
     }
 
+    /// 连接流程是否正在跑（防重复触发）：凭据已就位且阶段在连接/写
+    /// ClientInfo/等 ServerInfo/已拿到 ServerInfo 之一。失败（.failed）
+    /// 不算在跑——允许用户改码重试；断线处理会把凭据清掉让重连走干净路径。
+    private var flowInProgress: Bool {
+        guard flowCredential != nil else { return false }
+        switch flowPhase {
+        case .connecting, .writingClientInfo, .waitingServerInfo, .gotServerInfo:
+            return true
+        case .idle, .found, .failed:
+            return false
+        }
+    }
+
     /// 用户点「连接车机」时暂存的配对码；服务就绪后据此写 ClientInfo。
     private var pendingPin: String?
     /// 本轮写进 ClientInfo 的凭据：输码连接时就是配对码，免码重连时是已存令牌。
@@ -356,6 +369,14 @@ final class BleProbe: NSObject, ObservableObject {
 
     /// 凭据与 type 候选链就位后，真正跑连接流程（输码/令牌共用）。
     private func beginFlow(peripheral: CBPeripheral, credentialDescription: String) {
+        // 防重复触发（13:50 实测教训）：入网等待期间用户又点了一次「连接
+        // 车机」，beginFlow 重入把 clientInfoWritten/阶段全部重置，还对着
+        // 已到手的 ServerInfo 反复试写 ClientInfo，日志刷出一串误导性的
+        // 「条件未齐」。流程在跑时直接忽略，不重入、不重置状态机。
+        if flowInProgress {
+            log("UCar 连接：连接流程已在进行中（当前阶段：\(flowPhaseText)），忽略这次重复触发——不重入、不重置，等这一轮走完或失败再连")
+            return
+        }
         clientInfoWritten = false
         clientInfoWriteRetried = false
         // type 候选链（CarWith y8/h.java M() 口径）：type 是手机声明的协议代际，
@@ -413,22 +434,26 @@ final class BleProbe: NSObject, ObservableObject {
 
     /// 服务发现完成、…102 订阅就绪（已确认或已请求）且用户已输码时，写 ClientInfo。
     private func maybeWriteClientInfo() {
-        guard let credential = flowCredential, !clientInfoWritten, lastServerInfo == nil,
-              let char = charClientInfo, let peripheral = target,
-              peripheral.state == .connected else {
-            if flowCredential != nil, !clientInfoWritten {
-                let missing: String
-                if charClientInfo == nil {
-                    missing = "…101（ClientInfo）特征还没发现"
-                } else if target == nil {
-                    missing = "没有目标车机（target 为空）"
-                } else if target?.state != .connected {
-                    missing = "蓝牙还没连上（state=\(target?.state.rawValue ?? -1)）"
-                } else {
-                    missing = "条件未齐"
-                }
-                log("UCar 连接：这次没写成 ClientInfo——\(missing)，等后续回调再试")
-            }
+        guard let credential = flowCredential else { return }
+        if clientInfoWritten { return }
+        // ServerInfo 已到手：ClientInfo 这一环已经完成，不需要再写。
+        // 13:50 的「条件未齐」就是从这儿来的：旧 guard 把 lastServerInfo
+        // 混在总条件里，失败诊断又没覆盖这一项，只剩兜底的「条件未齐」，
+        // 看着像条件没凑齐、其实是流程早已越过这一步。现在逐项自报。
+        if lastServerInfo != nil {
+            log("UCar 连接：ServerInfo 已经到手，ClientInfo 不用再写（这一步早已完成，不是条件没齐）")
+            return
+        }
+        guard let char = charClientInfo else {
+            log("UCar 连接：这次没写成 ClientInfo——…101（ClientInfo）特征还没发现，等后续回调再试")
+            return
+        }
+        guard let peripheral = target else {
+            log("UCar 连接：这次没写成 ClientInfo——没有目标车机（target 为空），等后续回调再试")
+            return
+        }
+        guard peripheral.state == .connected else {
+            log("UCar 连接：这次没写成 ClientInfo——蓝牙还没连上（state=\(peripheral.state.rawValue)），等后续回调再试")
             return
         }
         guard serverInfoSubscribed || serverInfoNotifyRequested else {
@@ -753,6 +778,17 @@ extension BleProbe: CBCentralManagerDelegate {
                     pendingPin = nil
                     log("UCar 连接：已安排自动重连（第 \(autoReconnectAttempts) 次）——重新开始扫描，扫到车机 \(deviceId) 就用令牌免码连回")
                     start()
+                } else {
+                    // 没安排自动重连（本车 ServerInfo 不带令牌，是常态）：
+                    // 把流程复位到可重试状态，下次点「连接车机」走干净的
+                    // 新一轮；否则阶段停在 gotServerInfo、防重入守卫会把
+                    // 之后每次点按都当重复触发忽略掉。已到手的 ServerInfo
+                    // 与上层入网流程不受影响（lastServerInfo 保留）。
+                    flowCredential = nil
+                    flowUsesToken = false
+                    pendingPin = nil
+                    flowPhase = .found
+                    log("UCar 连接：本轮蓝牙流程就此收尾（无令牌可自动重连）——再点「连接车机」会重新走一轮新的；上层入网/CarLink 不受影响")
                 }
             case .failed:
                 break

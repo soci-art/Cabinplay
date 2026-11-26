@@ -103,6 +103,7 @@ struct ContentView: View {
                     bleHasToken: bleProbe.hasStoredToken,
                     blePhaseText: bleStageText,
                     blePinField: $blePin,
+                    selectedSize: targetSize,
                     onToggleLocalSession: { localSession.isRunning ? stopLocalSession() : startLocalSession() },
                     onSelectSize: { setSize($0, $1) },
                     onDisconnectCarLink: { stopCarLink() },

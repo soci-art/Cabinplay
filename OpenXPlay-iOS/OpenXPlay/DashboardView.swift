@@ -31,6 +31,9 @@ struct DashboardView: View {
 
     @Binding var blePinField: String
 
+    /// 当前生效的分辨率（与 ContentView 的状态实时绑定，菜单打勾用）。
+    let selectedSize: (Int, Int)
+
     let onToggleLocalSession: () -> Void
     let onSelectSize: (Int, Int) -> Void
     let onDisconnectCarLink: () -> Void
@@ -38,6 +41,38 @@ struct DashboardView: View {
     let onConnectBle: () -> Void
 
     @FocusState private var blePinFocused: Bool
+
+    // MARK: 分辨率菜单（勾选与实际生效值绑定）
+
+    private struct ResolutionOption: Identifiable {
+        let width: Int
+        let height: Int
+        var label: String { "\(width)×\(height)" }
+        var id: String { label }
+    }
+
+    private static let resolutionOptions: [ResolutionOption] = [
+        ResolutionOption(width: 854, height: 480),
+        ResolutionOption(width: 1280, height: 720),
+        ResolutionOption(width: 1920, height: 1080),
+    ]
+
+    private func sizeLabel(_ size: (Int, Int)) -> String {
+        "\(size.0)×\(size.1)"
+    }
+
+    /// 菜单内 Picker 的选中值：读的是当前生效分辨率，写回调 onSelectSize
+    /// 更新上层状态——两边共用同一个状态源，勾永远落在实际生效的那一档。
+    private var sizeSelection: Binding<String> {
+        Binding(
+            get: { sizeLabel(selectedSize) },
+            set: { newLabel in
+                if let option = Self.resolutionOptions.first(where: { $0.label == newLabel }) {
+                    onSelectSize(option.width, option.height)
+                }
+            }
+        )
+    }
 
     var body: some View {
         ScrollView {
@@ -93,12 +128,22 @@ struct DashboardView: View {
             .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(alignment: .bottomTrailing) {
                 Menu {
-                    Button("854×480") { onSelectSize(854, 480) }
-                    Button("1280×720") { onSelectSize(1280, 720) }
-                    Button("1920×1080") { onSelectSize(1920, 1080) }
+                    // Picker 放进 Menu 是系统原生的勾选菜单形态：当前生效
+                    // 的那一档自动带勾，且与 selectedSize 实时绑定——切换
+                    // 后重新打开菜单，勾落在新选中的那一档上。
+                    Picker("分辨率", selection: sizeSelection) {
+                        ForEach(Self.resolutionOptions) { option in
+                            Text(option.label).tag(option.label)
+                        }
+                    }
                 } label: {
-                    Image(systemName: "aspectratio")
-                        .frame(width: 38, height: 38)
+                    HStack(spacing: 4) {
+                        Image(systemName: "aspectratio")
+                        Text(sizeLabel(selectedSize))
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 38)
                 }
                 .foregroundStyle(.primary)
                 .background(.ultraThinMaterial, in: Capsule())
