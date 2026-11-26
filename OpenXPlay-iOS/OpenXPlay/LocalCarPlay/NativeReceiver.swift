@@ -21,7 +21,6 @@ final class NativeReceiver {
             if !enabled { self?.localSkipping = false }
         }
     }
-    #endif
     // forceKeyFrame state: throttled sends, resent every second until a keyframe arrives.
     private var keyframeWantedSince: DispatchTime?
     private var keyframeLastSent: DispatchTime?
