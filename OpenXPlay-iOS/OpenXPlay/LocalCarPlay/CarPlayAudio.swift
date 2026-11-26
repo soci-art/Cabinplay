@@ -77,6 +77,12 @@ final class CarPlayAudio {
     private static let renderQueue = DispatchQueue(label: "TDSCarKit.audio", qos: .userInteractive)
     // Audio decoding never blocks the video/RTSP queue. All streams share this queue.
     private static var playingStreams = 0
+    // 通话/语音流在场时暂停音乐：iOS 同一时刻只有一个类别，通话流会把
+    // 类别切到 playAndRecord + 扬声器，音乐留在 A2DP 上会来回跳。
+    private static var telephonyDepth = 0
+    private static let telephonyLock = NSLock()
+    private static let musicInstances = NSHashTable<CarPlayAudio>.weakObjects()
+    private var duplexRegistered = false
     #if os(iOS)
     private static var hasSpeakerOverride = false
     #endif
@@ -100,9 +106,14 @@ final class CarPlayAudio {
             microphone = NativeMicrophone(secret: secret, connectionID: connectionID, address: peerAddress, port: microphonePort, format: format)
         }
         data.onPacket = { [weak self] in self?.receive($0) }
+        // 所有实例都登记；暂停/恢复时只对当前在放音乐的实例生效。
+        Self.musicInstances.add(self)
     }
     private func receive(_ wire: Data) {
         guard active else { return }
+        // 通话/语音期间不接受音乐包：这些包已经过期，排进队列只会在
+        // 通话结束后一次性砸出来。
+        if Self.telephonyDepth > 0, microphone == nil { return }
         do {
             let packet = try cipher.receive(wire)
             let arrival = DispatchTime.now().uptimeNanoseconds / 1000
@@ -173,6 +184,10 @@ final class CarPlayAudio {
                     throw error
                 }
                 playing = true; Self.playingStreams += 1
+                if microphone != nil {
+                    duplexRegistered = true
+                    Self.beginTelephony()
+                }
                 if let microphone {
                     microphone.onLog = onLog
                     DispatchQueue.main.async { microphone.start() }
@@ -269,6 +284,7 @@ final class CarPlayAudio {
         if streamType == 102 {
             onLog?(CWL("音频流 102 接收实例已停，本实例累计收到 {1} 个包", [String(describing: packets)]))
         }
+        if duplexRegistered { duplexRegistered = false; Self.endTelephony() }
         if let microphone { DispatchQueue.main.async { microphone.stop() } }; microphone = nil
         data.stop(); control.stop(); player?.stop(); engine?.stop(); queuedFrames = 0
         if playing {
@@ -322,6 +338,60 @@ final class CarPlayAudio {
             log?(CWL("音频路由评估（{1}）：优先蓝牙模式，但当前没有 A2DP（{2}）——请确认车机蓝牙已连上媒体音频", [reason, AudioOutputPolicy.routeSummary]))
         }
         return nil
+    }
+
+    /// 通话开始：把正在放的音乐暂停，避免类别切换时来回跳。
+    private static func beginTelephony() {
+        telephonyLock.lock()
+        telephonyDepth += 1
+        let first = telephonyDepth == 1
+        telephonyLock.unlock()
+        guard first else { return }
+        for instance in musicInstances.allObjects {
+            instance.suspendForTelephony()
+        }
+        routeLogSink?(CWL("通话开始：音乐暂停"))
+    }
+
+    /// 通话结束：把类别恢复成能走蓝牙的音乐类别，再让音乐继续。
+    private static func endTelephony() {
+        telephonyLock.lock()
+        telephonyDepth = max(0, telephonyDepth - 1)
+        let last = telephonyDepth == 0
+        telephonyLock.unlock()
+        guard last else { return }
+        let session = AVAudioSession.sharedInstance()
+        let keepAlive = BackgroundKeepAlive.holdsAudioSession
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+        if keepAlive { options.insert(.mixWithOthers) }
+        try? session.setCategory(.playback, mode: .default, options: options)
+        try? session.setActive(true)
+        _ = reevaluateRouteOverride(reason: "通话结束")
+        for instance in musicInstances.allObjects {
+            instance.resumeAfterTelephony()
+        }
+        routeLogSink?(CWL("通话结束：音乐恢复，路由 {1}", [AudioOutputPolicy.routeSummary]))
+    }
+
+    fileprivate func suspendForTelephony() {
+        queue.async { [weak self] in
+            guard let self, self.active, let player = self.player else { return }
+            if self.playing {
+                player.pause()
+                self.buffering = true
+                self.queuedFrames = 0
+                self.onLog?(CWL("通话开始：本条音乐已暂停"))
+            }
+        }
+    }
+
+    fileprivate func resumeAfterTelephony() {
+        queue.async { [weak self] in
+            guard let self, self.active, let player = self.player else { return }
+            player.play()
+            self.buffering = false
+            self.onLog?(CWL("通话结束：本条音乐已恢复"))
+        }
     }
 
     /// 中断（来电、系统抢占）结束后重新激活会话并把播放器接回去；
