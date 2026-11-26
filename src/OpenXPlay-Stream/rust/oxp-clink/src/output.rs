@@ -524,17 +524,19 @@ impl ClinkOutput {
             let previous = h.media_stream;
             h.media_formats.retain(|(s, _)| *s != stream);
             if let Some(f) = format.as_ref().filter(|f| f.role == AudioRole::Media) {
+                // 放开采样率/声道：CarLink 车机的 AAC 解码器普遍同时支持
+                // 44.1/48 kHz、单/双声道，旧门槛把 44.1 kHz 的音乐整轮
+                // 拒收，等于把兼容性押在「iPhone 一定给 48 kHz」上。
                 if f.codec == AudioCodec::AacLc
-                    && f.sample_rate == 48000
-                    && f.channels == 2
-                    && f.config.as_deref() == Some(&[0x11, 0x90])
+                    && (8000..=48000).contains(&f.sample_rate)
+                    && (1..=2).contains(&f.channels)
                 {
                     h.media_formats.push((stream, f.clone()));
                 } else {
                     h.diagnostic(format!("unsupported_media_audio:{stream}"));
                     h.diagnostic(format!(
-                        "音频桥：主流声音格式被核心拒收（流 {stream}，{} Hz / {} 声道）——核心只收 AAC-LC 48000 Hz / 2 声道 / 配置 [0x11, 0x90]，这一轮声音送不到车机",
-                        f.sample_rate, f.channels
+                        "音频桥：主流声音格式被核心拒收（流 {stream}，{:?}，{} Hz / {} 声道）——只收 AAC-LC、8–48 kHz、1–2 声道，这一轮声音送不到车机",
+                        f.codec, f.sample_rate, f.channels
                     ));
                 }
             }
@@ -728,7 +730,8 @@ fn media_worker(
     // 选片——见 placeholder::PLACEHOLDER_SIZES 的注释：等待期喂车机
     // 的占位帧是保住车机会话的命脉，缺一档就有一档会在等待期零帧。
     let placeholder_set = PlaceholderSet::new()?;
-    let audio_config = oxp_media::AudioSpecificConfig::new(2, 48000, 2)?;
+    // 声音的 AudioSpecificConfig 不再写死 48 kHz / 2 声道：按当前登记
+    // 的主流格式在建 ADTS 头时现算（见下方 use site）。
     let mut gate = VideoSwitch::default();
     let mut revision = None;
     let mut generation: Option<Arc<ClinkSession>> = None;
@@ -1243,9 +1246,22 @@ fn media_worker(
                     }
                     {
                         let pts = mapped.max(transport_pts).max(0);
+                        let (media_rate, media_channels) = {
+                            let h = run.handoff.lock().unwrap();
+                            h.media_formats
+                                .iter()
+                                .find(|(s, _)| *s == p.stream)
+                                .map(|(_, f)| (f.sample_rate, f.channels))
+                                .unwrap_or((48000, 2))
+                        };
+                        let frame_config = oxp_media::AudioSpecificConfig::new(
+                            2,
+                            media_rate,
+                            media_channels,
+                        )?;
                         adts.clear();
                         adts.extend_from_slice(&oxp_media::Adts::build_header(
-                            &audio_config,
+                            &frame_config,
                             p.data.len(),
                         )?);
                         adts.extend_from_slice(&p.data);
