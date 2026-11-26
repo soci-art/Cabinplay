@@ -50,6 +50,7 @@ struct ContentView: View {
     @State private var headUnitIP = "192.168.49.1"
     @State private var localIP = ""
     @State private var pairingCode = ""
+    @State private var blePin = ""
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
     @State private var audio = AudioPipeline()
@@ -99,9 +100,12 @@ struct ContentView: View {
                     headUnitIP: headUnitIP,
                     bleScanning: bleProbe.scanning,
                     bleSummary: bleProbe.lastFoundSummary ?? "还没发现车机——在车里打开车机的 CarLink，再点开始探测",
+                    bleFound: bleProbe.foundDeviceId != nil,
+                    blePhaseText: bleProbe.flowPhaseText,
                     headUnitIPField: $headUnitIP,
                     localIPField: $localIP,
                     pairingCodeField: $pairingCode,
+                    blePinField: $blePin,
                     onToggleReceiver: { running ? stop() : start() },
                     onPiP: {
                         if !pip.start() { appendLog("画中画不可用") }
@@ -110,6 +114,7 @@ struct ContentView: View {
                     onConnectCarLink: { startCarLink() },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
+                    onConnectBle: { bleProbe.connectWithPin(blePin) },
                     onImportIdentity: { showingImporter = true },
                     onOpenSettings: { tab = 2 }
                 )
@@ -151,6 +156,7 @@ struct ContentView: View {
         }
         .onAppear {
             bleProbe.onLog = { appendLog($0) }
+            bleProbe.onServerInfo = { handleUCarServerInfo($0) }
             if localIP.isEmpty { localIP = LocalNetwork.ipv4Addresses().first ?? "" }
             pipReady = pip.setup(layer: decoder.layer)
             autoDetectCarLink()
@@ -178,6 +184,8 @@ struct ContentView: View {
                 if !pairingCode.isEmpty {
                     UserDefaults.standard.set(pairingCode, forKey: "oxp.lastPin")
                 }
+                // UCar 流程：鉴权成功后经 BLE …103 回告本机地址（失败不影响判定）。
+                bleProbe.writeClientAddress(localIP: localIP)
             }
         }
         core.onTouch = { screen, x, y, pressed in
@@ -210,6 +218,29 @@ struct ContentView: View {
                 if pairingCode.isEmpty {
                     pairingCode = UserDefaults.standard.string(forKey: "oxp.lastPin") ?? ""
                 }
+                startCarLink()
+            }
+        }
+    }
+
+    /// UCar 阶段A：BLE 拿到 ServerInfo 后——先裸探一次 57209，再把地址和
+    /// 刚输的配对码交给既有 CarLink 客户端走它自己的鉴权流程。
+    private func handleUCarServerInfo(_ info: UCarServerInfo) {
+        guard let ip = info.ipAddress, !ip.isEmpty else { return }
+        if localIP.isEmpty {
+            localIP = LocalNetwork.ipv4Addresses().first ?? ""
+        }
+        appendLog("UCar 连接：拿到车机地址 \(ip)（热点「\(info.ssid ?? "?")」），本机地址 \(localIP.isEmpty ? "未知" : localIP)，先裸连一次 \(ip):57209 探测")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let probe = HeadUnitProbe.probeOnce(ip, port: HeadUnitProbe.carLinkAuthPort)
+            DispatchQueue.main.async {
+                if probe.ok {
+                    appendLog("UCar 连接：裸 TCP 探测 \(ip):57209 —— 通（\(probe.detail)），车机的鉴权端口已经亮起来了")
+                } else {
+                    appendLog("UCar 连接：裸 TCP 探测 \(ip):57209 —— 不通（\(probe.detail)）。先确认手机连的是车机热点「\(info.ssid ?? "?")」；接着仍让 CarLink 客户端自己试一次，看它走到哪一步")
+                }
+                headUnitIP = ip
+                pairingCode = blePin
                 startCarLink()
             }
         }

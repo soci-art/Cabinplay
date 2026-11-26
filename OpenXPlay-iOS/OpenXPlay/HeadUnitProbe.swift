@@ -39,6 +39,46 @@ enum HeadUnitProbe {
         }
     }
 
+    /// 单次裸 TCP 连接探测（阻塞调用，请放后台线程）：返回是否连通和一句
+    /// 给日志看的细节（连通/被拒/超时/错误原文分开写清）。
+    static func probeOnce(_ ip: String, port: UInt16, timeoutMs: Int32 = 3000) -> (ok: Bool, detail: String) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return (false, "建 socket 失败 errno \(errno)") }
+        defer { close(fd) }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr(ip)
+
+        let result = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result == 0 { return (true, "直接连通") }
+        guard errno == EINPROGRESS else {
+            return (false, "connect 立刻失败 errno \(errno)（\(String(cString: strerror(errno)))）")
+        }
+
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard poll(&pfd, 1, timeoutMs) > 0 else {
+            return (false, "\(timeoutMs) 毫秒内没响应（超时，对方没理）")
+        }
+
+        var error: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)
+        if error == 0 { return (true, "连通") }
+        if error == ECONNREFUSED {
+            return (false, "被拒绝（Connection refused，端口没开或还没开始监听）")
+        }
+        return (false, "连不上 errno \(error)（\(String(cString: strerror(error)))）")
+    }
+
     private static func canConnect(_ ip: String, port: UInt16) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }

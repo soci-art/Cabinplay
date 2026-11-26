@@ -24,10 +24,13 @@ struct DashboardView: View {
     let headUnitIP: String
     let bleScanning: Bool
     let bleSummary: String
+    let bleFound: Bool
+    let blePhaseText: String
 
     @Binding var headUnitIPField: String
     @Binding var localIPField: String
     @Binding var pairingCodeField: String
+    @Binding var blePinField: String
 
     let onToggleReceiver: () -> Void
     let onPiP: () -> Void
@@ -35,6 +38,7 @@ struct DashboardView: View {
     let onConnectCarLink: () -> Void
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
+    let onConnectBle: () -> Void
     let onImportIdentity: () -> Void
     let onOpenSettings: () -> Void
 
@@ -258,33 +262,61 @@ struct DashboardView: View {
         .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
     }
 
-    // MARK: 蓝牙探针卡
+    // MARK: 蓝牙连接车机卡（探针 + UCar 连接前段）
 
     private var bleProbeCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("探测车机蓝牙").font(.cardTitle)
+                Text("蓝牙连接车机").font(.cardTitle)
                 Spacer()
                 HStack(spacing: 5) {
                     Circle()
                         .fill(bleScanning ? Color.green : Color.secondary.opacity(0.5))
                         .frame(width: 7, height: 7)
-                    Text(bleScanning ? "正在探测" : "未开始").font(.caption).foregroundStyle(.secondary)
+                    Text(bleScanning ? "正在探测" : "探测已停").font(.caption).foregroundStyle(.secondary)
                 }
             }
             Text(bleSummary)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button {
-                Haptics.tap()
-                onToggleBleProbe()
-            } label: {
-                Text(bleScanning ? "停止探测" : "开始探测")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 2)
+            Text(blePhaseText)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.primary)
+            TextField("车机屏幕上的 6 位配对码", text: $blePinField)
+                .keyboardType(.numberPad)
+                .font(.title3.monospaced())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+            HStack(spacing: 10) {
+                Button {
+                    Haptics.tap()
+                    onToggleBleProbe()
+                } label: {
+                    Text(bleScanning ? "停止探测" : "开始探测")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                }
+                .buttonStyle(.bordered)
+                .tint(Color.sunsetAccent)
+
+                Button {
+                    Haptics.tap()
+                    onConnectBle()
+                } label: {
+                    Text("连接车机")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.sunsetAccent)
+                .disabled(!bleFound || blePinField.count != 6)
             }
-            .buttonStyle(.bordered)
-            .tint(Color.sunsetAccent)
+            if !bleFound {
+                Text("先点「开始探测」，等上面显示发现车机，再输配对码连接")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding()
         .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
