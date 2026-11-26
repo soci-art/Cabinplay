@@ -15,11 +15,18 @@ struct SettingsView: View {
 
     // Wi-Fi 名兜底：记住值与授权状态进页时刷新一次；手填保存后即时更新。
     @State private var rememberedSSID = LocalCarPlaySession.rememberedInfraSSID
+    @State private var rememberedPasswordState = LocalCarPlaySession.passwordStateText(for: LocalCarPlaySession.rememberedInfraSSID)
     @State private var locationStatusText = WiFiNameAccess.authorizationStatusText
     @State private var manualSSID = ""
+    @State private var manualPassword = ""
+    @State private var manualOpenNetwork = false
 
     private var manualSSIDTrimmed: String {
         manualSSID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var manualSaveDisabled: Bool {
+        manualSSIDTrimmed.isEmpty || (!manualOpenNetwork && manualPassword.isEmpty)
     }
 
     private var versionText: String {
@@ -75,28 +82,41 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 HStack {
+                    Text("它的密码")
+                    Spacer()
+                    Text(rememberedPasswordState)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
                     Text("定位授权")
                     Spacer()
                     Text(locationStatusText)
                         .foregroundStyle(.secondary)
                 }
-                HStack {
-                    TextField("当前 Wi-Fi 名称（手填）", text: $manualSSID)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    Button("保存") {
-                        let name = manualSSIDTrimmed
-                        guard !name.isEmpty else { return }
-                        LocalCarPlaySession.rememberInfraSSIDManually(name)
-                        rememberedSSID = name
-                        manualSSID = ""
-                    }
-                    .disabled(manualSSIDTrimmed.isEmpty)
+                TextField("当前 Wi-Fi 名称（手填）", text: $manualSSID)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                SecureField("这个 Wi-Fi 的密码", text: $manualPassword)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .disabled(manualOpenNetwork)
+                Toggle("这个网络没有密码（开放网络）", isOn: $manualOpenNetwork)
+                Button("保存名字和密码") {
+                    let name = manualSSIDTrimmed
+                    guard !name.isEmpty else { return }
+                    LocalCarPlaySession.rememberWiFiPairManually(
+                        ssid: name, password: manualPassword, isOpen: manualOpenNetwork)
+                    rememberedSSID = name
+                    rememberedPasswordState = LocalCarPlaySession.passwordStateText(for: name)
+                    manualSSID = ""
+                    manualPassword = ""
+                    manualOpenNetwork = false
                 }
+                .disabled(manualSaveDisabled)
             } header: {
                 Text("Wi-Fi 名称")
             } footer: {
-                Text("启动本机 CarPlay 时要把当前 Wi-Fi 的名字报给系统。系统规定读这个名字需要定位授权；不想给权限，就在这里把当前 Wi-Fi 名手填一次，填了就能启动。")
+                Text("启动本机 CarPlay 时要把当前 Wi-Fi 的名字和密码成对报给系统。系统规定读名字需要定位授权；不想给权限，就在这里把名称和密码成对填一次。只填名字、密码空着，系统会以为这是没密码的网络，就不理了——除非它真是开放网络，那就在上面把「没有密码」打开。")
             }
 
             Section("关于") {
@@ -116,6 +136,7 @@ struct SettingsView: View {
         .background(Color.pageBackground)
         .onAppear {
             rememberedSSID = LocalCarPlaySession.rememberedInfraSSID
+            rememberedPasswordState = LocalCarPlaySession.passwordStateText(for: rememberedSSID)
             locationStatusText = WiFiNameAccess.authorizationStatusText
         }
     }
