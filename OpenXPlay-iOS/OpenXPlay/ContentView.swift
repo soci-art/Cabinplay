@@ -83,6 +83,17 @@ struct ContentView: View {
     @State private var joiner = UCarNetworkJoiner()
     @State private var joinGeneration = 0
 
+    // 本机 CarPlay 无回连自动重试（只在连接车机流程里、接续/启动后挂上）：
+    // 约 12 秒没等到控制回连就停掉以同凭据同地址重新发起，最多共 3 次。
+    // 只重发「从没回连过」的发起——真机规律：重启后第一次发起的会话才
+    // 能成，一旦有会话真正跑起来又结束，之后的新会话再也起不来，直到
+    // 下次重启（1548/1532 实证）；而没接上的发起不占这次机会（1510 空
+    // 密码那次根本没回连，后面 1525/1527 照样能成）。接续成功出画后立
+    // 刻收手，流程内绝不再碰这个会话的生命周期。
+    @State private var localRetryWork: DispatchWorkItem?
+    @State private var localRetryGeneration = 0
+    @State private var localAttemptCount = 0
+
     // clink 候选真连接试序＋被拒重试（流程内部行为，不受用户点按守卫影响）。
     // 参数：同候选原地重试间隔 2 秒、同候选最多 4 次、单次尝试 8 秒看门狗、
     // 含候选切换的总预算 30 秒。命中口径：状态走到协商（negotiating）或
@@ -125,7 +136,7 @@ struct ContentView: View {
                     keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
                     selectedSize: targetSize,
-                    onToggleLocalSession: { localSession.isRunning ? stopLocalSession() : startLocalSession() },
+                    onToggleLocalSession: { userToggleLocalSession() },
                     onSelectSize: { setSize($0, $1) },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
@@ -195,18 +206,72 @@ struct ContentView: View {
         hasVideo = false
     }
 
-    // MARK: 连接车机总流程（顺序：蓝牙先行 → 入网前停旧会话 → 入网 → 本机 CarPlay 一次启动 + clink 并行）
+    /// 驾驶舱开关是用户手动启停：手动点停要连带取消流程挂着的无回连
+    /// 自动重试，别在用户已经停掉之后又自己发起。
+    private func userToggleLocalSession() {
+        if localSession.isRunning {
+            cancelLocalCallbackRetry()
+            stopLocalSession()
+        } else {
+            startLocalSession()
+        }
+    }
+
+    // MARK: 本机 CarPlay 无回连自动重试（连接车机流程专用）
+
+    /// 接续/启动后挂上：约 12 秒仍无控制回连，就停掉以同凭据同地址重新
+    /// 发起，最多共 3 次尝试。只重发从没回连过的发起——没回连过的发起
+    /// 不占「重启后第一次机会」；一旦回连（controlConnected）立刻收手，
+    /// 之后绝不再碰这个会话的生命周期（帧桥汇合、clink 重连都不许动
+    /// 它）。3 次都无回连就停手并打人话日志：这个系统一轮里只要有会话
+    /// 真正跑过又结束，新的就再也发起不起来，非重启手机不可。
+    private func armLocalCallbackRetry() {
+        localRetryGeneration += 1
+        localAttemptCount = 1
+        scheduleLocalCallbackCheck(generation: localRetryGeneration)
+    }
+
+    private func scheduleLocalCallbackCheck(generation: Int) {
+        localRetryWork?.cancel()
+        let item = DispatchWorkItem {
+            guard generation == localRetryGeneration else { return }
+            if localSession.controlConnected || localSession.phase == .streaming {
+                appendLog("本机 CarPlay：已回连，自动重试收手——会话就此跑下去，流程内不再动它")
+                return
+            }
+            guard localAttemptCount < 3 else {
+                appendLog("本机 CarPlay：自动重试 3 次都没有回连——这个系统的毛病是：一轮里只要有 CarPlay 会话真正跑过又结束，新的就再也发起不起来，非得重启手机才行。先重启手机，再点一次「连接车机」从头走完")
+                return
+            }
+            localAttemptCount += 1
+            appendLog("本机 CarPlay：发起后 12 秒没等到系统回连，自动重试（第 \(localAttemptCount) 次/共 3 次，同凭据同地址重新发起）")
+            stopLocalSession(reason: "连接车机：无回连自动重试")
+            startLocalSession()
+            scheduleLocalCallbackCheck(generation: generation)
+        }
+        localRetryWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: item)
+    }
+
+    private func cancelLocalCallbackRetry() {
+        localRetryGeneration += 1
+        localRetryWork?.cancel()
+        localRetryWork = nil
+    }
+
+    // MARK: 连接车机总流程（顺序：蓝牙先行 → 旧网络上预发起会话 → 入网 → 切网后接续 + 无回连自动重试，clink 并行）
 
     /// 点「连接车机」的总入口：第一件事就是走蓝牙写 ClientInfo。车机
     /// 的 30 秒看门狗从蓝牙连上那刻起算，而蓝牙在扫描发现车机时就已
     /// 连上——先等本机 CarPlay 建立会把窗口吃光（14:56 实测：等满
     /// 15 秒才写 ClientInfo，写出后 8 秒无回执、蓝牙被车机断开；旧
     /// 流程连上立刻写、回执 <1 秒必成）。蓝牙这段只要一两秒，先走
-    /// 完；拿到 ServerInfo 后先在旧网络上把正在跑的本机 CarPlay 干净
-    /// 停掉、再入网，入网落稳后本机 CarPlay 一次启动到位、clink 试
-    /// 序同时开始（见 handleUCarServerInfo），两边靠帧桥兜底汇合。
+    /// 完；拿到 ServerInfo 后、入网之前，先在当前（旧）网络上把本机
+    /// CarPlay 会话发起（1530 唯一成功的形状：切网前发起的谈话、切网
+    /// 后被接续完成），再入网；地址一切过来按新地址重开接续、重发
+    /// StartSession，clink 试序同时开始（见 handleUCarServerInfo）。
     private func connectCarFlow() {
-        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先停旧会话再入网，入网后一次启动本机 CarPlay")
+        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
         bleProbe.connect(pin: blePin)
     }
 
@@ -443,6 +508,8 @@ struct ContentView: View {
         joiner.cancel()
         joinGeneration += 1
         joinPhase = .idle
+        // 用户主动断开：流程挂着的无回连自动重试一并取消。
+        cancelLocalCallbackRetry()
         // 用户主动断开 = 车机会话结束，本轮车机网络凭据作废。
         if LocalCarPlaySession.carCredentialsFresh {
             LocalCarPlaySession.invalidateCarCredentials()
@@ -460,10 +527,11 @@ struct ContentView: View {
         appendLog("CarLink 已断开")
     }
 
-    /// UCar：BLE 拿到 ServerInfo 后的整段自动流程——静默存凭据 → 还
-    /// 在旧网络上时先把正在跑的本机 CarPlay 干净停掉 → 组网
-    /// （UCarNetworkJoiner）→ 入网落稳后本机 CarPlay 一次启动到位、
-    /// 同时现取现验启 clink 鉴权。用户不再需要点任何东西。
+    /// UCar：BLE 拿到 ServerInfo 后的整段自动流程——静默存凭据 →
+    /// 在当前（旧）网络上先把本机 CarPlay 会话发起 → 组网
+    /// （UCarNetworkJoiner）→ 地址一切过来按新地址重开接续、重发
+    /// StartSession，同时现取现验启 clink 鉴权，并挂上无回连自动重
+    /// 试。用户不再需要点任何东西。
     private func handleUCarServerInfo(_ info: UCarServerInfo) {
         // 热点凭据静默存下并标为本轮新鲜（打时间戳＋本进程标记）：只许
         // 本轮车机会话内、本机 CarPlay 重开时用；会话结束即作废，绝不
@@ -484,17 +552,35 @@ struct ContentView: View {
             appendLog("UCar 连接：组网已在进行中，这份 ServerInfo 不重复触发")
             return
         }
-        // 入网切网会把旧网络上的连接整段掐断：本机 CarPlay 会话若正
-        // 在旧网络上跑（尤其已出画），被切网中途掐死后系统侧会把它
-        // 记成卡死——之后按新地址重开、乃至手动再开，iOS 都不回连
-        // （1532 实证）；而 1530 里首个会话还没建立就被换掉、重开即
-        // 成，差别就在旧会话是否已建立。所以顺序定死：入网之前，先
-        // 趁还在旧网络上把会话干净停掉（走既有 stop 路径、同步停
-        // 完）；没在跑也不在旧网络上先启——那等于再造一个跨网重开。
-        let stoppedForJoin = localSession.isRunning
-        if stoppedForJoin {
-            appendLog("本机 CarPlay：连接车机要先入网切网——趁还在旧网络上，先把正在跑的本机 CarPlay 干净停掉，入网后再一次启动到位")
-            stopLocalSession(reason: "连接车机：入网切网前先停掉")
+        // 本轮唯一的机会先占住，别在链条中间浪费掉。真机规律（与全
+        // 部日志吻合）：重启后第一次发起的 CarPlay 会话才能成；一旦
+        // 有会话真正跑起来又结束，之后的新会话再也起不来，直到下次
+        // 重启（1548 重启后 #1 出画、被停后 #2/#3 全败；1532 同理且
+        // 卡死带到下一轮）。而入网切到车机 DIRECT- 网络之后「新发
+        // 起」从没成过（四次全败，含上一版先停后入网再一次启动）；
+        // 唯一成功（1530）是切网「之前」就发起的谈话：StartSession
+        // 用本轮新鲜车机凭据在旧网络上先发出去、没等到回连，地址一
+        // 切过来接收端按新地址重开、重发 StartSession，iOS 立刻回
+        // 连并全程出画。所以顺序定死：入网之前先把会话发起在旧网络
+        // 上，中间不插入任何会真正建立又结束的会话。
+        var flowInitiatedLocalSession = false
+        if localSession.isRunning {
+            if localSession.controlConnected || localSession.phase == .streaming {
+                // 正在出画/已建立：留着它会被切网中途掐死、同样卡死，
+                // 唯一可走的路是先干净停掉、再立刻重新发起。
+                appendLog("本机 CarPlay：会话正在出画——先停掉，马上在当前网络重新发起，切网后接续（发起机会只有重启后这一次，不能让它被切网掐死）")
+                stopLocalSession(reason: "连接车机：停掉已出画会话以便重新发起接续")
+                startLocalSession()
+                flowInitiatedLocalSession = true
+            } else {
+                // 已发起、还没回连：这就是正在谈的那次机会，留着它，
+                // 切网后靠地址重开接续，不要重启它。
+                appendLog("本机 CarPlay：会话已发起、正在等系统回连——留着这次谈话，切网后接续，不重启它")
+            }
+        } else {
+            appendLog("本机 CarPlay：先在当前网络发起 CarPlay 会话，切网后接续（用本轮车机凭据「\(info.ssid ?? "?")」，这是本轮唯一的那次发起）")
+            startLocalSession()
+            flowInitiatedLocalSession = true
         }
         joinPhase = .joining
         carLinkDetail = "入网中：加入车机网络「\(info.ssid ?? "?")」"
@@ -507,8 +593,11 @@ struct ContentView: View {
             }
             guard let result else {
                 joinPhase = .failed("入网失败")
-                if stoppedForJoin {
-                    appendLog("本机 CarPlay：入网失败，入网前停掉的会话保持停止（手动点「启动 CarPlay」可恢复）")
+                if flowInitiatedLocalSession, localSession.isRunning, !localSession.controlConnected {
+                    // 本轮流程刚发起的会话还没回连过：停掉它不占重启
+                    // 后的发起机会，留着它只会挂在已作废的凭据上空等。
+                    stopLocalSession(reason: "连接车机：入网失败，停掉刚发起的会话")
+                    appendLog("本机 CarPlay：入网失败，刚发起的会话已停掉（它还没回连过，不占发起机会）；手动点「启动 CarPlay」可单独用")
                 }
                 // 入网没成 = 这轮车机会话未成立，刚存的凭据一并作废。
                 if LocalCarPlaySession.carCredentialsFresh {
@@ -520,20 +609,29 @@ struct ContentView: View {
             joinPhase = .idle
             flowLocalIP = result.localIP
             carLinkDetail = "本机 \(result.localIP) · 正在连接车机"
-            // 入网落稳，本机 CarPlay 现在一次启动到位：凭据是本轮刚带
-            // 回的新鲜车机凭据、地址就是入网后的地址，不存在跨网重
-            // 开。仅剩的兜底：入网期间用户手动启动过、且还绑在旧地址
-            // 上，才重开一次对齐新地址。
-            if localSession.isRunning, localSession.boundAddress != result.localIP {
-                appendLog("本机 CarPlay：入网期间被手动启动且还绑在旧地址 \(localSession.boundAddress ?? "?") 上，重开一次对齐新地址 \(result.localIP)")
-                stopLocalSession(reason: "入网后对齐新地址重开")
+            // 切网后接续：切网前发起的那次谈话还在等回连、且还绑在旧
+            // 地址上，就按新地址重开接续——同凭据重启接收端、重发
+            // StartSession，这正是 1530 成的那一步。会话内的启动期地
+            // 址看门狗可能已先一步重开对齐（boundAddress 已是新地
+            // 址），那就不重复动它。已回连/出画的会话是终点：绝不再
+            // 停它、重开它（帧桥汇合、clink 那边都不碰它的生命周期）。
+            if localSession.isRunning, !localSession.controlConnected,
+               localSession.boundAddress != result.localIP {
+                appendLog("本机 CarPlay：切网后接续——会话还绑在旧地址 \(localSession.boundAddress ?? "?")，按新地址 \(result.localIP) 重开、重发 StartSession（凭据不变）")
+                stopLocalSession(reason: "连接车机：切网后按新地址接续重开")
                 startLocalSession()
-            } else if !localSession.isRunning {
-                appendLog("本机 CarPlay：入网完成，现在启动本机 CarPlay（一次到位，不再跨网重开）")
+            } else if localSession.isRunning {
+                appendLog("本机 CarPlay：切网后接续已就位（会话已在新地址上或已回连），不重复动它")
+            } else {
+                // 极端兜底：预发起的会话不知为何没在跑，现在补发起。
+                appendLog("本机 CarPlay：入网完成，会话没在跑，兜底现在发起（用本轮车机凭据）")
                 startLocalSession()
             }
+            // 无回连自动重试挂上：接续后约 12 秒仍无回连就同凭据同地
+            // 址重新发起，最多共 3 次；回连即收手。
+            armLocalCallbackRetry()
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
-            // 与本机 CarPlay 启动并行，两边靠帧桥汇合。
+            // 与本机 CarPlay 接续并行，两边靠帧桥汇合。
             beginClinkAttempts(candidates: result.candidates, localIP: result.localIP)
         }
     }
