@@ -29,6 +29,9 @@ final class CarLinkCore {
     var onLog: ((String) -> Void)?
     var onState: ((State) -> Void)?
     var onTouch: ((UInt32, Double, Double, Bool) -> Void)?
+    /// 校准捕获回调：捕获模式下核心只报原始坐标（触控面归一化）走
+    /// 这里，正常触控通道（onTouch）同时静默，绝不转发给 iOS。
+    var onTouchCapture: ((Double, Double) -> Void)?
     var onKey: ((UInt32, Bool) -> Void)?
 
     private(set) var running = false
@@ -69,6 +72,11 @@ final class CarLinkCore {
             // 车机触摸回送本机 CarPlay 会话（由 ContentView 接到 LocalCarPlaySession）。
             core.onTouch?(screen, x, y, pressed != 0)
         }
+        callbacks.on_touch_capture = { context, x, y in
+            guard let context else { return }
+            let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
+            core.onTouchCapture?(x, y)
+        }
         callbacks.on_key = { context, code, down in
             guard let context else { return }
             let core = Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue()
@@ -100,6 +108,40 @@ final class CarLinkCore {
         guard running else { return }
         _ = clink_stop()
         running = false
+    }
+
+    // MARK: 触控按车校准（核心 UIBC 的共享校准状态）
+
+    /// 按车机 deviceId 把生效校准（手动优先、其次内置预置）推给核
+    /// 心：有就设上，没有就清掉让核心走居中模型。每轮连接开始时调
+    /// 一次；手动校准完成/清除时也调，运行中的会话立刻生效。
+    func applyTouchCalibration(forDeviceId deviceId: String?) {
+        if let deviceId, let effective = TouchCalibrationStore.effectiveRect(for: deviceId) {
+            let rect = effective.rect
+            clink_set_touch_calibration(rect.left, rect.right, rect.top, rect.bottom,
+                                         effective.isPreset ? 1 : 2)
+        } else {
+            clink_clear_touch_calibration()
+        }
+    }
+
+    /// 校准捕获开关：开着时车机触控只报原始坐标、不转发给 iOS。
+    func setTouchCapture(_ on: Bool) {
+        clink_set_touch_capture(on ? 1 : 0)
+    }
+
+    /// 核心记下的车机声明几何（校准自检的宽高比一项要用）：surface
+    /// 是车机屏、visible 是画面区；没报过为 nil。
+    func touchGeometry() -> (surface: (Int, Int)?, visible: (Int, Int)?)? {
+        var values: [UInt32] = [0, 0, 0, 0]
+        let known = values.withUnsafeMutableBufferPointer { buffer -> UInt32 in
+            guard let base = buffer.baseAddress else { return 0 }
+            return clink_touch_geometry(base)
+        }
+        guard known != 0 else { return nil }
+        let surface = (Int(values[0]), Int(values[1]))
+        let visible = (values[2] > 0 && values[3] > 0) ? (Int(values[2]), Int(values[3])) : nil
+        return (surface, visible)
     }
 
     /// 把解码配置（avcC/hvcC 记录）推给车机；必须先于帧调用。codec：1=H.264，2=H.265。

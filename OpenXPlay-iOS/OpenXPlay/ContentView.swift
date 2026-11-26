@@ -64,7 +64,22 @@ struct ContentView: View {
     @State private var blePin = ""
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
-    @State private var targetSize: (Int, Int) = (1280, 720)
+
+    // 分辨率改自动（不再有手动菜单）：阶梯从高往低，连接时先用这台
+    // 车上次协商定案的档（存 UserDefaults），没有就从最高档起步；
+    // 整轮协商都失败就自动降一档、本机 CarPlay 会话按新尺寸重开一
+    // 次再试（WFD 声明、本机 CarPlay 请求、触控换算三处尺寸必须同
+    // 源同值，见 abandonClinkAttempts 的降档分支）。targetSize 是当
+    // 前档的生效值，只用于展示与启动参数，不再由用户选。
+    private static let sizeLadder: [(Int, Int)] = [(1920, 1080), (1280, 720), (854, 480)]
+    @State private var sizeTierIndex = 0
+    @State private var targetSize: (Int, Int) = (1920, 1080)
+
+    // 触控校准页（设置页按钮与驾驶舱首次提示共用同一个 sheet）。
+    @State private var showCalibration = false
+    /// 校准提示「看过」标记的刷新计数（标记本身存 UserDefaults 按车
+    /// 记；点过提示或关掉提示后 +1 让界面重算显隐）。
+    @State private var calibrationHintRevision = 0
 
     // UCar 后段流程状态（全部自动推导，不再有手填项）。
     private enum JoinPhase: Equatable {
@@ -134,8 +149,10 @@ struct ContentView: View {
                     blePhaseText: bleStageText,
                     keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
-                    selectedSize: targetSize,
-                    onSelectSize: { setSize($0, $1) },
+                    currentSizeLabel: "\(targetSize.0)×\(targetSize.1)",
+                    showCalibrationHint: calibrationHintVisible,
+                    onOpenCalibration: { openCalibration() },
+                    onDismissCalibrationHint: { dismissCalibrationHint() },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
                     onConnectBle: { connectCarFlow() }
@@ -154,8 +171,9 @@ struct ContentView: View {
 
             NavigationStack {
                 SettingsView(
-                    selectedSize: targetSize,
-                    onSelectSize: { setSize($0, $1) }
+                    calibrationCarId: bleProbe.foundDeviceId ?? lastCarDeviceId,
+                    calibrationAvailable: carLinkState == .playing,
+                    onOpenCalibration: { openCalibration() }
                 )
                 .navigationTitle("设置")
             }
@@ -185,6 +203,13 @@ struct ContentView: View {
                 break
             }
         }
+        .sheet(isPresented: $showCalibration) {
+            TouchCalibrationView(
+                deviceId: bleProbe.foundDeviceId ?? lastCarDeviceId,
+                sessionPlaying: carLinkState == .playing,
+                onLog: { appendLog($0) }
+            )
+        }
         .onAppear {
             bleProbe.onLog = { appendLog($0) }
             bleProbe.onServerInfo = { handleUCarServerInfo($0) }
@@ -211,11 +236,47 @@ struct ContentView: View {
         }
     }
 
+    // MARK: 触控校准提示（首次连某台没校准记录的车、出画后给一行）
+
+    /// 上次连过的车机 deviceId（ServerInfo 到手时落盘）：设置页在没
+    /// 发现车机时也能对着这台车开校准页。
+    private var lastCarDeviceId: String? {
+        let value = UserDefaults.standard.string(forKey: "cabinplay.lastCarDeviceId")
+        return (value?.isEmpty == false) ? value : nil
+    }
+
+    /// 驾驶舱校准提示的显隐：正在出画、认得出是哪台车、这台车没有
+    /// 任何校准（手动/预置都没有）、且没被关掉过。预置命中的车（车
+    /// 主本人的 UNI-V）天然不弹——预置已经在用了。
+    private var calibrationHintVisible: Bool {
+        _ = calibrationHintRevision
+        guard carLinkState == .playing, localSession.phase == .streaming,
+              let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId else { return false }
+        if TouchCalibrationStore.hasAnyCalibration(for: deviceId) { return false }
+        return !UserDefaults.standard.bool(forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
+    }
+
+    private func openCalibration() {
+        if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
+            UserDefaults.standard.set(true, forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
+            calibrationHintRevision += 1
+        }
+        showCalibration = true
+    }
+
+    private func dismissCalibrationHint() {
+        if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
+            UserDefaults.standard.set(true, forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
+        }
+        calibrationHintRevision += 1
+    }
+
     // MARK: 本机 CarPlay 会话
 
-    private func startLocalSession() {
+    private func startLocalSession(addressOverride: String? = nil) {
         decoder.reset()
-        localSession.start(width: targetSize.0, height: targetSize.1, fps: 60)
+        localSession.start(width: targetSize.0, height: targetSize.1, fps: 60,
+                           addressOverride: addressOverride)
         if localSession.phase.isFailed {
             Haptics.error()
         }
@@ -289,8 +350,7 @@ struct ContentView: View {
                     stopLocalSession(reason: "连接车机：换设备标识重试，先停会话")
                     ReceiverConfiguration.rotatePersistentDeviceID()
                     appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录），用新身份重新发起")
-                    startLocalSession()
-                    scheduleLocalCallbackCheck(generation: generation)
+                    startLocalSessionAfterAddressWait(generation: generation)
                 } else {
                     appendLog("本机 CarPlay：换了新设备标识也重试满 3 次，还是没有回连——这一轮已经换身份重试过了，仍不行就只能重启手机后再点一次「连接车机」")
                 }
@@ -298,9 +358,8 @@ struct ContentView: View {
             }
             localAttemptCount += 1
             appendLog("本机 CarPlay：发起后 \(waitSeconds) 秒没等到系统回连，自动重试（第 \(localAttemptCount) 次/共 3 次，同凭据同地址重新发起）")
-            stopLocalSession(reason: "连接车机：无回连自动重试")
-            startLocalSession()
-            scheduleLocalCallbackCheck(generation: generation)
+            restartLocalSessionAfterAddressWait(generation: generation,
+                                                reason: "连接车机：无回连自动重试")
         }
         localRetryWork = item
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(waitSeconds), execute: item)
@@ -310,6 +369,49 @@ struct ContentView: View {
         localRetryGeneration += 1
         localRetryWork?.cancel()
         localRetryWork = nil
+    }
+
+    /// 无回连重开的前半：停掉会话，再走等地址启动（轮换分支自己已
+    /// 经停过会话、换完身份，直接调后半即可）。
+    private func restartLocalSessionAfterAddressWait(generation: Int, reason: String) {
+        stopLocalSession(reason: reason)
+        startLocalSessionAfterAddressWait(generation: generation)
+    }
+
+    /// 等地址启动：切网后 en0 地址会先消失约 9 秒才落新地址，旧做法
+    /// 重开时一次性即时读、零容错，落进空窗就直接判死
+    /// （PLACEHOLDER-TIMING-DIFF 第 3 节）。现在按入网步的节奏 1.5
+    /// 秒一探、最多约 10 秒等地址回来再 start；仍空则用流程已知的
+    /// 本机地址（flowLocalIP，接续成功时记下的那个）兜底启动——会
+    /// 话自己的启动期地址看门狗会在地址落稳后按真地址重开对齐；
+    /// 两者皆无才按失败处理并打人话日志。generation 守卫保证流程
+    /// 已换轮/已断开时不会乱入。
+    private func startLocalSessionAfterAddressWait(generation: Int) {
+        var probes = 0
+        func attempt() {
+            guard generation == localRetryGeneration else { return }
+            if ReceiverConfiguration.wifiIPv4Address() != nil {
+                if probes > 0 {
+                    appendLog("本机 CarPlay：等了约 \(Int(Double(probes) * 1.5)) 秒，en0 地址回来了，按真地址重新发起")
+                }
+                startLocalSession()
+                scheduleLocalCallbackCheck(generation: generation)
+                return
+            }
+            probes += 1
+            if probes <= 7 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { attempt() }
+                return
+            }
+            if !flowLocalIP.isEmpty {
+                appendLog("本机 CarPlay：等了约 10 秒 en0 地址还没回来，用流程已知的本机地址 \(flowLocalIP) 兜底启动（地址落稳后会话会自己对齐）")
+                startLocalSession(addressOverride: flowLocalIP)
+                scheduleLocalCallbackCheck(generation: generation)
+            } else {
+                appendLog("本机 CarPlay：等了约 10 秒还是读不到本机地址，也没有流程已知的地址可兜底——这一轮先停在这里，连上车机网络或任意 Wi-Fi 后再点一次「连接车机」")
+            }
+        }
+        attempt()
     }
 
     // MARK: 连接车机总流程（顺序：蓝牙先行 → 旧网络上预发起会话 → 入网 → 切网后接续 + 无回连自动重试，clink 并行）
@@ -336,9 +438,21 @@ struct ContentView: View {
         bleProbe.connect(pin: blePin)
     }
 
-    private func setSize(_ width: Int, _ height: Int) {
-        targetSize = (width, height)
-        appendLog("输出尺寸将使用 \(width)×\(height)（本机 CarPlay 与 CarLink 共用，下次启动会话时生效）")
+    /// 分辨率自动协商的起步档：这台车上次协商定案的尺寸（按
+    /// deviceId 存）就是这轮的起步档；没有记录就从阶梯最高档起。
+    /// 每轮连接在 handleUCarServerInfo 开头调一次。
+    private func prepareSizeTier(for deviceId: String?) {
+        var tier = 0
+        if let deviceId,
+           let saved = UserDefaults.standard.string(forKey: "cabinplay.provenSize.\(deviceId)"),
+           let index = Self.sizeLadder.firstIndex(where: { "\($0.0)x\($0.1)" == saved }) {
+            tier = index
+        }
+        sizeTierIndex = tier
+        targetSize = Self.sizeLadder[tier]
+        appendLog(tier == 0
+            ? "分辨率自动协商：从最高档 \(targetSize.0)×\(targetSize.1) 起步，车机接受不了就自动降档"
+            : "分辨率自动协商：这台车上次定案是 \(targetSize.0)×\(targetSize.1)，这轮从这一档起步")
     }
 
     // MARK: 连接卡阶段文案（蓝牙前段 + CarLink 后段合并）
@@ -415,6 +529,10 @@ struct ContentView: View {
         core.onTouch = { _, x, y, pressed in
             localSession.touchesFromCarLink(pressed: pressed, x: x, y: y)
         }
+        core.onTouchCapture = { x, y in
+            // 校准捕获：原始坐标只送校准总线，绝不进上面的触控转发。
+            TouchCaptureBus.shared.handler?(x, y)
+        }
         core.onKey = { code, down in
             localSession.keyFromCarLink(code: code, down: down)
         }
@@ -428,6 +546,9 @@ struct ContentView: View {
             return
         }
         wireCarLinkCallbacks()
+        // 触控校准按这台车推给核心（手动优先、其次预置、都没有走
+        // 居中模型）：每轮试序开始时推一次，运行中改校准也立刻生效。
+        CarLinkCore.shared.applyTouchCalibration(forDeviceId: bleProbe.foundDeviceId ?? lastCarDeviceId)
         cancelClinkLoopWork()
         clinkCandidates = candidates
         clinkCandidateIndex = 0
@@ -509,6 +630,12 @@ struct ContentView: View {
         clinkWatchdogWork = nil
         clinkLoopActive = false
         appendLog("CarLink 候选 \(flowCarIP) 命中（状态已到「\(state.text)」）——车机地址定为 \(flowCarIP)")
+        // 协商定案的尺寸按车记下：下次连这台车直接从这一档起步，
+        // 不必每轮都从最高档往下试。
+        if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
+            UserDefaults.standard.set("\(targetSize.0)x\(targetSize.1)",
+                                      forKey: "cabinplay.provenSize.\(deviceId)")
+        }
     }
 
     /// 本次尝试判失败的入口：置 settled、撤看门狗，再走统一决策。
@@ -554,6 +681,23 @@ struct ContentView: View {
         guard clinkLoopActive else { return }
         clinkLoopActive = false
         cancelClinkLoopWork()
+        // 分辨率自动降档：这一档整轮协商都没成、阶梯下面还有档——降
+        // 一档再整轮试。本机 CarPlay 会话按新尺寸重开一次（协商定案
+        // 后对齐尺寸的那一次重开）：不重开的话 WFD 声明会降、本机
+        // CarPlay 还按旧尺寸出帧，三处尺寸长期不一致，触控必偏。
+        if sizeTierIndex + 1 < Self.sizeLadder.count {
+            let oldSize = targetSize
+            sizeTierIndex += 1
+            targetSize = Self.sizeLadder[sizeTierIndex]
+            appendLog("分辨率自动降档：\(oldSize.0)×\(oldSize.1) 这一档整轮没协商成（\(reason)），降到 \(targetSize.0)×\(targetSize.1) 再试——本机 CarPlay 会话按新尺寸重开一次，让声明/请求/触控三处尺寸对齐")
+            if localSession.isRunning {
+                stopLocalSession(reason: "分辨率自动降档，按新尺寸重开")
+                startLocalSession()
+                armLocalCallbackRetry()
+            }
+            beginClinkAttempts(candidates: clinkCandidates, localIP: flowLocalIP)
+            return
+        }
         appendLog("CarLink 全部候选与重试都失败了（\(reason)；试过 \(clinkCandidates.joined(separator: "、"))）——这一轮停在这里，把日志发回来看")
         carLinkDetail = "连接失败：车机地址都试过了（\(reason)）"
     }
@@ -620,6 +764,13 @@ struct ContentView: View {
             appendLog("UCar 连接：组网已在进行中，这份 ServerInfo 不重复触发")
             return
         }
+        // 认出是哪台车：deviceId 落盘（设置页校准/预置命中要用），
+        // 分辨率阶梯按这台车上次的定案档起步——放在防重复守卫之后、
+        // 预发起之前，重复的 ServerInfo 不会把正在跑的尺寸重置掉。
+        if let deviceId = bleProbe.foundDeviceId {
+            UserDefaults.standard.set(deviceId, forKey: "cabinplay.lastCarDeviceId")
+        }
+        prepareSizeTier(for: bleProbe.foundDeviceId)
         // 本轮唯一的机会先占住，别在链条中间浪费掉。真机规律（与全
         // 部日志吻合）：重启后第一次发起的 CarPlay 会话才能成；一旦
         // 有会话真正跑起来又结束，之后的新会话再也起不来，直到下次

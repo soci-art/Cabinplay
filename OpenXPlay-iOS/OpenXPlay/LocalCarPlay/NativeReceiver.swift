@@ -325,7 +325,10 @@ final class NativeReceiver {
             guard state.cipher == nil, let verify = state.verify else { throw ProtocolError.malformed(CWL("pair-verify 不可用")) }
             return RTSPResponse(body: try verify.handle(request.body), contentType: "application/pairing+tlv8")
         case ("GET", "/info"), ("POST", "/info"):
-            let info = CarPlayInfo.build(configuration)
+            // appStates 据实报：媒体状态取此刻 102 流是否建着（会话
+            // 早期 /info 时流还没建，报 false 是实话，不再恒写死）。
+            let info = CarPlayInfo.build(configuration,
+                                         mediaActive: state.media?.mediaStreamActive ?? false)
             return RTSPResponse(body: try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0),
                                 contentType: "application/x-apple-binary-plist")
         case ("POST", "/auth-setup"):
@@ -351,12 +354,40 @@ final class NativeReceiver {
                     }
                 }
                 if type == "modesChanged", let params = command["params"] as? [String: Any] {
+                    // 全量落盘（AUDIO-CLAIM-DIFF 方向 2）：resources 与
+                    // appStates 一起打，不再只挑 resources 的三个数
+                    // 字——appStates 是仲裁的另一半，以前整段被丢弃，
+                    // 放歌瞬间手机那侧媒体状态翻没翻 true 在日志里无
+                    // 据可查，认领载荷也没法对着手机原报文调。
+                    var resourceText: [String] = []
+                    var audioClaimedByPhone = false
                     for resource in params["resources"] as? [[String: Any]] ?? [] {
                         let fields = ["resourceID", "entity", "permanentEntity"].compactMap { key -> String? in
                             guard let value = resource[key] as? NSNumber else { return nil }
                             return "\(key)=\(value)"
                         }
-                        log(CWL("CarPlay 资源：{1}", [String(describing: fields.joined(separator: ", "))]))
+                        resourceText.append(fields.joined(separator: ", "))
+                        if (resource["resourceID"] as? NSNumber)?.intValue == 2,
+                           let entity = (resource["entity"] as? NSNumber)?.intValue,
+                           entity != 2 {
+                            audioClaimedByPhone = true
+                        }
+                    }
+                    var appStateText: [String] = []
+                    for appState in params["appStates"] as? [[String: Any]] ?? [] {
+                        let parts = appState.keys.sorted().map { key -> String in
+                            if let value = appState[key] as? NSNumber { return "\(key)=\(value)" }
+                            return "\(key)=\(String(describing: appState[key]))"
+                        }
+                        appStateText.append("{" + parts.joined(separator: ", ") + "}")
+                    }
+                    log(CWL("CarPlay 模式变化（modesChanged）全量：resources=[{1}]；appStates=[{2}]",
+                            [resourceText.joined(separator: "; "), appStateText.joined(separator: "; ")]))
+                    // 认领重申（方向 3）：音频资源被判给手机时回发一
+                    // 次认领，把「只旁听」改成「参与仲裁」；节流与上
+                    // 限在媒体会话内部管。
+                    if audioClaimedByPhone {
+                        state.media?.claimAudioResource(reason: "收到 modesChanged：音频资源 2 的 entity 被判给手机")
                     }
                 }
 

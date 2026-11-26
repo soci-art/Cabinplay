@@ -112,6 +112,11 @@ final class BleProbe: NSObject, ObservableObject {
     private var serverInfoNotifyRequested = false
     /// 点连接后数秒还没写出 ClientInfo 时打诊断日志的看门狗。
     private var writeWatchdog: DispatchWorkItem?
+    /// 看门狗自动重连（每轮连接最多一次）：5 秒蓝牙还没连上时取消
+    /// 当前尝试重连一次。取消会引来 didFailToConnect/didDisconnect
+    /// 回调、把流程误判失败——shield 标记让那一次回调被吞掉。
+    private var watchdogReconnectUsed = false
+    private var watchdogReconnectShield = false
     private var charClientInfo: CBCharacteristic?
     private var charServerInfoRef: CBCharacteristic?
     private var charClientAddr: CBCharacteristic?
@@ -379,6 +384,8 @@ final class BleProbe: NSObject, ObservableObject {
         }
         clientInfoWritten = false
         clientInfoWriteRetried = false
+        watchdogReconnectUsed = false
+        watchdogReconnectShield = false
         // type 候选链（CarWith y8/h.java M() 口径）：type 是手机声明的协议代际，
         // 只可能取 1002 或 1001——车机广播版本码 ≥1002 先发 1002，无响应回落 1001；
         // 版本码不到 1002 就只发 1001。绝不发广播码原值或 1003（取值域外，车机会整包丢弃）。
@@ -412,13 +419,30 @@ final class BleProbe: NSObject, ObservableObject {
     }
 
     /// 点连接后启动：数秒内还没写出 ClientInfo，就打一行状态说明卡在哪一步，
-    /// 并顺手再试一次写（防止某个回调丢了流程静默卡住）。
+    /// 并顺手再试一次写（防止某个回调丢了流程静默卡住）。若卡的这一步
+    /// 是「蓝牙根本没连上」（1742 日志 B–E 轮：state 恒为 1、连接尝试
+    /// 僵在半路），先取消当前尝试、自动重连一次（每轮最多一次），再
+    /// 给一轮看门狗；重连后还不行就按原流程收尾。
     private func startWriteWatchdog() {
         writeWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.flowCredential != nil, !self.clientInfoWritten else { return }
             if case .failed = self.flowPhase { return }
             if case .gotServerInfo = self.flowPhase { return }
+            if !self.watchdogReconnectUsed,
+               let peripheral = self.target ?? self.foundPeripheral,
+               peripheral.state != .connected, let central = self.central {
+                self.watchdogReconnectUsed = true
+                self.watchdogReconnectShield = true
+                self.log("UCar 连接：看门狗——点连接后 5 秒蓝牙还没连上（state=\(peripheral.state.rawValue)），取消当前连接尝试、自动重连一次")
+                central.cancelPeripheralConnection(peripheral)
+                self.target = peripheral
+                peripheral.delegate = self
+                self.lastConnectAttempt[peripheral.identifier] = Date()
+                central.connect(peripheral, options: nil)
+                self.startWriteWatchdog()
+                return
+            }
             let stateText: String
             if let t = self.target {
                 stateText = "蓝牙 state=\(t.state.rawValue)"
@@ -753,6 +777,13 @@ extension BleProbe: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        // 看门狗重连主动取消的那次尝试会引来这个回调：不是真失败，
+        // 吞掉，别把正在重连的流程判死。
+        if watchdogReconnectShield {
+            watchdogReconnectShield = false
+            log("UCar 连接：看门狗重连——旧尝试的取消回调已忽略，新连接尝试已在路上")
+            return
+        }
         log("蓝牙探针：蓝牙连接失败：\(error?.localizedDescription ?? "未知错误")")
         if flowCredential != nil {
             flowPhase = .failed("蓝牙连接失败")
@@ -762,6 +793,11 @@ extension BleProbe: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        if watchdogReconnectShield {
+            watchdogReconnectShield = false
+            log("UCar 连接：看门狗重连——旧尝试的取消回调已忽略，新连接尝试已在路上")
+            return
+        }
         log("蓝牙探针：蓝牙已断开\(error.map { "：\($0.localizedDescription)" } ?? "")")
         if target === peripheral { target = nil }
         if flowCredential != nil {

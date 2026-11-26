@@ -25,7 +25,18 @@ enum CarPlayInfo {
         return ((clamped - 30) + 2) / 5 * 5 + 30
     }
 
-    static func build(_ config: ReceiverConfiguration) -> [String: Any] {
+    /// mediaActive: whether the media audio stream (102) is actually
+    /// up at build time. The appStates entry for media reports it as-is
+    /// instead of a hard-coded false (which told the iPhone "the
+    /// accessory never has a media app active" for the whole session —
+    /// one half of why the modes arbitration kept awarding the audio
+    /// resource to the phone). Note: the appStateID↔app mapping is not
+    /// defined anywhere in this codebase; the layout below (1 = speech,
+    /// the only entry carrying speechMode; 2 = media; 3 = telephony)
+    /// follows the shape of this declaration itself. Speech/telephony
+    /// keep their previous values: speechMode -1 (no speech session)
+    /// and telephony false (call activity is not tracked here).
+    static func build(_ config: ReceiverConfiguration, mediaActive: Bool = false) -> [String: Any] {
         let area: [String: Any] = ["widthPixels": config.width, "heightPixels": config.height, "originXPixels": 0, "originYPixels": 0]
         var view = area; var safe = area; safe["drawUIOutsideSafeArea"] = true; view["safeArea"] = safe
         let widthPhysical = config.widthPhysicalMM
@@ -42,7 +53,7 @@ enum CarPlayInfo {
         var resources = [resource]
         if config.audioEnabled { var audio = resource; audio["resourceID"] = 2; resources.append(audio) }
         let modes: [String: Any] = ["resources": resources, "appStates": [
-            ["appStateID": 2, "state": false], ["appStateID": 1, "speechMode": -1], ["appStateID": 3, "state": false]]]
+            ["appStateID": 2, "state": mediaActive], ["appStateID": 1, "speechMode": -1], ["appStateID": 3, "state": false]]]
         let hidDevices = [
             hidDevice(HID.touch, name: CWL("CarWithin 触控屏"), descriptor: touchDescriptor(width: config.width, height: config.height)),
             hidDevice(HID.knob, name: CWL("CarWithin 旋钮"), descriptor: knobDescriptor),

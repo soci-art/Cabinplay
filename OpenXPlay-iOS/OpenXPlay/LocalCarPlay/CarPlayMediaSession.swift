@@ -22,6 +22,15 @@ final class CarPlayMediaSession {
     private var cseq = 0
     private var videoPackets = 0
     private var videoBytes = 0
+    /// 音频认领（AUDIO-CLAIM-DIFF）的节流状态：待发标记、上次发出
+    /// 时刻、本会话已发次数（上限 6 次，防与手机对刷）。
+    private var claimPending = false
+    private var lastClaimAt: DispatchTime?
+    private var claimCount = 0
+    private var claimCapLogged = false
+
+    /// 主流（102）此刻是否建着：/info 的 appStates 据实报要用。
+    var mediaStreamActive: Bool { audio[102] != nil }
     var onLog: ((String) -> Void)?
     var onBrowserAudio: ((Int, AVAudioPCMBuffer, UInt64) -> Void)?
     /// 编码音频 tap 转出：（流类型，裸 AAC 访问单元，主机微秒时间戳，格式）。
@@ -72,6 +81,11 @@ final class CarPlayMediaSession {
                     replies.append(["type": type, "dataPort": output.dataPort, "controlPort": output.controlPort,
                                     "streamConnectionID": connectionID])
                     onLog?(CWL("音频流 {1} 已就绪：{2} {3} Hz / {4} 声道", [String(describing: type), String(describing: format.name), String(describing: format.sampleRate), String(describing: format.channels)]))
+                    if type.intValue == 102 {
+                        // 主流刚建好就认领一次：开场仲裁就是在这几秒里
+                        // 把音频资源判给手机的，赶在定案前发言。
+                        claimAudioResource(reason: "主流 102 已建流")
+                    }
                     continue
                 }
                 guard type.intValue == 110, let connectionID = stream["streamConnectionID"] as? NSNumber else {
@@ -152,6 +166,7 @@ final class CarPlayMediaSession {
         connection.onClose = { [weak self] in self?.event = nil; self?.eventCipher = nil; self?.onLog?(CWL("事件通道已关闭")) }
         connection.start()
         flushNightMode()
+        flushPendingClaim()
     }
     var hasEventChannel: Bool { event != nil && eventCipher != nil }
     /// Full multitouch state: every slot is reported each time; missing slots report up.
@@ -184,6 +199,52 @@ final class CarPlayMediaSession {
     }
     private func sendHID(_ uuid: String, _ report: Data, label: String) -> Bool {
         sendCommand(["type": "hidSendReport", "uuid": uuid, "hidReport": report], label: label)
+    }
+    /// 主动认领音频资源（AUDIO-CLAIM-DIFF 方向 1＋3）：经事件通道
+    /// 发与手机通知同构的 modesChanged——音频资源（resourceID 2）
+    /// 的 entity/permanentEntity 指向配件（2）、媒体 appState 报活
+    /// 动。真车机上对应这个动作的是用户按车机音源键；我方以前只声
+    /// 明、只旁听、从不发言，仲裁开场几秒就定案、放歌永不重谈。
+    /// 时机：主流 102 建流后发一次；之后每次收到「R2 被判给手机」
+    /// 的通知（由 NativeReceiver 转交）节流重申——间隔 ≥8 秒、单
+    /// 会话最多 6 次，别和手机对刷。通道没连上时记待发，通道一连
+    /// 上就补发。验法看接收端日志三行：认领后手机回的 modesChanged
+    /// 里 R2 entity 是否变回 2、102 是否被 SETUP 且不紧跟
+    /// TEARDOWN、放歌时音频「数据包=」计数是否涨起来。
+    func claimAudioResource(reason: String) {
+        let now = DispatchTime.now()
+        if let last = lastClaimAt,
+           now.uptimeNanoseconds - last.uptimeNanoseconds < 8_000_000_000 {
+            claimPending = true
+            return
+        }
+        guard claimCount < 6 else {
+            if !claimCapLogged {
+                claimCapLogged = true
+                onLog?(CWL("音频认领：本会话已认领满 6 次，手机仍不放行就不再重申了（后续看蓝牙放行那条路）"))
+            }
+            return
+        }
+        let payload: [String: Any] = ["type": "modesChanged", "params": [
+            "resources": [["resourceID": 2, "entity": 2, "permanentEntity": 2]],
+            "appStates": [["appStateID": 2, "state": true]],
+        ]]
+        if sendCommand(payload, label: CWL("音频认领")) {
+            claimCount += 1
+            lastClaimAt = now
+            claimPending = false
+            onLog?(CWL("音频认领：已发 modesChanged 认领（第 {1} 次，{2}）——音频资源 2 的 entity/permanentEntity 报配件（2）、媒体 appState 报活动；等手机回 modesChanged 看 R2 归属变没变", [String(describing: claimCount), reason]))
+        } else {
+            claimPending = true
+            onLog?(CWL("音频认领：事件通道还没连上，先记下待发（{1}）", [reason]))
+        }
+    }
+    /// 事件通道刚连上时补发待发认领（绕过节流：这是通道就绪后的
+    /// 第一次机会，建流那次多半就卡在这里）。
+    private func flushPendingClaim() {
+        guard claimPending else { return }
+        lastClaimAt = nil
+        claimAudioResource(reason: "事件通道已连上，补发待发认领")
     }
     /// Asks the iPhone to encode an IDR/IRAP picture now. CarPlay only sends one keyframe at stream
     /// start, so every decoder recovery and every late browser viewer depends on this command.

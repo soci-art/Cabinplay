@@ -88,6 +88,9 @@ final class LocalCarPlaySession: ObservableObject {
     private var identity: AccessoryIdentity?
     private var configuration: ReceiverConfiguration?
     private var startParams: (width: Int, height: Int, fps: Int)?
+    /// 本次启动的地址是上层兜底给的（不保证已在网卡上）：beginStart
+    /// 校验时放宽「地址须属于本机」一项，靠地址看门狗事后对齐。
+    private var startAddressWasOverride = false
     /// 因等定位授权而挂起的本次启动：授权结果回来后自动续启，不让
     /// 用户再点一次。stop() 会把它清掉，清掉后授权回调不再续启。
     private var pendingSSIDStart: (address: String, identity: AccessoryIdentity)?
@@ -305,7 +308,12 @@ final class LocalCarPlaySession: ObservableObject {
 
     // MARK: 启停
 
-    func start(width: Int, height: Int, fps: Int) {
+    /// addressOverride：无回连重试重开时上层轮询等过地址仍读不到，
+    /// 用流程已知的本机地址兜底启动（见 ContentView 的等地址重开）。
+    /// 覆盖地址不保证此刻就在网卡上，所以校验放宽「地址须属于本机」
+    /// 这一项；地址真正落稳后，启动期地址看门狗会发现不一致并按真
+    /// 地址自动重开对齐，不会长期用错地址跑。
+    func start(width: Int, height: Int, fps: Int, addressOverride: String? = nil) {
         guard !isRunning else { return }
         startParams = (width, height, fps)
         bridge.setFPS(Double(fps))
@@ -318,11 +326,18 @@ final class LocalCarPlaySession: ObservableObject {
             return
         }
         identity = loadedIdentity
-        guard let address = ReceiverConfiguration.wifiIPv4Address()
+        guard let address = addressOverride
+                ?? ReceiverConfiguration.wifiIPv4Address()
                 ?? LocalNetwork.ipv4Addresses().first else {
             phase = .failed("拿不到本机地址")
             onLog?("本机 CarPlay：拿不到本机 Wi-Fi 地址——先连上车机热点（或任意 Wi-Fi）再启动")
             return
+        }
+        if let addressOverride {
+            startAddressWasOverride = true
+            onLog?("本机 CarPlay：用流程已知地址 \(addressOverride) 兜底启动（en0 此刻读不到地址；地址落稳后会话会按真地址自动重开对齐）")
+        } else {
+            startAddressWasOverride = false
         }
         // Wi-Fi 身份按可信度选（见 pickWiFiIdentity）：只有本轮车机会话
         // 刚带回的新鲜凭据才许用车机 DIRECT- 名；其余情况一律用当前网
@@ -363,7 +378,7 @@ final class LocalCarPlaySession: ObservableObject {
         config.maxFPS = fps
         config.videoCodec = .h264
         do {
-            try config.validate()
+            try config.validate(requiresLocalAddress: !startAddressWasOverride)
         } catch {
             phase = .failed(error.localizedDescription)
             onLog?("本机 CarPlay：配置没过校验——\(error.localizedDescription)")

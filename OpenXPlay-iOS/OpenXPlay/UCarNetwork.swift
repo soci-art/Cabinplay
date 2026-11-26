@@ -49,7 +49,16 @@ final class UCarNetworkJoiner {
     private var deadline: Date?
     private var warnedSlow = false
     private var pendingSSID: String?
+    private var pendingPsk: String?
     private var pendingBleCarIP: String?
+    /// 入网重申请（1742 日志 B–E 轮教训：系统接受加入后 en0 地址 90
+    /// 秒不落、整轮干等到超时）：接受后约 15 秒仍无新地址就直接重
+    /// apply 一次（不 remove——remove 会把用户手动连上的也踢掉，直
+    /// 接重 apply 副作用最小），最多 2 次，总等待仍是原来的 90 秒。
+    /// apply 报错走手动路（用户拒绝/程序化失败）时不重申请。
+    private var lastApplyAt: Date?
+    private var applyFailed = false
+    private var reapplyCount = 0
     /// 入网前 en0 上的全部 IPv4（基线）。新地址 = 不在基线里的私有地址。
     private var baselineAddresses: Set<String> = []
     /// apply 回了 alreadyAssociated：系统认定已连在目标网络上，轮询时可
@@ -127,9 +136,13 @@ final class UCarNetworkJoiner {
         warnedSlow = false
         didJoin = false
         applyClaimedAssociated = false
+        lastApplyAt = nil
+        applyFailed = false
+        reapplyCount = 0
         self.completion = completion
 
         pendingSSID = ssid
+        pendingPsk = psk
         pendingBleCarIP = (bleCarIP?.isEmpty == false) ? bleCarIP : nil
 
         let baseline = Self.en0Addresses()
@@ -162,6 +175,17 @@ final class UCarNetworkJoiner {
         // 程序化加入：NEHotspotConfiguration（系统会弹确认框，用户点「加入」）。
         onStatus?("入网中：请在系统弹窗里点「加入」连上车机网络")
         onLog?("UCar 入网：请系统加入「\(ssid)」——会弹系统确认框，点「加入」才执行；若报 entitlement 相关错误，说明签名描述文件不带 HotspotConfiguration 能力，改走手动加入")
+        applyJoinConfiguration(restartPolling: true)
+        // apply 的完成回调在个别系统版本上可能迟迟不回，轮询兜底先起着。
+        startPolling()
+    }
+
+    /// 发起一次加入申请（首次与重申请共用）。restartPolling 只给首
+    /// 次：重申请不许重置 90 秒总等待（startPolling 会重设 deadline）。
+    private func applyJoinConfiguration(restartPolling: Bool) {
+        guard let ssid = pendingSSID, !ssid.isEmpty else { return }
+        let psk = pendingPsk
+        lastApplyAt = Date()
         let configuration = NEHotspotConfiguration(ssid: ssid, passphrase: psk ?? "", isWEP: false)
         configuration.joinOnce = false
         NEHotspotConfigurationManager.shared.apply(configuration) { [weak self] error in
@@ -174,19 +198,21 @@ final class UCarNetworkJoiner {
                     self.onLog?("UCar 入网：系统说已经连在这个网络上了，等地址确认")
                 } else if nsError.domain == NEHotspotConfigurationErrorDomain,
                           nsError.code == NEHotspotConfigurationError.userDenied.rawValue {
+                    self.applyFailed = true
                     self.onLog?("UCar 入网：系统弹窗被拒绝了。改走手动：去系统设置→Wi-Fi 连「\(ssid)」\((psk?.isEmpty == false) ? "，密码就是蓝牙带回的那个（已存下）" : "")，连上后这边会自动往下走")
                     self.onStatus?("入网中：请去系统设置手动连「\(ssid)」")
                 } else {
+                    self.applyFailed = true
                     self.onLog?("UCar 入网：程序化加入失败（\(nsError.domain) \(nsError.code)：\(nsError.localizedDescription)）。改走手动：去系统设置→Wi-Fi 连「\(ssid)」，连上后这边会自动往下走")
                     self.onStatus?("入网中：请去系统设置手动连「\(ssid)」")
                 }
             } else {
                 self.onLog?("UCar 入网：系统已接受加入「\(ssid)」，等本机地址变化确认入网（实况每 1.5 秒一行）")
             }
-            self.startPolling()
+            if restartPolling {
+                self.startPolling()
+            }
         }
-        // apply 的完成回调在个别系统版本上可能迟迟不回，轮询兜底先起着。
-        startPolling()
     }
 
     private func startPolling() {
@@ -233,6 +259,17 @@ final class UCarNetworkJoiner {
            let local = addresses.first(where: { Self.sameSlash24($0, bleCarIP) }) {
             joined(localIP: local, via: "本机地址已与 ServerInfo 给的车机地址 \(bleCarIP) 同 /24")
             return
+        }
+
+        // 入网重申请：系统接受加入后约 15 秒仍没拿到新地址（判据一
+        // 至四都没命中），直接重 apply 一次，最多 2 次；总等待仍是
+        // 下面的 90 秒 deadline，不重置、不无限重试。apply 已报错走
+        // 手动路的不重申请（用户在手动连，程序别插手）。
+        if !applyFailed, reapplyCount < 2,
+           let lastApplyAt, Date().timeIntervalSince(lastApplyAt) >= 15 {
+            reapplyCount += 1
+            onLog?("UCar 入网：系统接受加入后约 15 秒仍没拿到新地址，重新发起一次加入申请（重申请第 \(reapplyCount) 次，最多 2 次；总等待仍是 90 秒，不重置）")
+            applyJoinConfiguration(restartPolling: false)
         }
 
         if let deadline {

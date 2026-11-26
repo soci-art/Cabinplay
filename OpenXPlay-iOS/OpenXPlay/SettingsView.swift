@@ -1,17 +1,20 @@
 // SPDX-FileCopyrightText: 2026 OpenXPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// 设置：只留真用得上的——输出尺寸、身份状态（只读）、关于。
+// 设置：只留真用得上的——身份状态（只读）、触控校准入口、Wi-Fi 名
+// 兜底、关于。分辨率已改自动协商，不再有手动菜单。
 // 身份用 CabinPlay 自带的那套（包内文件，启动本机 CarPlay 时自验配对），
 // 不需要再导入。
 
 import SwiftUI
 
 struct SettingsView: View {
-    let selectedSize: (Int, Int)
-    let onSelectSize: (Int, Int) -> Void
-
-    private let sizes: [(Int, Int)] = [(854, 480), (1280, 720), (1920, 1080)]
+    /// 当前针对的车机（刚发现的，或上次连过的那台）：触控校准按它
+    /// 存取。 nil 时校准入口置灰。
+    let calibrationCarId: String?
+    /// CarLink 是否正在出画（校准要触控链活着才能做）。
+    let calibrationAvailable: Bool
+    let onOpenCalibration: () -> Void
 
     // Wi-Fi 名兜底：记住值与授权状态进页时刷新一次；手填保存后即时更新。
     @State private var rememberedSSID = LocalCarPlaySession.rememberedInfraSSID
@@ -33,6 +36,15 @@ struct SettingsView: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
+    /// 校准入口右侧的状态小字：还没认出车/已预置/已校准/未校准。
+    private var calibrationStatusText: String {
+        guard let calibrationCarId else { return "还没连过车机" }
+        if let effective = TouchCalibrationStore.effectiveRect(for: calibrationCarId) {
+            return effective.isPreset ? "已用内置预置" : "已校准"
+        }
+        return "还没校准"
+    }
+
     private var identityReady: Bool {
         Bundle.main.url(forResource: "certificate", withExtension: "p7b") != nil
             && Bundle.main.url(forResource: "leaf", withExtension: "cer") != nil
@@ -52,26 +64,26 @@ struct SettingsView: View {
             }
 
             Section {
-                ForEach(sizes.indices, id: \.self) { index in
-                    let size = sizes[index]
-                    Button {
-                        onSelectSize(size.0, size.1)
-                    } label: {
-                        HStack {
-                            Text("\(size.0)×\(size.1)")
-                                .foregroundStyle(.primary)
-                            Spacer()
-                            if selectedSize.0 == size.0 && selectedSize.1 == size.1 {
-                                Image(systemName: "checkmark")
-                                    .foregroundStyle(Color.sunsetAccent)
-                            }
-                        }
+                Button {
+                    onOpenCalibration()
+                } label: {
+                    HStack {
+                        Text("校准车机触控")
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Text(calibrationStatusText)
+                            .foregroundStyle(.secondary)
+                            .font(.footnote)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .disabled(calibrationCarId == nil)
             } header: {
-                Text("输出")
+                Text("触控")
             } footer: {
-                Text("分辨率本机 CarPlay 与 CarLink 共用，在下次启动会话时生效。")
+                Text("每台车机屏上画面的位置不一样，校准一次（在车机屏上点画面四条边的中间），点起来才对得准。结果按这台车单独存，换车互不影响。分辨率已经改成自动协商了，不用在这里选。")
             }
 
             Section {

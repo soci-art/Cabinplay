@@ -129,28 +129,31 @@ final class CarPlayAudio {
                 retryPlaybackAt = now + 0.5
                 #if os(iOS)
                 let session = AVAudioSession.sharedInstance()
+                let routeOutputs = session.currentRoute.outputs
+                let routeHasCarAudio = routeOutputs.contains { $0.portType == .carAudio }
+                let routeHasA2DP = routeOutputs.contains { $0.portType == .bluetoothA2DP }
+                // 类别（AUDIO-BT-ROUTE-DIFF）：需要 playAndRecord 的场
+                // 合——带麦克风、已钉扬声器、或路由只有 CarPlay 口没
+                // 有蓝牙（要钉扬声器避回路，得先切过去）。类别选项恒
+                // 并入 .allowBluetoothA2DP：不给这个选项，被强制切的
+                // playAndRecord 类别下蓝牙 A2DP 连候选资格都没有。
+                // 通话流不掺和：这里从不设 .allowBluetooth（HFP），
+                // 抢不到通话路由，通话维持手机扬声器＋手机麦克风。
                 let needsDuplexCategory = microphone != nil || Self.hasSpeakerOverride
+                    || (routeHasCarAudio && !routeHasA2DP)
                 var options: AVAudioSession.CategoryOptions = needsDuplexCategory ? [.defaultToSpeaker] : []
+                options.insert(.allowBluetoothA2DP)
                 if BackgroundKeepAlive.holdsAudioSession { options.insert(.mixWithOthers) }
                 let category: AVAudioSession.Category = needsDuplexCategory ? .playAndRecord : .playback
                 if session.category != category || session.mode != .default || session.categoryOptions != options {
                     try session.setCategory(category, mode: .default, options: options)
                 }
                 try session.setActive(true)
-                if session.currentRoute.outputs.contains(where: { $0.portType == .carAudio }) {
-                    // In the same-device session CarAudio is our own virtual CarPlay receiver.
-                    // Feeding decoded audio back into that route leaves the physical speaker silent.
-                    if session.category != .playAndRecord {
-                        try session.setCategory(.playAndRecord, mode: .default, options: options.union(.defaultToSpeaker))
-                    }
-                    do {
-                        try session.overrideOutputAudioPort(.speaker)
-                        Self.hasSpeakerOverride = true
-                        onLog?(CWL("本机音频避开 CarPlay 路由，改用 iPhone 扬声器"))
-                    } catch {
-                        Self.deactivateSessionIfIdle()
-                        throw error
-                    }
+                Self.installRouteObserverIfNeeded()
+                Self.routeLogSink = { [weak self] message in self?.onLog?(message) }
+                if let failure = Self.reevaluateRouteOverride(reason: "起播") {
+                    Self.deactivateSessionIfIdle()
+                    throw failure
                 }
                 #endif
                 let engine: AVAudioEngine
@@ -270,6 +273,65 @@ final class CarPlayAudio {
         }
     }
     #if os(iOS)
+    /// 路由评估的日志出口（最近一条流的 onLog）：routeChange 通知是
+    /// 系统回调、没有实例在手，借这个静态口把日志送回 App 日志。
+    private static var routeLogSink: ((String) -> Void)?
+    private static var routeObserverInstalled = false
+
+    /// 扬声器钉子的统一评估（起播与路由变化共用，AUDIO-BT-ROUTE
+    /// -DIFF 第 3 节）：路由含 CarPlay 音频口、且不含蓝牙 A2DP 时才
+    /// 钉——carAudio 口对面是我们自己的接收端，解码声从那儿出会被
+    /// 当作发给车机的音频送回本 App 再解码（回路、扬声器无声）；
+    /// A2DP 是单向的、不回路，只避 CarPlay、放行蓝牙。没有「强制
+    /// 蓝牙」的 API，放行只是给资格：虚拟 CarPlay 在场时 iOS 让不
+    /// 让本 App 输出落 A2DP 只能真机验。每处规则变化打一行日志。
+    /// 返回非 nil 表示「该钉没钉成」（与旧行为一致，调用方中止起播）。
+    private static func reevaluateRouteOverride(reason: String) -> Error? {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+        let hasCarAudio = outputs.contains { $0.portType == .carAudio }
+        let hasA2DP = outputs.contains { $0.portType == .bluetoothA2DP }
+        let log = routeLogSink
+        if hasCarAudio && !hasA2DP {
+            guard !hasSpeakerOverride else { return nil }
+            do {
+                try session.overrideOutputAudioPort(.speaker)
+                hasSpeakerOverride = true
+                log?(CWL("音频路由评估（{1}）：路由含 CarPlay 音频口、没有蓝牙 A2DP——钉住 iPhone 扬声器（避开 CarPlay 回路）", [reason]))
+                return nil
+            } catch {
+                log?(CWL("音频路由评估（{1}）：想钉扬声器没钉成——{2}", [reason, error.localizedDescription]))
+                return error
+            }
+        }
+        if hasSpeakerOverride {
+            try? session.overrideOutputAudioPort(.none)
+            hasSpeakerOverride = false
+            log?(CWL("音频路由评估（{1}）：路由已离开 CarPlay 独占，松开扬声器钉子，输出按系统路由走", [reason]))
+        }
+        if hasA2DP {
+            log?(CWL("音频路由评估（{1}）：路由含蓝牙 A2DP，不钉扬声器，放行蓝牙输出", [reason]))
+        }
+        return nil
+    }
+
+    /// 路由变化监听（只装一次）：离开 carAudio 落到 A2DP 时松钉、
+    /// 回到只有 carAudio 时重新钉——旧实现整场不松，路由中途变了
+    /// 也没人重估，蓝牙永远出不来。
+    private static func installRouteObserverIfNeeded() {
+        guard !routeObserverInstalled else { return }
+        routeObserverInstalled = true
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil
+        ) { _ in
+            // 只在还有流在播时重估：没流时钉子状态留给起播那一刻定。
+            renderQueue.async {
+                guard playingStreams > 0 else { return }
+                _ = reevaluateRouteOverride(reason: "路由变化")
+            }
+        }
+    }
+
     /// Releases the shared session after the last stream, unless the background keep-alive still
     /// plays in it: deactivating would stop that player too and iOS would suspend the app.
     private static func deactivateSessionIfIdle(releaseSpeakerOverride: Bool = false) {
@@ -282,7 +344,9 @@ final class CarPlayAudio {
             guard releaseSpeakerOverride else { return }
             hasSpeakerOverride = false
             try? session.overrideOutputAudioPort(.none)
-            try? session.setCategory(.playback, mode: .default, options: keepAlive ? [.mixWithOthers] : [])
+            var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+            if keepAlive { options.insert(.mixWithOthers) }
+            try? session.setCategory(.playback, mode: .default, options: options)
         }
         guard !keepAlive else { return }
         try? session.setActive(false, options: .notifyOthersOnDeactivation)

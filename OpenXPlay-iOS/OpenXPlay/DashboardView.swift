@@ -33,47 +33,19 @@ struct DashboardView: View {
 
     @Binding var blePinField: String
 
-    /// 当前生效的分辨率（与 ContentView 的状态实时绑定，菜单打勾用）。
-    let selectedSize: (Int, Int)
+    /// 当前生效的分辨率（自动协商的当前档，只展示、不可手选）。
+    let currentSizeLabel: String
 
-    let onSelectSize: (Int, Int) -> Void
+    /// 首次连某台没校准记录的车且已出画时，给一行可点的校准提示。
+    let showCalibrationHint: Bool
+    let onOpenCalibration: () -> Void
+    let onDismissCalibrationHint: () -> Void
+
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
     let onConnectBle: () -> Void
 
     @FocusState private var blePinFocused: Bool
-
-    // MARK: 分辨率菜单（勾选与实际生效值绑定）
-
-    private struct ResolutionOption: Identifiable {
-        let width: Int
-        let height: Int
-        var label: String { "\(width)×\(height)" }
-        var id: String { label }
-    }
-
-    private static let resolutionOptions: [ResolutionOption] = [
-        ResolutionOption(width: 854, height: 480),
-        ResolutionOption(width: 1280, height: 720),
-        ResolutionOption(width: 1920, height: 1080),
-    ]
-
-    private func sizeLabel(_ size: (Int, Int)) -> String {
-        "\(size.0)×\(size.1)"
-    }
-
-    /// 菜单内 Picker 的选中值：读的是当前生效分辨率，写回调 onSelectSize
-    /// 更新上层状态——两边共用同一个状态源，勾永远落在实际生效的那一档。
-    private var sizeSelection: Binding<String> {
-        Binding(
-            get: { sizeLabel(selectedSize) },
-            set: { newLabel in
-                if let option = Self.resolutionOptions.first(where: { $0.label == newLabel }) {
-                    onSelectSize(option.width, option.height)
-                }
-            }
-        )
-    }
 
     var body: some View {
         ScrollView {
@@ -113,27 +85,38 @@ struct DashboardView: View {
             HStack {
                 Text("分辨率").font(.footnote.weight(.medium))
                 Spacer()
-                Menu {
-                    // Picker 放进 Menu 是系统原生的勾选菜单形态：当前生效
-                    // 的那一档自动带勾，且与 selectedSize 实时绑定——切换
-                    // 后重新打开菜单，勾落在新选中的那一档上。
-                    Picker("分辨率", selection: sizeSelection) {
-                        ForEach(Self.resolutionOptions) { option in
-                            Text(option.label).tag(option.label)
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "aspectratio")
-                        Text(sizeLabel(selectedSize))
-                            .font(.caption2.weight(.semibold))
-                    }
-                    .padding(.horizontal, 10)
-                    .frame(height: 38)
+                HStack(spacing: 4) {
+                    Image(systemName: "aspectratio")
+                    Text("自动 · 当前 \(currentSizeLabel)")
+                        .font(.caption2.weight(.semibold))
                 }
-                .foregroundStyle(.primary)
+                .padding(.horizontal, 10)
+                .frame(height: 38)
                 .background(.ultraThinMaterial, in: Capsule())
-                .accessibilityLabel("分辨率")
+                .accessibilityLabel("分辨率（自动协商）")
+            }
+
+            if showCalibrationHint {
+                HStack(spacing: 8) {
+                    Button {
+                        Haptics.tap()
+                        onOpenCalibration()
+                    } label: {
+                        Label("这台车还没校准触控，点这里花半分钟校准一次，点得更准", systemImage: "hand.tap")
+                            .font(.caption.weight(.medium))
+                            .multilineTextAlignment(.leading)
+                    }
+                    .foregroundStyle(Color.sunsetAccent)
+                    Spacer()
+                    Button {
+                        onDismissCalibrationHint()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.bold))
+                    }
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("不再提示校准")
+                }
             }
 
             if localPhaseFailed {
