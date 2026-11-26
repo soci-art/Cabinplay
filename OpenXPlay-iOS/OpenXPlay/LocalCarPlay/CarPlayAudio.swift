@@ -83,6 +83,8 @@ final class CarPlayAudio {
     private static let telephonyLock = NSLock()
     private static let musicInstances = NSHashTable<CarPlayAudio>.weakObjects()
     private var duplexRegistered = false
+    // 只有真被通话按停过的流，通话结束才恢复；没在播的流不抢跑。
+    private var suspendedByTelephony = false
     #if os(iOS)
     private static var hasSpeakerOverride = false
     #endif
@@ -378,6 +380,7 @@ final class CarPlayAudio {
             guard let self, self.active, let player = self.player else { return }
             if self.playing {
                 player.pause()
+                self.suspendedByTelephony = true
                 self.buffering = true
                 self.queuedFrames = 0
                 self.onLog?(CWL("通话开始：本条音乐已暂停"))
@@ -387,7 +390,8 @@ final class CarPlayAudio {
 
     fileprivate func resumeAfterTelephony() {
         queue.async { [weak self] in
-            guard let self, self.active, let player = self.player else { return }
+            guard let self, self.active, self.suspendedByTelephony, let player = self.player else { return }
+            self.suspendedByTelephony = false
             player.play()
             self.buffering = false
             self.onLog?(CWL("通话结束：本条音乐已恢复"))
