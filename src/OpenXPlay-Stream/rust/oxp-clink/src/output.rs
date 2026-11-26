@@ -705,6 +705,14 @@ fn media_worker(
     let mut late_live = false;
     let mut adts = Vec::new();
     let mut muxer = None;
+    // The `audio_enabled` the live muxer was built with; `None` while there
+    // is no muxer. The muxer freezes this into its PMT at construction, so a
+    // late `media_audio` negotiation needs a rebuild (see below).
+    let mut muxer_audio_enabled: Option<bool> = None;
+    // Audio frames actually written into the TS (emitted, not just queued),
+    // reported through the diagnostic channel every 500 frames so the app
+    // log can prove audio reached the car without needing a trace run.
+    let mut audio_frames_written = 0u64;
     let mut trace_stats = run.trace.as_ref().map(|_| TraceMedia::default());
     while run.active.load(Ordering::Acquire) {
         let session = run.session.lock().unwrap().clone();
@@ -750,6 +758,7 @@ fn media_worker(
                     statistics.new_session(h.queue.dropped, path.send_stalls);
                     reported_at = None;
                     muxer = None;
+                    muxer_audio_enabled = None;
                     session_codec = None;
                     keyframes = KeyframeRequests::default();
                 }
@@ -813,6 +822,21 @@ fn media_worker(
         } else {
             VideoConfig::Avc(&placeholder_config)
         };
+        // `media_audio` can turn true after the muxer was built: its PMT is
+        // frozen at construction, so a muxer built without audio would carry
+        // no audio stream for the whole session — and the first audio write
+        // would fail the whole media worker. Rebuild it the same way a
+        // session change does when the negotiated audio arrives late; the
+        // rebuild happens before any audio drain in this same iteration, so
+        // `write_audio` can no longer hit the disabled-audio error.
+        if muxer_audio_enabled == Some(false) && snapshot.media_audio {
+            muxer = None;
+            muxer_audio_enabled = None;
+            listener.diagnostic("音频桥：车机音频协商在封装器建好后才到，已重建封装器让节目表带上音频流");
+        }
+        if muxer.is_none() {
+            muxer_audio_enabled = Some(snapshot.media_audio);
+        }
         let muxer = muxer.get_or_insert_with(|| {
             if let Some(t) = &run.trace {
                 let codec = codec_name(session_codec);
@@ -1108,6 +1132,14 @@ fn media_worker(
                             stats.last_audio_pts = pts;
                             if result != Emit::Dropped {
                                 stats.audio_frames += 1;
+                            }
+                        }
+                        if result != Emit::Dropped {
+                            audio_frames_written += 1;
+                            if audio_frames_written % 500 == 0 {
+                                listener.diagnostic(&format!(
+                                    "音频桥：已向车机送出 {audio_frames_written} 个声音包"
+                                ));
                             }
                         }
                         transport_pts = pts;

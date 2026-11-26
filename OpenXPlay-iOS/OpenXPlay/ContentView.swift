@@ -249,8 +249,11 @@ struct ContentView: View {
 
     // MARK: 本机 CarPlay 无回连自动重试（连接车机流程专用）
 
-    /// 接续/启动后挂上：约 12 秒仍无控制回连，就停掉以同凭据同地址重新
-    /// 发起，最多共 3 次尝试。只重发从没回连过的发起——没回连过的发起
+    /// 接续/启动后挂上：第一轮等 8 秒、之后每轮等 12 秒仍无控制回连，
+    /// 就停掉以同凭据同地址重新发起，最多共 3 次尝试。首轮缩到 8 秒是
+    /// 因为历史成功回连都在 6 秒内到（1 秒/1 秒/6 秒，ROTATION-MARKER
+    /// -DIFF 第 4 节），8 秒留有余量又不空等；不能再缩到 6 秒——会和
+    /// 第 6 秒才到的回连赛跑、把即将连上的会话停掉重开。只重发从没回连过的发起——没回连过的发起
     /// 不占「重启后第一次机会」；一旦回连（controlConnected）立刻收手，
     /// 之后绝不再碰这个会话的生命周期（帧桥汇合、clink 重连都不许动
     /// 它）。3 次都无回连就停手并打人话日志：这个系统一轮里只要有会话
@@ -264,6 +267,10 @@ struct ContentView: View {
 
     private func scheduleLocalCallbackCheck(generation: Int) {
         localRetryWork?.cancel()
+        // 本轮检查窗：每个身份的第一轮 8 秒，第二轮起 12 秒（定版依据
+        // 见 armLocalCallbackRetry 的注释）。在排期这一刻按当前尝试次
+        // 数定格，日志里如实打出本轮等了多少秒，方便对账。
+        let waitSeconds = localAttemptCount == 1 ? 8 : 12
         let item = DispatchWorkItem {
             guard generation == localRetryGeneration else { return }
             if localSession.controlConnected || localSession.phase == .streaming {
@@ -290,13 +297,13 @@ struct ContentView: View {
                 return
             }
             localAttemptCount += 1
-            appendLog("本机 CarPlay：发起后 12 秒没等到系统回连，自动重试（第 \(localAttemptCount) 次/共 3 次，同凭据同地址重新发起）")
+            appendLog("本机 CarPlay：发起后 \(waitSeconds) 秒没等到系统回连，自动重试（第 \(localAttemptCount) 次/共 3 次，同凭据同地址重新发起）")
             stopLocalSession(reason: "连接车机：无回连自动重试")
             startLocalSession()
             scheduleLocalCallbackCheck(generation: generation)
         }
         localRetryWork = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(waitSeconds), execute: item)
     }
 
     private func cancelLocalCallbackRetry() {
@@ -317,12 +324,13 @@ struct ContentView: View {
     /// 后被接续完成），再入网；地址一切过来按新地址重开接续、重发
     /// StartSession，clink 试序同时开始（见 handleUCarServerInfo）。
     private func connectCarFlow() {
-        // 预轮换：上次会话真正连上过又结束（标记在会话停止时落下），
-        // 系统侧那本旧账多半已经楔住——先换新设备标识再发起，跳过注定
-        // 失败的同身份等待。新会话连上后标记自动清除。
+        // 预轮换：上次会话真正连上过（标记在它连上那一刻就落下，见
+        // LocalCarPlaySession.preRotationPending），系统侧那本旧账多半
+        // 已经楔住——先换新设备标识再发起，跳过注定失败的同身份等待。
+        // 标记不在这里清：新会话连上时先清旧的、再按本次连上重新落。
         if LocalCarPlaySession.preRotationPending {
             ReceiverConfiguration.rotatePersistentDeviceID()
-            appendLog("本机 CarPlay：已换新设备标识（避开系统里卡住的旧记录）——上次会话连上过又结束了，这次先换标识再连接")
+            appendLog("本机 CarPlay：检测到上次会话标记，先换新设备标识再连接（避开系统里卡住的旧记录）")
         }
         appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
         bleProbe.connect(pin: blePin)
@@ -575,6 +583,13 @@ struct ContentView: View {
         CarLinkCore.shared.stop()
         carLinkRunning = false
         carLinkState = .idle
+        // 本机 CarPlay 会话也一并收尾，走统一的 stopLocalSession：以前
+        // 这里只停车机链路，会话本体被留在原地、最后由原生侧事件通道
+        // 自行关闭收场，不经过 LocalCarPlaySession.stop()，预轮换标记
+        // 的 stop 写点被整条绕过（ROTATION-MARKER-DIFF 实锤）。标记现
+        // 已在连上时就落下，这里再收尾是让会话干净结束（停画中画＋
+        // 会话 stop＋解码器复位，都在 stopLocalSession 里，别重复做）。
+        stopLocalSession(reason: "用户断开车机")
         localSession.carLinkPlayingChanged(false)
         carLinkDetail = "已断开"
         appendLog("CarLink 已断开")

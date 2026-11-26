@@ -53,6 +53,7 @@ final class CarPlayMediaSession {
                     audio.removeValue(forKey: type.intValue)?.stop()
                     let output = try CarPlayAudio(secret: secret, peerAddress: peerAddress,
                         connectionID: connectionID.uint64Value, format: format, microphonePort: microphonePort)
+                    output.streamType = type.intValue
                     output.onLog = { [weak self] in self?.onLog?($0) }
                     // 音频桥只 tap 主流（102）的 AAC：裸帧多喂一份给车机
                     // 核心，本机扬声器播放保持原样。语音/通话流不走这条。

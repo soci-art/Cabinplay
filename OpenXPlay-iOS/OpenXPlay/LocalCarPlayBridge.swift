@@ -61,6 +61,7 @@ final class LocalCarPlayBridge {
                 self.audioFormatKey = nil
                 self.audioPacketsPushed = 0
                 self.audioPushFailures = 0
+                self.audioPacketsHeldBack = 0
             }
         }
     }
@@ -142,6 +143,9 @@ final class LocalCarPlayBridge {
     private var audioFormatKey: String?
     private var audioPacketsPushed = 0
     private var audioPushFailures = 0
+    /// 车机还没进入出画状态时被静默门拦下的声音包数（以前完全静默，
+    /// 日志里看不出声音到底来过没有，AUDIO-SILENT-DIFF 点名补上）。
+    private var audioPacketsHeldBack = 0
 
     /// 接收端 tap 到的主流 AAC 帧。hostMicros 是 CarPlayAudio 的
     /// browserTimestamp（主机开机单调时钟微秒），喂核心前必须换算到
@@ -150,7 +154,18 @@ final class LocalCarPlayBridge {
     /// 核心队列压住丢掉。本机扬声器播放是另一条路，这里只是多喂一份。
     func appendAudio(stream: Int, samples: Data, hostMicros: UInt64, format: ReceiverAudioFormat) {
         queue.async { [weak self] in
-            guard let self, self.clinkPlaying, format.isAAC else { return }
+            guard let self else { return }
+            // 非 AAC 的包不归这条桥（tap 只装在主流 AAC 实例上，这里
+            // 只是双保险），静默放过；车机还没出画时拦下的 AAC 包要
+            // 计数并节流打日志，不再静默吞掉（AUDIO-SILENT-DIFF）。
+            guard format.isAAC else { return }
+            guard self.clinkPlaying else {
+                self.audioPacketsHeldBack += 1
+                if self.audioPacketsHeldBack == 1 || self.audioPacketsHeldBack % 300 == 0 {
+                    self.onLog?("音频桥：车机还没进入出画状态，声音包先拦下（第 \(self.audioPacketsHeldBack) 个）——出画后开始往车机送")
+                }
+                return
+            }
             if self.clockStart == nil { self.clockStart = DispatchTime.now() }
             let epochMicros = (self.clockStart?.uptimeNanoseconds ?? 0) / 1000
             let ptsMicros = max(0, Int64(hostMicros) - Int64(epochMicros))
@@ -174,10 +189,12 @@ final class LocalCarPlayBridge {
             }
             if CarLinkCore.shared.pushAudioPacket(stream: UInt32(stream), data: samples, ptsMicros: ptsMicros) {
                 audioPacketsPushed += 1
+                // 周期计数不在这里打了：改由核心侧按「真正写进 TS 发
+                // 往车机的帧数」每 500 帧打一行「已向车机送出 N 个声音
+                // 包」——那是更准的口径（这里数的只是核心收下入队的
+                // 包），两边都打会重复刷屏。被拒计数仍看下面失败行。
                 if audioPacketsPushed == 1 {
                     onLog?("音频桥：首个声音包已喂给车机核心（\(samples.count) 字节）")
-                } else if audioPacketsPushed % 500 == 0 {
-                    onLog?("音频桥：已向车机喂第 \(audioPacketsPushed) 个声音包（累计被拒 \(audioPushFailures) 次）")
                 }
             } else {
                 audioPushFailures += 1

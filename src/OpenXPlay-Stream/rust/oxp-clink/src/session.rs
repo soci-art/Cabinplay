@@ -905,10 +905,19 @@ impl ClinkSession {
             .with_view_size(move |width, height| listener.view_size(width, height))
             .with_diagnostic(move |message| diagnostic_listener.diagnostic(&message));
         let mut audio_anchor: Option<bool> = None;
+        let mut mode_anchor: Option<(u32, u32)> = None;
         if let Some(trace) = &self.options.trace {
             touch = touch.with_trace(trace.clone(), self.trace_session());
         }
         let mut wfd = WfdSource::with_hevc_mode(a.local_ipv4.to_string(), ports, self.options.hevc);
+        // WFD 向车机声明的画面尺寸必须与实际出流严格一致：出流尺寸就是
+        // 用户所选输出分辨率（FFI 传入的 picture_size，与本机 CarPlay 会
+        // 话 StartSession 用的是同一份 targetSize）。声明一直写死
+        // 1280x720 时，选 1920x1080 出流触控整体偏移、选 720p 才准
+        // （TOUCH-MAP-DIFF 旁注＋真机实证），病根即声明与实际不一致。
+        if let Some((width, height)) = self.options.picture_size {
+            wfd.set_display_size(width, height);
+        }
         for service in [
             ports.control,
             ports.cert,
@@ -1073,6 +1082,19 @@ impl ClinkSession {
                                 } else {
                                     "车机没接受 AAC 声音，声音送不到车机"
                                 }
+                            ));
+                        }
+                        // 声明尺寸定锚：协商消息到达且本次声明尺寸与上次
+                        // 不同才打一行，最后一行就是本会话的结论——下份
+                        // 真机日志据此核对 WFD 声明有没有跟上所选分辨率。
+                        if (message.body.contains("wfd_video_formats:")
+                            || message.line.starts_with("SETUP "))
+                            && mode_anchor != Some((wfd.mode.width, wfd.mode.height))
+                        {
+                            mode_anchor = Some((wfd.mode.width, wfd.mode.height));
+                            self.listener.diagnostic(&format!(
+                                "WFD 向车机声明画面尺寸 {}×{}（跟随所选输出分辨率，声明与实际出流一致触控才不偏）",
+                                wfd.mode.width, wfd.mode.height
                             ));
                         }
                         owner.report(&wfd);

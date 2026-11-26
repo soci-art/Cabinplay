@@ -81,6 +81,9 @@ final class CarPlayAudio {
     private static var hasSpeakerOverride = false
     #endif
     var onLog: ((String) -> Void)?
+    /// 本实例对应的 CarPlay 流类型（100/101/102），由 CarPlayMedia
+    /// Session 建实例时回填；主流 102 停时据此打累计包数日志。
+    var streamType: Int?
     var onBrowserAudio: ((AVAudioPCMBuffer, UInt64) -> Void)?
     /// 编码音频 tap（仅主流 AAC）：在解码前截一份裸 AAC 访问单元与主机
     /// 微秒时间戳，供音频桥多喂一份给车机；原解码→扬声器路径不动。
@@ -250,6 +253,13 @@ final class CarPlayAudio {
     }
     private func stopOnQueue() {
         guard active else { return }; active = false
+        // 主流（102）实例停时打一行本实例累计包数：iOS 这一轮到底送
+        // 了多少声音包一眼可见，不用再靠 5 秒统计行推断（诊断
+        // AUDIO-SILENT-DIFF：1645 轮整轮只有 1 个建流 priming 包，
+        // 就是靠这种行才能一眼定性）。
+        if streamType == 102 {
+            onLog?(CWL("音频流 102 接收实例已停，本实例累计收到 {1} 个包", [String(describing: packets)]))
+        }
         if let microphone { DispatchQueue.main.async { microphone.stop() } }; microphone = nil
         data.stop(); control.stop(); player?.stop(); engine?.stop(); queuedFrames = 0
         if playing {

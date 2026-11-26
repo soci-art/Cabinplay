@@ -46,15 +46,22 @@ final class LocalCarPlaySession: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
-    /// 本轮会话是否真正连上过（控制连接建立过）：会话结束时据此落
-    /// 「下次连接前先轮换 deviceID」标记（见 preRotationPending）。
+    /// 本轮会话是否真正连上过（控制连接建立过）：连上那一刻据此落
+    /// 「下次连接前先轮换 deviceID」标记，stop() 收尾时再冗余落一次
+    /// （见 preRotationPending）。
     private var connectedThisSession = false
 
-    /// 预轮换标记（持久化）：会话真正连上过又结束时落下；下次点「连接
-    /// 车机」时上层先轮换 deviceID 再发起，跳过注定失败的同身份等待；
-    /// 新会话连上后由 onControlConnected 清除。存在的原因：系统侧的
-    /// 会话记录在一轮会话真正跑过又结束后会楔住，同身份再发起不回连，
-    /// 换个新身份等于新车、天然没有那本旧账。
+    /// 预轮换标记（持久化）：会话真正连上（收到控制连接）的那一刻就
+    /// 落下——onControlConnected 先清掉上一轮的旧标记、再按本次连上
+    /// 重新落；stop() 里保留一处冗余写点。下次点「连接车机」时上层
+    /// 读到就先轮换 deviceID 再发起，跳过注定失败的同身份等待。落点
+    /// 提前到连上时，是因为用户点断开走的上层路径、杀 App 等结束方
+    /// 式都不保证经过 stop()，等收尾才落会漏（ROTATION-MARKER-DIFF
+    /// 实锤：1645 轮点断开从未调 stop()，标记永不落、1649 轮干等约
+    /// 35 秒）。标记只在 connectCarFlow 开头被读，会话运行中没有任何
+    /// 路径读它，不会自触发轮换。存在的原因：系统侧的会话记录在一
+    /// 轮会话真正跑过又结束后会楔住，同身份再发起不回连，换个新身
+    /// 份等于新车、天然没有那本旧账。
     static var preRotationPending: Bool {
         get { UserDefaults.standard.bool(forKey: "cabinplay.preRotateDeviceID") }
         set { UserDefaults.standard.set(newValue, forKey: "cabinplay.preRotateDeviceID") }
@@ -449,7 +456,8 @@ final class LocalCarPlaySession: ObservableObject {
 
     /// 所有停止路径统一走这里并打明原因，别再出现无原因的「已停止」。
     func stop(reason: String = "用户手动停止") {
-        // 真正连上过的会话结束：落预轮换标记，下次连接先换新身份。
+        // 预轮换标记的冗余写点：标记在连上时已经落下（onControl
+        // Connected），这里对真正连上过的会话再落一次兜底。
         if connectedThisSession {
             Self.preRotationPending = true
         }
@@ -514,8 +522,13 @@ final class LocalCarPlaySession: ObservableObject {
             guard let self else { return }
             self.controlConnected = true
             self.connectedThisSession = true
-            // 新会话已连上：预轮换标记完成使命，清掉。
+            // 预轮换标记当场落：先清上一轮的旧标记，再按本次连上重新
+            // 落——不等会话结束，因为断开/杀 App 等结束路径不保证经
+            // 过 stop()（见 preRotationPending 的注释）。此刻起这轮会
+            // 话无论怎么收场，下次连接都会先换新设备标识。
             Self.preRotationPending = false
+            Self.preRotationPending = true
+            self.onLog?("本机 CarPlay：已记住：下次连接先换新设备标识（这次会话已连上，标记先落好，免得结束时没走正常收尾又漏掉）")
             self.phase = .negotiating
             self.sameDevice.didConnectControl()
         }

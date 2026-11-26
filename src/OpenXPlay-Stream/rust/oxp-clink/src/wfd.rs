@@ -153,6 +153,10 @@ pub struct WfdSource {
     address: String,
     ports: ClinkPorts,
     pub mode: WfdMode,
+    /// Display size the host asked us to declare (its chosen output
+    /// resolution). Seeded via [Self::set_display_size]; `None` keeps the
+    /// historical 1280x720 default.
+    display_size: Option<(u32, u32)>,
     pub decoders: Vec<DecoderSupport>,
     pub iccoa_support_hevc: Option<String>,
     pub playing: bool,
@@ -179,6 +183,7 @@ impl WfdSource {
         Self {
             address,
             mode: WfdMode::default(),
+            display_size: None,
             decoders: Vec::new(),
             iccoa_support_hevc: None,
             playing: false,
@@ -193,6 +198,17 @@ impl WfdSource {
             ports,
             hevc,
         }
+    }
+    /// Seeds the display size declared to the head unit. Both the RTSP
+    /// `wfd_car_display_mode` capability and the CONTROL display body read
+    /// the size from the negotiated mode, so the declared size must be the
+    /// host's actual output resolution verbatim: the head unit maps touch
+    /// coordinates against the declared size, and a stale 1280x720
+    /// declaration under a 1920x1080 stream shifts every touch.
+    pub fn set_display_size(&mut self, width: u32, height: u32) {
+        self.display_size = Some((width, height));
+        self.mode.width = width;
+        self.mode.height = height;
     }
     pub fn hevc_enabled(&self) -> bool {
         self.hevc != ClinkHevcMode::Off && self.iccoa_support_hevc.as_deref() == Some("supported")
@@ -275,7 +291,17 @@ impl WfdSource {
                             supported.push(decoder);
                         }
                         if selected.is_none() && cea & (1 << 5) != 0 {
+                            // Profile/level come from the peer's formats;
+                            // the declared size is ours — the host's output
+                            // resolution seeded via `set_display_size` —
+                            // never the peer's timing default.
+                            let fallback = WfdMode::default();
+                            let (width, height) = self
+                                .display_size
+                                .unwrap_or((fallback.width, fallback.height));
                             selected = Some(WfdMode {
+                                width,
+                                height,
                                 profile: profile as u8,
                                 level: bit as u8,
                                 ..Default::default()
