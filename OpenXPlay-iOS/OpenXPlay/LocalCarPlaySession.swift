@@ -12,6 +12,7 @@
 // 自动带回并存下的车机热点，连接表里也能手动改。
 
 import Foundation
+import Combine
 
 final class LocalCarPlaySession: ObservableObject {
     enum Phase: Equatable {

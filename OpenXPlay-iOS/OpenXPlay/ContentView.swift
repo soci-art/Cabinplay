@@ -285,3 +285,11 @@ struct ContentView: View {
         if log.count > 400 { log.removeFirst(log.count - 400) }
     }
 }
+
+extension DateFormatter {
+    static let logFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+}
