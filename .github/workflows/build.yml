@@ -1,4 +1,3 @@
-
 name: build
 
 on:
@@ -31,7 +30,6 @@ jobs:
           fi
       - name: rust builds
         run: |
-          set -o pipefail
           cd src/OpenXPlay-Stream/rust && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios
           cd ../../OpenXPlay-Relay/rust && cargo build -p oxp-ios --release --target aarch64-apple-ios
 
@@ -45,27 +43,24 @@ jobs:
           rustc -V
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           brew install xcodegen
-      - name: Rust libs for simulator
-        run: |
-          set -e
-          cd src/OpenXPlay-Relay/rust
-          cargo build -p oxp-ios --release --target aarch64-apple-ios-sim
-          cd ../../OpenXPlay-Stream/rust
-          cargo build -p oxp-clink-ios --release --target aarch64-apple-ios-sim
-          mkdir -p ../../OpenXPlay-iOS/generated
-          cp target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a ../../OpenXPlay-iOS/generated/
-          cp ../../OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a ../../OpenXPlay-iOS/generated/
-          cd ../../OpenXPlay-iOS/generated
-          libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
-          cp ../../src/OpenXPlay-Relay/rust/oxp-ios/include/oxp_ios.h .
-          cp ../../src/OpenXPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h .
-      - name: Generate Xcode project
-        run: cd OpenXPlay-iOS && xcodegen generate
-      - name: Build (no signing)
+      - name: Build app (no signing)
         run: |
           set -o pipefail
-          cd OpenXPlay-iOS
-          if ! xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee /tmp/xcode.log; then
-            echo "::error::$(grep -E 'error:' /tmp/xcode.log | head -n 4 | tr '\n' ' ' | cut -c1-800)"
-            exit 1
+          ROOT="$GITHUB_WORKSPACE"
+          (
+            cd "$ROOT/src/OpenXPlay-Relay/rust" && cargo build -p oxp-ios --release --target aarch64-apple-ios-sim
+            cd "$ROOT/src/OpenXPlay-Stream/rust" && cargo build -p oxp-clink-ios --release --target aarch64-apple-ios-sim
+            mkdir -p "$ROOT/OpenXPlay-iOS/generated"
+            cp "$ROOT/src/OpenXPlay-Stream/rust/target/aarch64-apple-ios-sim/release/liboxp_clink_ios.a" "$ROOT/OpenXPlay-iOS/generated/"
+            cp "$ROOT/src/OpenXPlay-Relay/rust/target/aarch64-apple-ios-sim/release/liboxp_ios.a" "$ROOT/OpenXPlay-iOS/generated/"
+            cd "$ROOT/OpenXPlay-iOS/generated" && libtool -static -o liboxp_all.a liboxp_ios.a liboxp_clink_ios.a
+            cp "$ROOT/src/OpenXPlay-Relay/rust/oxp-ios/include/oxp_ios.h" .
+            cp "$ROOT/src/OpenXPlay-Stream/rust/oxp-clink-ios/include/oxp_clink_ios.h" .
+            cd "$ROOT/OpenXPlay-iOS" && xcodegen generate
+            xcodebuild -project OpenXPlay.xcodeproj -scheme OpenXPlay -sdk iphonesimulator -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          ) 2>&1 | tee /tmp/build.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            echo "::error::$(grep -E 'error:|error ' /tmp/build.log | head -n 4 | tr '\n' ' ' | cut -c1-900)"
+            exit $code
           fi
