@@ -37,9 +37,6 @@ struct DashboardView: View {
     let currentSizeLabel: String
 
     /// 首次连某台没校准记录的车且已出画时，给一行可点的校准提示。
-    let showCalibrationHint: Bool
-    let onOpenCalibration: () -> Void
-    let onDismissCalibrationHint: () -> Void
 
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
@@ -94,29 +91,6 @@ struct DashboardView: View {
                 .frame(height: 38)
                 .background(.ultraThinMaterial, in: Capsule())
                 .accessibilityLabel("分辨率（自动协商）")
-            }
-
-            if showCalibrationHint {
-                HStack(spacing: 8) {
-                    Button {
-                        Haptics.tap()
-                        onOpenCalibration()
-                    } label: {
-                        Label("这台车还没校准触控，点这里花半分钟校准一次，点得更准", systemImage: "hand.tap")
-                            .font(.caption.weight(.medium))
-                            .multilineTextAlignment(.leading)
-                    }
-                    .foregroundStyle(Color.sunsetAccent)
-                    Spacer()
-                    Button {
-                        onDismissCalibrationHint()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption2.weight(.bold))
-                    }
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("不再提示校准")
-                }
             }
 
             if localPhaseFailed {

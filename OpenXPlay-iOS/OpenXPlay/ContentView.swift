@@ -75,12 +75,6 @@ struct ContentView: View {
     @State private var sizeTierIndex = 0
     @State private var targetSize: (Int, Int) = (1920, 1080)
 
-    // 触控校准页（设置页按钮与驾驶舱首次提示共用同一个 sheet）。
-    @State private var showCalibration = false
-    /// 校准提示「看过」标记的刷新计数（标记本身存 UserDefaults 按车
-    /// 记；点过提示或关掉提示后 +1 让界面重算显隐）。
-    @State private var calibrationHintRevision = 0
-
     // UCar 后段流程状态（全部自动推导，不再有手填项）。
     private enum JoinPhase: Equatable {
         case idle, joining, failed(String)
@@ -161,9 +155,6 @@ struct ContentView: View {
                     keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
                     currentSizeLabel: "\(targetSize.0)×\(targetSize.1)",
-                    showCalibrationHint: calibrationHintVisible,
-                    onOpenCalibration: { openCalibration() },
-                    onDismissCalibrationHint: { dismissCalibrationHint() },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
                     onConnectBle: { connectCarFlow() }
@@ -181,11 +172,7 @@ struct ContentView: View {
             .tag(1)
 
             NavigationStack {
-                SettingsView(
-                    calibrationCarId: bleProbe.foundDeviceId ?? lastCarDeviceId,
-                    calibrationAvailable: carLinkState == .playing,
-                    onOpenCalibration: { openCalibration() }
-                )
+                SettingsView()
                 .navigationTitle("设置")
             }
             .tabItem { Label("设置", systemImage: "gearshape") }
@@ -214,13 +201,6 @@ struct ContentView: View {
                 break
             }
         }
-        .sheet(isPresented: $showCalibration) {
-            TouchCalibrationView(
-                deviceId: bleProbe.foundDeviceId ?? lastCarDeviceId,
-                sessionPlaying: carLinkState == .playing,
-                onLog: { appendLog($0) }
-            )
-        }
         .onAppear {
             bleProbe.onLog = { appendLog($0) }
             bleProbe.onServerInfo = { handleUCarServerInfo($0) }
@@ -247,39 +227,10 @@ struct ContentView: View {
         }
     }
 
-    // MARK: 触控校准提示（首次连某台没校准记录的车、出画后给一行）
-
-    /// 上次连过的车机 deviceId（ServerInfo 到手时落盘）：设置页在没
-    /// 发现车机时也能对着这台车开校准页。
+    /// 上次连过的车机 deviceId（ServerInfo 到手时落盘）。
     private var lastCarDeviceId: String? {
         let value = UserDefaults.standard.string(forKey: "cabinplay.lastCarDeviceId")
         return (value?.isEmpty == false) ? value : nil
-    }
-
-    /// 驾驶舱校准提示的显隐：正在出画、认得出是哪台车、这台车没有
-    /// 任何校准（手动/预置都没有）、且没被关掉过。预置命中的车（车
-    /// 主本人的 UNI-V）天然不弹——预置已经在用了。
-    private var calibrationHintVisible: Bool {
-        _ = calibrationHintRevision
-        guard carLinkState == .playing, localSession.phase == .streaming,
-              let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId else { return false }
-        if TouchCalibrationStore.hasAnyCalibration(for: deviceId) { return false }
-        return !UserDefaults.standard.bool(forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
-    }
-
-    private func openCalibration() {
-        if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
-            UserDefaults.standard.set(true, forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
-            calibrationHintRevision += 1
-        }
-        showCalibration = true
-    }
-
-    private func dismissCalibrationHint() {
-        if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
-            UserDefaults.standard.set(true, forKey: "cabinplay.touchCalHintSeen.\(deviceId)")
-        }
-        calibrationHintRevision += 1
     }
 
     // MARK: 本机 CarPlay 会话
@@ -593,10 +544,6 @@ struct ContentView: View {
         core.onTouch = { _, x, y, pressed in
             localSession.touchesFromCarLink(pressed: pressed, x: x, y: y)
         }
-        core.onTouchCapture = { x, y in
-            // 校准捕获：原始坐标只送校准总线，绝不进上面的触控转发。
-            TouchCaptureBus.shared.handler?(x, y)
-        }
         core.onKey = { code, down in
             localSession.keyFromCarLink(code: code, down: down)
         }
@@ -611,9 +558,9 @@ struct ContentView: View {
         }
         wireCarLinkCallbacks()
         touchAnchorLogged = false
-        // 触控校准按这台车推给核心（手动优先、其次预置、都没有走
-        // 居中模型）：每轮试序开始时推一次，运行中改校准也立刻生效。
-        CarLinkCore.shared.applyTouchCalibration(forDeviceId: bleProbe.foundDeviceId ?? lastCarDeviceId)
+        // 触控换算固定居中模型（校准功能已整套撤销）：每轮试序开
+        // 始时把模式推给核心一次，并清掉核心里可能残留的校准矩形。
+        CarLinkCore.shared.applyTouchMode()
         cancelClinkLoopWork()
         clinkCandidates = candidates
         clinkCandidateIndex = 0

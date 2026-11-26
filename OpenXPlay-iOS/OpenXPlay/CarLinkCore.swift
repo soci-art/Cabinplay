@@ -110,49 +110,21 @@ final class CarLinkCore {
         running = false
     }
 
-    // MARK: 触控按车校准（核心 UIBC 的共享校准状态）
+    // MARK: 触控换算（固定居中模型）
 
-    /// 按车机 deviceId 把生效校准（手动优先、其次内置预置）推给核
-    /// 心：有就设上，没有就清掉让核心走居中模型。每轮连接开始时调
-    /// 一次；手动校准完成/清除时也调，运行中的会话立刻生效。
-    func applyTouchCalibration(forDeviceId deviceId: String?) {
-        // 先推触控模式（取证三档）：模式与校准矩形是两件独立的事，
-        // 每次按车应用校准时一并把这台车存的模式推给核心，切换在
-        // 核心侧打日志、立即生效。
-        let mode = deviceId.map { TouchModeStore.mode(for: $0) } ?? .calibrated
-        clink_set_touch_mode(mode.coreValue)
-        if let deviceId, let effective = TouchCalibrationStore.effectiveRect(for: deviceId) {
-            let rect = effective.rect
-            clink_set_touch_calibration(rect.left, rect.right, rect.top, rect.bottom,
-                                         effective.isPreset ? 1 : 2)
-        } else {
-            clink_clear_touch_calibration()
-        }
+    /// 触控换算固定居中模型（校准功能已整套撤销：描边校准页、按车
+    /// 校准记录、模式切换都不再有）：每轮连接开始时把居中模式推给
+    /// 核心（核心侧 FFI 也已钉死居中，任何入参都回不到按校准/直
+    /// 通），并清掉核心里可能残留的校准矩形，双保险。
+    func applyTouchMode() {
+        clink_set_touch_mode(1) // 1 = 居中模型（核心 FFI 模式编号）
+        clink_clear_touch_calibration()
     }
 
     /// 出画后让核心重打一行触控定锚（声明几何＋当前换算方式）：
     /// 日志中段导出时开头的定锚行会被滚掉，这一行为新会话兜底。
     func logTouchAnchor() {
         clink_log_touch_anchor()
-    }
-
-    /// 校准捕获开关：开着时车机触控只报原始坐标、不转发给 iOS。
-    func setTouchCapture(_ on: Bool) {
-        clink_set_touch_capture(on ? 1 : 0)
-    }
-
-    /// 核心记下的车机声明几何（校准自检的宽高比一项要用）：surface
-    /// 是车机屏、visible 是画面区；没报过为 nil。
-    func touchGeometry() -> (surface: (Int, Int)?, visible: (Int, Int)?)? {
-        var values: [UInt32] = [0, 0, 0, 0]
-        let known = values.withUnsafeMutableBufferPointer { buffer -> UInt32 in
-            guard let base = buffer.baseAddress else { return 0 }
-            return clink_touch_geometry(base)
-        }
-        guard known != 0 else { return nil }
-        let surface = (Int(values[0]), Int(values[1]))
-        let visible = (values[2] > 0 && values[3] > 0) ? (Int(values[2]), Int(values[3])) : nil
-        return (surface, visible)
     }
 
     /// 把解码配置（avcC/hvcC 记录）推给车机；必须先于帧调用。codec：1=H.264，2=H.265。
