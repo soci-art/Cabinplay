@@ -9,6 +9,36 @@ struct LogView: View {
     let lines: [String]
     let onClear: () -> Void
 
+    /// 分享用的日志文件地址。纯文字分享在 iOS 上没有「存储到文件」，
+    /// 所以先把日志写成真正的 .txt 文件，再分享这个文件。
+    @State private var logFileURL: URL?
+
+    /// 把当前日志写到临时目录的 .txt 文件（文件名带时间戳），供分享使用。
+    private func prepareLogFile() {
+        guard !lines.isEmpty else {
+            logFileURL = nil
+            return
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmm"
+        let fileName = "CabinPlay-log-\(formatter.string(from: Date())).txt"
+        let dir = FileManager.default.temporaryDirectory
+        // 顺手清掉上次的日志文件，别越攒越多。
+        if let old = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for url in old where url.lastPathComponent.hasPrefix("CabinPlay-log-") && url.lastPathComponent != fileName {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let url = dir.appendingPathComponent(fileName)
+        do {
+            try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            logFileURL = url
+        } catch {
+            logFileURL = nil
+        }
+    }
+
     private enum Kind {
         case milestone, stream, problem, plain
     }
@@ -49,13 +79,16 @@ struct LogView: View {
             }
         }
         .background(Color.pageBackground)
+        .onAppear { prepareLogFile() }
+        .onChange(of: lines) { prepareLogFile() }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    ShareLink(item: lines.joined(separator: "\n")) {
-                        Label("分享日志", systemImage: "square.and.arrow.up")
+                    if let logFileURL {
+                        ShareLink(item: logFileURL) {
+                            Label("分享日志", systemImage: "square.and.arrow.up")
+                        }
                     }
-                    .disabled(lines.isEmpty)
                     Button(role: .destructive) {
                         onClear()
                     } label: {
