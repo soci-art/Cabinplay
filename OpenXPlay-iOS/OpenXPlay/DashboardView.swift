@@ -29,6 +29,9 @@ struct DashboardView: View {
     let bleHasToken: Bool
     let blePhaseText: String
 
+    /// 后台保活状态（本机 CarPlay 会话运行期间自动生效）。
+    let keepAliveActive: Bool
+
     @Binding var blePinField: String
 
     /// 当前生效的分辨率（与 ContentView 的状态实时绑定，菜单打勾用）。
@@ -295,6 +298,8 @@ struct DashboardView: View {
             statusRow("蓝牙配对", state: blePhaseText, ok: bleFound)
             statusRow("车机出画", state: carLinkState.text,
                       ok: carLinkState == .playing)
+            statusRow("后台保活", state: keepAliveActive ? "已开启（回桌面/锁屏不断）" : "未开启",
+                      ok: keepAliveActive)
             if carLinkState == .playing && localStreaming {
                 Text("已上车：CarPlay 画面正在车机上显示，车机触摸能直接操作")
                     .font(.footnote.weight(.medium))

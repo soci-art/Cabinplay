@@ -122,13 +122,14 @@ struct ContentView: View {
                     bleFound: bleProbe.foundDeviceId != nil,
                     bleHasToken: bleProbe.hasStoredToken,
                     blePhaseText: bleStageText,
+                    keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
                     selectedSize: targetSize,
                     onToggleLocalSession: { localSession.isRunning ? stopLocalSession() : startLocalSession() },
                     onSelectSize: { setSize($0, $1) },
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
-                    onConnectBle: { bleProbe.connect(pin: blePin) }
+                    onConnectBle: { connectCarFlow() }
                 )
                 .navigationTitle("驾驶舱")
             }
@@ -188,10 +189,69 @@ struct ContentView: View {
         }
     }
 
-    private func stopLocalSession() {
-        localSession.stop()
+    private func stopLocalSession(reason: String = "用户在驾驶舱点停") {
+        localSession.stop(reason: reason)
         decoder.reset()
         hasVideo = false
+    }
+
+    // MARK: 连接车机总流程（顺序：先本机 CarPlay，后蓝牙）
+
+    @State private var connectWaitGeneration = 0
+    @State private var connectWaitInProgress = false
+
+    /// 点「连接车机」的总入口。本机 CarPlay 必须先在当前网络上把会话
+    /// 建立起来再走蓝牙/入网/clink：它在车机 DIRECT- 网络上冷启动会
+    /// 卡在 StartSession 等回连（14:25、14:31 两轮实测）；先在当前网
+    /// 络建好，入网换地址后有自动重开接管，本机这半就不被车机网络卡。
+    private func connectCarFlow() {
+        if connectWaitInProgress {
+            appendLog("连接车机：正在等本机 CarPlay 建立，忽略这次重复点击")
+            return
+        }
+        guard !localSession.isRunning else {
+            bleProbe.connect(pin: blePin)
+            return
+        }
+        appendLog("连接车机：先启动本机 CarPlay（在当前网络上），等它建立后再走蓝牙连接车机")
+        startLocalSession()
+        if localSession.phase.isFailed {
+            appendLog("连接车机：本机 CarPlay 没启起来（原因看上面），先继续走蓝牙流程")
+            bleProbe.connect(pin: blePin)
+            return
+        }
+        connectWaitInProgress = true
+        connectWaitGeneration += 1
+        let generation = connectWaitGeneration
+        pollLocalSessionReady(generation: generation, waited: 0)
+    }
+
+    /// 等本机 CarPlay 至少走到协商（控制通道已连）再放行蓝牙；失败或
+    /// 15 秒超时也放行（日志打明），别让车机这半被本机这半永久堵住。
+    private func pollLocalSessionReady(generation: Int, waited: Double) {
+        let work = DispatchWorkItem { [self] in
+            guard connectWaitInProgress, generation == connectWaitGeneration else { return }
+            if localSession.controlConnected || localSession.phase == .streaming {
+                connectWaitInProgress = false
+                appendLog("连接车机：本机 CarPlay 已建立（\(localSession.phase.text)），开始蓝牙连接车机")
+                bleProbe.connect(pin: blePin)
+                return
+            }
+            if localSession.phase.isFailed {
+                connectWaitInProgress = false
+                appendLog("连接车机：本机 CarPlay 建立失败（\(localSession.phase.text)），先继续走蓝牙流程")
+                bleProbe.connect(pin: blePin)
+                return
+            }
+            if waited >= 15 {
+                connectWaitInProgress = false
+                appendLog("连接车机：等本机 CarPlay 建立超时（15 秒，当前阶段：\(localSession.phase.text)），先走蓝牙流程；它稍后建立了会自动接上帧桥")
+                bleProbe.connect(pin: blePin)
+                return
+            }
+            pollLocalSessionReady(generation: generation, waited: waited + 0.5)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     private func setSize(_ width: Int, _ height: Int) {
@@ -258,6 +318,13 @@ struct ContentView: View {
                         ? "会话刚启动就结束（没走到协商）" : clinkLastError)
                 } else if !clinkLoopActive {
                     carLinkDetail = "会话已结束：车机 \(flowCarIP) · 本机 \(flowLocalIP)"
+                    // 车机会话到此终了：这轮带回的车机网络凭据随之失效，
+                    // 不许再被下一次本机 CarPlay 启动引用（旧 DIRECT- 名
+                    // 指向的网络已经不存在）。
+                    if LocalCarPlaySession.carCredentialsFresh {
+                        LocalCarPlaySession.invalidateCarCredentials()
+                        appendLog("UCar 连接：车机会话已结束，本轮车机网络凭据已作废（下次启动本机 CarPlay 不再用这个网络名）")
+                    }
                 }
             }
             // 帧桥：进入出画才推帧（补配置+请求关键帧），离开即停推。
@@ -420,6 +487,14 @@ struct ContentView: View {
         joiner.cancel()
         joinGeneration += 1
         joinPhase = .idle
+        // 等本机 CarPlay 建立的放行等待一并取消，别在断开后又自己启蓝牙。
+        connectWaitInProgress = false
+        connectWaitGeneration += 1
+        // 用户主动断开 = 车机会话结束，本轮车机网络凭据作废。
+        if LocalCarPlaySession.carCredentialsFresh {
+            LocalCarPlaySession.invalidateCarCredentials()
+            appendLog("UCar 连接：已断开，本轮车机网络凭据已作废")
+        }
         // 候选试序一并停：撤掉待发的重试与看门狗，别在用户断开后又自己启。
         clinkLoopActive = false
         clinkAttemptSettled = true
@@ -436,13 +511,12 @@ struct ContentView: View {
     /// （UCarNetworkJoiner）→ 入网后本机 CarPlay 会话按新地址重开 →
     /// 现取现验启 clink 鉴权。用户不再需要点任何东西。
     private func handleUCarServerInfo(_ info: UCarServerInfo) {
-        // 热点凭据静默存下供本机 CarPlay 会话用（不再有手填界面）。
+        // 热点凭据静默存下并标为本轮新鲜（打时间戳＋本进程标记）：只许
+        // 本轮车机会话内、本机 CarPlay 重开时用；会话结束即作废，绝不
+        // 留给下一次单独启动拿旧 DIRECT- 名去连死网络。
         if let ssid = info.ssid, !ssid.isEmpty {
-            LocalCarPlaySession.savedSSID = ssid
-            if let psk = info.psk {
-                LocalCarPlaySession.savedPassword = psk
-            }
-            appendLog("UCar 连接：车机网络「\(ssid)」的凭据已静默存下，本机 CarPlay 启动时用它告诉系统走哪个网络")
+            LocalCarPlaySession.storeCarCredentials(ssid: ssid, password: info.psk)
+            appendLog("UCar 连接：车机网络「\(ssid)」的凭据已静默存下并标为本轮新鲜（只在本轮车机会话内供本机 CarPlay 重开时用）")
         }
         if carLinkRunning {
             appendLog("UCar 连接：CarLink 已在跑，这份 ServerInfo 不重复启流程")
@@ -467,16 +541,28 @@ struct ContentView: View {
             }
             guard let result else {
                 joinPhase = .failed("入网失败")
+                // 入网没成 = 这轮车机会话未成立，刚存的凭据一并作废。
+                if LocalCarPlaySession.carCredentialsFresh {
+                    LocalCarPlaySession.invalidateCarCredentials()
+                    appendLog("UCar 连接：入网失败，本轮车机网络凭据已作废")
+                }
                 return
             }
             joinPhase = .idle
             flowLocalIP = result.localIP
             carLinkDetail = "本机 \(result.localIP) · 正在连接车机"
+            // 本机 CarPlay 若在点连接时没启起来（当时没有可用的 Wi-Fi
+            // 名），入网后凭据已新鲜、地址已落定，补启一次。
+            if !localSession.isRunning {
+                appendLog("本机 CarPlay：入网前没启起来，入网后用本轮新鲜凭据补启一次")
+                startLocalSession()
+            }
             // 入网换了本机 IP：本机 CarPlay 会话还绑在旧地址上就重开一次
-            // （单 Wi-Fi 接口的必经之路，不是故障）。
+            // （单 Wi-Fi 接口的必经之路，不是故障）。重开时用的是本轮刚
+            // 带回的新鲜车机凭据，与当前网络一致。
             if localSession.isRunning, localSession.boundAddress != result.localIP {
-                appendLog("本机 CarPlay：入网后本机地址从 \(localSession.boundAddress ?? "?") 变成了 \(result.localIP)，用新地址重开会话")
-                stopLocalSession()
+                appendLog("本机 CarPlay：因地址变化重开：旧 \(localSession.boundAddress ?? "?") → 新 \(result.localIP)（入网换了本机地址）")
+                stopLocalSession(reason: "入网换地址重开")
                 startLocalSession()
             }
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选）。

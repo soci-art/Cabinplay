@@ -31,6 +31,7 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>bluetooth-central</string>
 	</array>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>CabinPlay 需要用蓝牙先找到车机：车机会用蓝牙发出信号，手机收到信号、交换好信息之后，才能连上车机，把画面送到车机屏上。</string>
