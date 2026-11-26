@@ -6,7 +6,7 @@ use crate::{
     interfaces::*,
     media::{RtpPacketizer, RtpSender, RtpUnit, RtpWrite},
     model::*,
-    placeholder::{BundledHevcPlaceholderVideo, BundledPlaceholderVideo, PlaceholderVideo},
+    placeholder::{BundledPlaceholderVideo, PlaceholderSet, PlaceholderVideo, SelectedPlaceholder},
     require,
     session::{ClinkSession, SessionCallbacks, SessionOptions},
     trace::{next_session, now_nanos, ClinkMediaTap, ClinkTrace, ClinkTraceEvent},
@@ -671,15 +671,16 @@ fn media_worker(
     listener: &dyn ClinkListener,
     id: &str,
 ) -> Result<()> {
-    let placeholder_config = AvcConfig::parse(&placeholder.format().config)?;
     require(
         !placeholder.frames().is_empty()
             && placeholder.fps() > 0
             && nal::is_key_frame(&placeholder.frames()[0], VideoCodec::H264, Format::Avcc)?,
         "invalid_placeholder",
     )?;
-    let hevc_placeholder = BundledHevcPlaceholderVideo::new()?;
-    let hevc_placeholder_config = HevcConfig::parse(&hevc_placeholder.format().config)?;
+    // 每一档协商尺寸一份的占位片全集（两种编码），协商定案后按尺寸
+    // 选片——见 placeholder::PLACEHOLDER_SIZES 的注释：等待期喂车机
+    // 的占位帧是保住车机会话的命脉，缺一档就有一档会在等待期零帧。
+    let placeholder_set = PlaceholderSet::new()?;
     let audio_config = oxp_media::AudioSpecificConfig::new(2, 48000, 2)?;
     let mut gate = VideoSwitch::default();
     let mut revision = None;
@@ -699,6 +700,7 @@ fn media_worker(
     let mut reported_at = None;
     let mut mismatch_reported = None;
     let mut placeholder_skip_reported = false;
+    let mut placeholder_feed_reported = false;
     let mut path = RtpPath::default();
     let mut write: Option<(Arc<ClinkSession>, RtpWrite)> = None;
     // What the write still in flight after the sender's wait carries; its clocks restart when it lands.
@@ -762,6 +764,7 @@ fn media_worker(
                     muxer_audio_enabled = None;
                     session_codec = None;
                     keyframes = KeyframeRequests::default();
+                    placeholder_feed_reported = false;
                 }
                 placeholder_index = 0;
                 next_placeholder = Instant::now();
@@ -813,16 +816,25 @@ fn media_worker(
         } else {
             VideoCodec::H264
         });
-        let clip: &dyn PlaceholderVideo = if session_codec == VideoCodec::H265 {
-            &hevc_placeholder
-        } else {
-            placeholder
-        };
-        let clip_config = if session_codec == VideoCodec::H265 {
-            VideoConfig::Hevc(&hevc_placeholder_config)
-        } else {
-            VideoConfig::Avc(&placeholder_config)
-        };
+        // 按协商定案尺寸选占位片：自动分辨率阶梯三档都备了同尺寸
+        // 片子，正常路径必然命中；选不到（阶梯外的协商结果）才走下
+        // 面的跳过占位帧兜底。
+        let selected = placeholder_set.select(
+            session_codec,
+            snapshot.mode.width,
+            snapshot.mode.height,
+        );
+        let (clip, clip_config): (Option<&dyn PlaceholderVideo>, Option<VideoConfig>) =
+            match selected {
+                Some(SelectedPlaceholder::Avc { video, config }) => {
+                    (Some(video), Some(VideoConfig::Avc(config)))
+                }
+                Some(SelectedPlaceholder::Hevc { video, config }) => {
+                    (Some(video), Some(VideoConfig::Hevc(config)))
+                }
+                None => (None, None),
+            };
+        let clip_fps = clip.map_or(30, |c| c.fps());
         // `media_audio` can turn true after the muxer was built: its PMT is
         // frozen at construction, so a muxer built without audio would carry
         // no audio stream for the whole session — and the first audio write
@@ -885,23 +897,18 @@ fn media_worker(
             write = Some((session.clone(), to_session));
         }
         let write = &write.as_ref().unwrap().1;
-        // 占位片是编译期写死的 1280×720/30fps 片子，协商尺寸与它不一
-        // 致时旧行为是直接报错终止整个媒体线程（placeholder_timing_
-        // mismatch）——2026-11-26 真机 1080p 三轮全灭就是死在这里：
-        // 核心自己杀掉会话、车机看起来像断开。现在改为：尺寸不符就
-        // 跳过占位帧、会话照常靠真实帧运行，只打一行诊断说明跳过原
-        // 因（每轮一行）。占位帧的节拍也不再用占位片自带的 fps，改
-        // 按会话协商帧率走（见下面占位写出块）。
-        let placeholder_compatible = (snapshot.mode.width, snapshot.mode.height)
-            == (clip.format().width, clip.format().height);
-        if !placeholder_compatible && !placeholder_skip_reported {
+        // 占位片的历史教训有两层：写死 1280×720 又拿尺寸相等断言卡
+        // 协商结果时，1080p 三轮全灭（placeholder_timing_mismatch 杀
+        // 会话）；断言拆除后只剩 720p 一份片子时，1080p 轮等待期零帧
+        // ——车机在输出开始正好 10 秒以 vehicle_channel_closed 关掉
+        // 通道（720p 轮靠占位帧喂着、干等 30 秒也不关）。所以现在每
+        // 档都备同尺寸片子、按协商尺寸选片；选不到才是异常路径：跳
+        // 过占位帧、会话靠真实帧运行，只打一行诊断，绝不杀会话。
+        if clip.is_none() && !placeholder_skip_reported {
             placeholder_skip_reported = true;
             listener.diagnostic(&format!(
-                "占位片 {}×{} 与协商画面 {}×{} 尺寸不一致：跳过占位帧继续运行（不再终止会话），画面由本机 CarPlay 的真实帧直接驱动",
-                clip.format().width,
-                clip.format().height,
-                snapshot.mode.width,
-                snapshot.mode.height
+                "协商画面 {}×{} 没有备好的同尺寸占位片：跳过占位帧继续运行（不再终止会话），画面由本机 CarPlay 的真实帧直接驱动",
+                snapshot.mode.width, snapshot.mode.height
             ));
         }
         let origin = Origin {
@@ -969,7 +976,7 @@ fn media_worker(
                 let was_live = gate.live;
                 if gate.accept(frame.key_frame) {
                     if !was_live {
-                        live_offset = (output_pts + 1_000_000 / clip.fps() as i64)
+                        live_offset = (output_pts + 1_000_000 / clip_fps as i64)
                             .max(0)
                             .max(frame.pts_us + video_clock.audio_offset.unwrap_or(-frame.pts_us))
                             - frame.pts_us;
@@ -1073,42 +1080,51 @@ fn media_worker(
         // 会话已是 60）：pts 推进与写出间隔都用 snapshot.mode.fps。
         let session_fps = snapshot.mode.fps.max(1);
         if writable
-            && placeholder_compatible
             && gate.placeholder()
             && now >= next_placeholder
             && video_clock.placeholder_due(now)
         {
-            let data = &clip.frames()[placeholder_index];
-            let pts = (output_pts + 1_000_000 / session_fps as i64)
-                .max(0)
-                .max(transport_pts + 1);
-            let key = placeholder_index == 0;
-            let result = path.emit(&run.sender, write, listener, pts, || {
-                muxer.write_video(data, clip_config, pts, key)
-            })?;
-            output_pts = pts;
-            transport_pts = pts;
-            if let Some(stats) = &mut trace_stats {
-                if result == Emit::Dropped {
-                    stats.failed_video += 1;
+            if let (Some(clip), Some(clip_config)) = (clip, clip_config) {
+                let data = &clip.frames()[placeholder_index];
+                let pts = (output_pts + 1_000_000 / session_fps as i64)
+                    .max(0)
+                    .max(transport_pts + 1);
+                let key = placeholder_index == 0;
+                let result = path.emit(&run.sender, write, listener, pts, || {
+                    muxer.write_video(data, clip_config, pts, key)
+                })?;
+                output_pts = pts;
+                transport_pts = pts;
+                if let Some(stats) = &mut trace_stats {
+                    if result == Emit::Dropped {
+                        stats.failed_video += 1;
+                    }
+                    if result != Emit::Dropped {
+                        stats.video_bytes += data.len() as u64;
+                        stats.keyframes += u64::from(key);
+                    }
                 }
-                if result != Emit::Dropped {
-                    stats.video_bytes += data.len() as u64;
-                    stats.keyframes += u64::from(key);
+                if !statistics.video(result, None, data.len()) {
+                    placeholder_index = 0;
+                } else {
+                    session.set_stream_size((clip.format().width, clip.format().height));
+                    video_clock.written_at = Some(Instant::now());
+                    placeholder_index = (placeholder_index + 1) % clip.frames().len();
+                    if !placeholder_feed_reported {
+                        placeholder_feed_reported = true;
+                        listener.diagnostic(&format!(
+                            "占位片 {}×{} 与协商尺寸一致，等待期喂帧中（本机 CarPlay 回连前靠占位帧保住车机会话）",
+                            clip.format().width,
+                            clip.format().height
+                        ));
+                    }
                 }
+                if result == Emit::Late {
+                    writable = false;
+                    late_video = true;
+                }
+                next_placeholder = now + Duration::from_nanos(1_000_000_000 / session_fps as u64);
             }
-            if !statistics.video(result, None, data.len()) {
-                placeholder_index = 0;
-            } else {
-                session.set_stream_size((clip.format().width, clip.format().height));
-                video_clock.written_at = Some(Instant::now());
-                placeholder_index = (placeholder_index + 1) % clip.frames().len();
-            }
-            if result == Emit::Late {
-                writable = false;
-                late_video = true;
-            }
-            next_placeholder = now + Duration::from_nanos(1_000_000_000 / session_fps as u64);
         }
         if snapshot.media_audio {
             for _ in 0..4 {
