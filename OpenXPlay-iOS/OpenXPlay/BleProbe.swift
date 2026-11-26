@@ -76,6 +76,11 @@ final class BleProbe: NSObject, ObservableObject {
     private var pendingPin: String?
     private var clientInfoWritten = false
     private var serverInfoSubscribed = false
+    /// 已调用 setNotifyValue(true) 请求 …102 通知。有的车机不回订阅确认回调，
+    /// 写 ClientInfo 不能只等回调确认，这个标记也要算数。
+    private var serverInfoNotifyRequested = false
+    /// 点连接后数秒还没写出 ClientInfo 时打诊断日志的看门狗。
+    private var writeWatchdog: DispatchWorkItem?
     private var charClientInfo: CBCharacteristic?
     private var charServerInfoRef: CBCharacteristic?
     private var charClientAddr: CBCharacteristic?
@@ -282,6 +287,10 @@ final class BleProbe: NSObject, ObservableObject {
         clientInfoWritten = false
         flowPhase = .connecting
         log("UCar 连接：开始连接流程，车机 deviceId \(foundDeviceId ?? "?")，配对码 **\(trimmed.suffix(2))")
+        let readyNow = peripheral.state == .connected && charClientInfo != nil
+            && (serverInfoSubscribed || serverInfoNotifyRequested)
+        log("UCar 连接：点连接时状态——蓝牙 \(peripheral.state == .connected ? "已连" : "未连（state=\(peripheral.state.rawValue)）")，…101 特征 \(charClientInfo != nil ? "已发现" : "未发现")，…102 订阅 \(serverInfoSubscribed ? "已确认" : (serverInfoNotifyRequested ? "已请求未确认" : "未订阅"))；\(readyNow ? "条件已齐，立即写 ClientInfo" : "等蓝牙连上/特征发现/订阅就绪后写")")
+        startWriteWatchdog()
         // 连接流程开始后停扫描省电，但 GATT 连接保持。
         central?.stopScan()
         scanning = false
@@ -302,16 +311,57 @@ final class BleProbe: NSObject, ObservableObject {
         }
     }
 
-    /// 服务发现完成、…102 订阅就绪且用户已输码时，写 ClientInfo。
+    /// 点连接后启动：数秒内还没写出 ClientInfo，就打一行状态说明卡在哪一步，
+    /// 并顺手再试一次写（防止某个回调丢了流程静默卡住）。
+    private func startWriteWatchdog() {
+        writeWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.pendingPin != nil, !self.clientInfoWritten else { return }
+            if case .failed = self.flowPhase { return }
+            if case .gotServerInfo = self.flowPhase { return }
+            let stateText: String
+            if let t = self.target {
+                stateText = "蓝牙 state=\(t.state.rawValue)"
+            } else {
+                stateText = "还没有目标车机（target 为空）"
+            }
+            self.log("UCar 连接：看门狗——点连接后 5 秒还没写出 ClientInfo。当前状态：\(stateText)，…101 特征 \(self.charClientInfo != nil ? "已发现" : "未发现")，…102 订阅 \(self.serverInfoSubscribed ? "已确认" : (self.serverInfoNotifyRequested ? "已请求未确认" : "未订阅"))，阶段 \(self.flowPhaseText)。再试一次写")
+            self.maybeWriteClientInfo()
+        }
+        writeWatchdog = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
+    }
+
+    /// 服务发现完成、…102 订阅就绪（已确认或已请求）且用户已输码时，写 ClientInfo。
     private func maybeWriteClientInfo() {
         guard let pin = pendingPin, !clientInfoWritten, lastServerInfo == nil,
               let char = charClientInfo, let peripheral = target,
-              peripheral.state == .connected else { return }
-        guard serverInfoSubscribed else {
+              peripheral.state == .connected else {
+            if pendingPin != nil, !clientInfoWritten {
+                let missing: String
+                if charClientInfo == nil {
+                    missing = "…101（ClientInfo）特征还没发现"
+                } else if target == nil {
+                    missing = "没有目标车机（target 为空）"
+                } else if target?.state != .connected {
+                    missing = "蓝牙还没连上（state=\(target?.state.rawValue ?? -1)）"
+                } else {
+                    missing = "条件未齐"
+                }
+                log("UCar 连接：这次没写成 ClientInfo——\(missing)，等后续回调再试")
+            }
+            return
+        }
+        guard serverInfoSubscribed || serverInfoNotifyRequested else {
             log("UCar 连接：等 …102 订阅就绪后再写 ClientInfo")
             return
         }
+        if !serverInfoSubscribed {
+            log("UCar 连接：…102 订阅确认回调还没回来，但通知已请求过，不再等回调，直接写 ClientInfo")
+        }
         clientInfoWritten = true
+        writeWatchdog?.cancel()
+        writeWatchdog = nil
         flowPhase = .writingClientInfo
 
         let fields = buildClientInfo(pin: pin)
@@ -579,6 +629,9 @@ extension BleProbe: CBCentralManagerDelegate {
         charServerInfoRef = nil
         charClientAddr = nil
         serverInfoSubscribed = false
+        serverInfoNotifyRequested = false
+        writeWatchdog?.cancel()
+        writeWatchdog = nil
         clientInfoWritten = false
     }
 }
@@ -615,6 +668,7 @@ extension BleProbe: CBPeripheralDelegate {
             }
             if char.uuid == Self.charServerInfo {
                 if char.properties.contains(.notify) {
+                    serverInfoNotifyRequested = true
                     peripheral.setNotifyValue(true, for: char)
                     log("蓝牙探针：已订阅 …102 通知，等车机发 ServerInfo")
                 } else {
@@ -622,16 +676,28 @@ extension BleProbe: CBPeripheralDelegate {
                 }
             }
         }
+        // 用户已输码在等连接时，特征一发现齐就直接试着写 ClientInfo，
+        // 不依赖订阅确认回调（有的车机不回那个回调，等它会静默卡住）。
+        if pendingPin != nil {
+            maybeWriteClientInfo()
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         if let error {
             log("蓝牙探针：订阅通知失败（\(characteristic.uuid.uuidString)）：\(error.localizedDescription)")
+            if pendingPin != nil, characteristic.uuid == Self.charServerInfo {
+                log("UCar 连接：流程进行中 …102 订阅回调报错，订阅没确认；已请求过通知的话写 ClientInfo 不等这个确认")
+                maybeWriteClientInfo()
+            }
         } else {
             log("蓝牙探针：通知状态 \(characteristic.uuid.uuidString) 现在是 \(characteristic.isNotifying ? "已开启" : "已关闭")")
             if characteristic.uuid == Self.charServerInfo {
                 serverInfoSubscribed = characteristic.isNotifying
+                if pendingPin != nil {
+                    log("UCar 连接：流程进行中收到 …102 订阅回调，isNotifying=\(characteristic.isNotifying)，据此试着写 ClientInfo")
+                }
                 if characteristic.isNotifying {
                     maybeWriteClientInfo()
                 }
