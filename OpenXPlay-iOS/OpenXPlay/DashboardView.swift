@@ -25,6 +25,7 @@ struct DashboardView: View {
     let bleScanning: Bool
     let bleSummary: String
     let bleFound: Bool
+    let bleHasToken: Bool
     let blePhaseText: String
 
     @Binding var headUnitIPField: String
@@ -324,10 +325,14 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color.sunsetAccent)
-                .disabled(!bleFound || blePinField.count != 6)
+                .disabled(!bleFound || (blePinField.count != 6 && !bleHasToken))
             }
             if !bleFound {
                 Text("先点「开始探测」，等上面显示发现车机，再输配对码连接")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if bleHasToken && blePinField.count != 6 {
+                Text("这台车机存有上次配对的重连令牌，不用输码，直接点「连接车机」就能连")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

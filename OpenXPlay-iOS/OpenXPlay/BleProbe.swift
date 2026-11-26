@@ -74,6 +74,21 @@ final class BleProbe: NSObject, ObservableObject {
 
     /// 用户点「连接车机」时暂存的配对码；服务就绪后据此写 ClientInfo。
     private var pendingPin: String?
+    /// 本轮写进 ClientInfo 的凭据：输码连接时就是配对码，免码重连时是已存令牌。
+    private var flowCredential: String?
+    /// 本轮是不是在用令牌免码连接。
+    private var flowUsesToken = false
+    /// ClientInfo 的 type 候选链：先用车机广播版本码原值，无响应依次回落 1003/1002/1001。
+    private var clientInfoTypes: [Int] = []
+    private var clientInfoTypeIndex = 0
+    /// 本轮是否已完整走到 ServerInfo（断线自动重连的判定依据）。
+    private var sessionEstablished = false
+    /// 断线后已自动重连的次数（每轮手动连接清零，最多自动重连 1 次）。
+    private var autoReconnectAttempts = 0
+    /// 正在等自动重连的车机 deviceId（重新扫到它就自动用令牌连）。
+    private var autoReconnectDeviceId: String?
+    /// 当前发现的车机有没有已存的重连令牌（连接按钮免输码用）。
+    @Published private(set) var hasStoredToken = false
     private var clientInfoWritten = false
     private var serverInfoSubscribed = false
     /// 已调用 setNotifyValue(true) 请求 …102 通知。有的车机不回订阅确认回调，
@@ -118,6 +133,8 @@ final class BleProbe: NSObject, ObservableObject {
 
     func stop() {
         wantScanning = false
+        sessionEstablished = false
+        autoReconnectDeviceId = nil
         central?.stopScan()
         if let target {
             central?.cancelPeripheralConnection(target)
@@ -132,6 +149,10 @@ final class BleProbe: NSObject, ObservableObject {
         serverInfoTimeout?.cancel()
         serverInfoTimeout = nil
         pendingPin = nil
+        flowCredential = nil
+        flowUsesToken = false
+        clientInfoTypes = []
+        clientInfoTypeIndex = 0
         lastServerInfo = nil
         clientInfoWritten = false
         serverInfoSubscribed = false
@@ -272,6 +293,20 @@ final class BleProbe: NSObject, ObservableObject {
 
     // MARK: - 连接流程（阶段A）
 
+    /// 连接按钮入口：输了 6 位码走输码连接；没输码但存有这台车机的令牌，走免码重连。
+    func connect(pin: String) {
+        let trimmed = pin.trimmingCharacters(in: .whitespaces)
+        if trimmed.count == 6 {
+            connectWithPin(trimmed)
+        } else if hasStoredToken {
+            connectWithToken()
+        } else if trimmed.isEmpty {
+            log("UCar 连接：先输车机屏幕上的 6 位配对码再连（这台车机还没有存下的重连令牌）")
+        } else {
+            log("UCar 连接：配对码要是 6 位，现在是 \(trimmed.count) 位，先输对再连")
+        }
+    }
+
     /// 用户在卡片上输好配对码点「连接车机」后调用。
     func connectWithPin(_ pin: String) {
         let trimmed = pin.trimmingCharacters(in: .whitespaces)
@@ -284,9 +319,48 @@ final class BleProbe: NSObject, ObservableObject {
             return
         }
         pendingPin = trimmed
+        flowCredential = trimmed
+        flowUsesToken = false
+        autoReconnectAttempts = 0
+        autoReconnectDeviceId = nil
+        beginFlow(peripheral: peripheral, credentialDescription: "配对码 **\(trimmed.suffix(2))")
+    }
+
+    /// 用已存的 authentication 令牌免码重连（BLE-SPEC §4.4 的 type=2 路径：
+    /// 令牌原样填进 pinCodeOrAuthentication，TCP 侧随之走 QUICK）。
+    func connectWithToken() {
+        guard let deviceId = foundDeviceId, let token = storedToken(for: deviceId) else {
+            log("UCar 连接：这台车机没有存下的重连令牌，还是输配对码连一次")
+            return
+        }
+        guard let peripheral = foundPeripheral ?? target else {
+            log("UCar 连接：还没发现车机，先点「开始探测」，等卡片显示发现车机再连")
+            return
+        }
+        pendingPin = nil
+        flowCredential = token
+        flowUsesToken = true
+        log("UCar 连接：用已存令牌免码重连（令牌共 \(token.count) 位，已打码）")
+        beginFlow(peripheral: peripheral, credentialDescription: "已存令牌免码")
+    }
+
+    /// 已存的重连令牌（ServerInfo 的 authentication，按车机 deviceId 落盘）。
+    func storedToken(for deviceId: String) -> String? {
+        let token = UserDefaults.standard.string(forKey: "ucar.authToken.\(deviceId)")
+        return (token?.isEmpty == false) ? token : nil
+    }
+
+    /// 凭据与 type 候选链就位后，真正跑连接流程（输码/令牌共用）。
+    private func beginFlow(peripheral: CBPeripheral, credentialDescription: String) {
         clientInfoWritten = false
+        // type 候选链：广播版本码原值打头，之后依次回落 1003/1002/1001（去重保序）。
+        var chain: [Int] = [foundVersionCode ?? 1005, 1003, 1002, 1001]
+        var seen = Set<Int>()
+        chain = chain.filter { seen.insert($0).inserted }
+        clientInfoTypes = chain
+        clientInfoTypeIndex = 0
         flowPhase = .connecting
-        log("UCar 连接：开始连接流程，车机 deviceId \(foundDeviceId ?? "?")，配对码 **\(trimmed.suffix(2))")
+        log("UCar 连接：开始连接流程，车机 deviceId \(foundDeviceId ?? "?")，\(credentialDescription)；ClientInfo 的 type 候选链 \(chain.map { String($0) }.joined(separator: " → "))（无响应自动往后换）")
         let readyNow = peripheral.state == .connected && charClientInfo != nil
             && (serverInfoSubscribed || serverInfoNotifyRequested)
         log("UCar 连接：点连接时状态——蓝牙 \(peripheral.state == .connected ? "已连" : "未连（state=\(peripheral.state.rawValue)）")，…101 特征 \(charClientInfo != nil ? "已发现" : "未发现")，…102 订阅 \(serverInfoSubscribed ? "已确认" : (serverInfoNotifyRequested ? "已请求未确认" : "未订阅"))；\(readyNow ? "条件已齐，立即写 ClientInfo" : "等蓝牙连上/特征发现/订阅就绪后写")")
@@ -316,7 +390,7 @@ final class BleProbe: NSObject, ObservableObject {
     private func startWriteWatchdog() {
         writeWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingPin != nil, !self.clientInfoWritten else { return }
+            guard let self, self.flowCredential != nil, !self.clientInfoWritten else { return }
             if case .failed = self.flowPhase { return }
             if case .gotServerInfo = self.flowPhase { return }
             let stateText: String
@@ -334,10 +408,10 @@ final class BleProbe: NSObject, ObservableObject {
 
     /// 服务发现完成、…102 订阅就绪（已确认或已请求）且用户已输码时，写 ClientInfo。
     private func maybeWriteClientInfo() {
-        guard let pin = pendingPin, !clientInfoWritten, lastServerInfo == nil,
+        guard let credential = flowCredential, !clientInfoWritten, lastServerInfo == nil,
               let char = charClientInfo, let peripheral = target,
               peripheral.state == .connected else {
-            if pendingPin != nil, !clientInfoWritten {
+            if flowCredential != nil, !clientInfoWritten {
                 let missing: String
                 if charClientInfo == nil {
                     missing = "…101（ClientInfo）特征还没发现"
@@ -364,7 +438,7 @@ final class BleProbe: NSObject, ObservableObject {
         writeWatchdog = nil
         flowPhase = .writingClientInfo
 
-        let fields = buildClientInfo(pin: pin)
+        let fields = buildClientInfo(credential: credential)
         let masked = fields.maskedJSON
         log("UCar 连接：准备写 ClientInfo 到 …101（PIN 已打码）：\(masked)")
         for note in fields.notes { log(note) }
@@ -384,17 +458,27 @@ final class BleProbe: NSObject, ObservableObject {
     private func startServerInfoTimeout() {
         serverInfoTimeout?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingPin != nil else { return }
+            guard let self, self.flowCredential != nil else { return }
             if case .gotServerInfo = self.flowPhase { return }
+            // type 回落链：当前 type 等了 20 秒没等到 ServerInfo，换下一个候选重写。
+            if self.clientInfoTypeIndex + 1 < self.clientInfoTypes.count {
+                self.clientInfoTypeIndex += 1
+                let next = self.clientInfoTypes[self.clientInfoTypeIndex]
+                self.log("UCar 连接：type=\(self.clientInfoTypes[self.clientInfoTypeIndex - 1]) 写完 20 秒没等到 ServerInfo，自动换 type=\(next) 重写 ClientInfo（候选 \(self.clientInfoTypeIndex + 1)/\(self.clientInfoTypes.count)）")
+                self.clientInfoWritten = false
+                self.flowPhase = .writingClientInfo
+                self.maybeWriteClientInfo()
+                return
+            }
             self.flowPhase = .failed("等 ServerInfo 超时")
-            self.log("UCar 连接：写完 ClientInfo 后 20 秒没等到 …102 的 ServerInfo——可能配对码不对、车机没认，或车机要先在屏幕上确认。把车机屏幕情况和这份日志一起发回来看")
+            self.log("UCar 连接：type 候选链 \(self.clientInfoTypes.map { String($0) }.joined(separator: "/")) 全部试完都没等到 …102 的 ServerInfo——可能配对码不对、车机没认，或车机要先在屏幕上确认。把车机屏幕情况和这份日志一起发回来看")
         }
         serverInfoTimeout = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: item)
     }
 
-    /// 组装 ClientInfo（字段依据 BLE-SPEC §4.1）。
-    private func buildClientInfo(pin: String) -> (jsonData: Data?, maskedJSON: String, notes: [String]) {
+    /// 组装 ClientInfo（字段依据 BLE-SPEC §4.1）。credential 是配对码或已存令牌。
+    private func buildClientInfo(credential: String) -> (jsonData: Data?, maskedJSON: String, notes: [String]) {
         var notes: [String] = []
 
         // id：本地持久化的 6 字符随机 ID。
@@ -408,10 +492,13 @@ final class BleProbe: NSObject, ObservableObject {
         } else {
             notes.append("UCar 连接：ClientInfo 的 mac 用此前生成的替代地址 \(mac)（iOS 取不到真 MAC）")
         }
-        // type：优先用车机广播的版本码（本机实测 1005）；安卓样本会映射到
-        // 1001/1002/1003，本轮先照广播原值填，日志注明。
-        let typeValue = foundVersionCode ?? 1001
-        notes.append("UCar 连接：ClientInfo 的 type 填 \(typeValue)（取车机广播版本码原值；安卓样本会映射成 1001/1002/1003，若车机不认再改）")
+        // type：候选链当前值（广播版本码原值打头，无响应依次回落 1003/1002/1001）。
+        let typeValue = clientInfoTypes.indices.contains(clientInfoTypeIndex)
+            ? clientInfoTypes[clientInfoTypeIndex] : (foundVersionCode ?? 1001)
+        notes.append("UCar 连接：ClientInfo 的 type 填 \(typeValue)（候选链第 \(clientInfoTypeIndex + 1)/\(max(clientInfoTypes.count, 1)) 个；广播码原值打头，安卓样本代际为 1001/1002/1003）")
+        if flowUsesToken {
+            notes.append("UCar 连接：本轮用已存令牌免码连接，pinCodeOrAuthentication 填的是令牌（共 \(credential.count) 位）")
+        }
         // manufactures：照安卓样本填 Xiaomi，最大化车机接受概率。
         notes.append("UCar 连接：ClientInfo 的 manufactures 照样本填 \"Xiaomi\"（不是真厂商名，是为了让车机按样本路径走）")
         // channel：未连 Wi-Fi/取不到信道时填 0。
@@ -421,7 +508,7 @@ final class BleProbe: NSObject, ObservableObject {
             "id": phoneId,
             "name": marketName,
             "model": marketName,
-            "pinCodeOrAuthentication": pin,
+            "pinCodeOrAuthentication": credential,
             "band": 1,
             "mac": mac,
             "type": typeValue,
@@ -430,7 +517,7 @@ final class BleProbe: NSObject, ObservableObject {
         ]
         let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         var maskedDict = dict
-        maskedDict["pinCodeOrAuthentication"] = "**" + String(pin.suffix(2))
+        maskedDict["pinCodeOrAuthentication"] = "**" + String(credential.suffix(2))
         let maskedData = try? JSONSerialization.data(withJSONObject: maskedDict, options: [.sortedKeys])
         let masked = maskedData.flatMap { String(data: $0, encoding: .utf8) } ?? "(拼不出来)"
         return (data, masked, notes)
@@ -439,7 +526,7 @@ final class BleProbe: NSObject, ObservableObject {
     /// 鉴权成功后经 …103 回告手机局域网地址（BLE-SPEC §4.3）。失败只记日志。
     func writeClientAddress(localIP: String) {
         // 没走过 BLE 连接流程（比如用的是老 CarLink 页直连）时静默跳过。
-        guard pendingPin != nil || lastServerInfo != nil else { return }
+        guard flowCredential != nil || lastServerInfo != nil else { return }
         guard !localIP.isEmpty else {
             log("UCar 连接：拿不到本机局域网 IP，跳过写 …103 回告地址")
             return
@@ -476,13 +563,15 @@ final class BleProbe: NSObject, ObservableObject {
         serverInfoTimeout?.cancel()
         serverInfoTimeout = nil
         flowPhase = .gotServerInfo
+        sessionEstablished = true
 
         log("UCar 连接：收到 ServerInfo——ssid「\(info.ssid ?? "?")」 psk \(info.psk.map { "共 \($0.count) 位（已打码）" } ?? "无") mac \(info.mac ?? "?") freq \(info.freq.map { String($0) } ?? "?") authentication \(info.authentication != nil ? "有（重连令牌，已存）" : "无") ipAddress \(info.ipAddress ?? "无")")
         if let auth = info.authentication, let deviceId = foundDeviceId {
             UserDefaults.standard.set(auth, forKey: "ucar.authToken.\(deviceId)")
+            hasStoredToken = true
         }
         if let ip = info.ipAddress, !ip.isEmpty {
-            if pendingPin != nil {
+            if flowCredential != nil {
                 onServerInfo?(info)
             } else {
                 log("UCar 连接：这条 ServerInfo 不是本轮输码流程触发的，只记录不往下走")
@@ -494,7 +583,7 @@ final class BleProbe: NSObject, ObservableObject {
 
     // MARK: 持久化小工具
 
-    private static func persistentPhoneId() -> String {
+    static func persistentPhoneId() -> String {
         let key = "ucar.phoneId"
         if let saved = UserDefaults.standard.string(forKey: key), saved.count == 6 {
             return saved
@@ -518,7 +607,7 @@ final class BleProbe: NSObject, ObservableObject {
     }
 
     /// 机型市场名：取硬件标识（如 iPhone15,3）映射成市场名，未知就用标识本身。
-    private static func deviceMarketName() -> String {
+    static func deviceMarketName() -> String {
         var systemInfo = utsname()
         uname(&systemInfo)
         let identifier = withUnsafePointer(to: &systemInfo.machine) {
@@ -581,13 +670,24 @@ extension BleProbe: CBCentralManagerDelegate {
                 foundVersionCode = info.versionCode
                 foundName = info.name
                 foundPeripheral = peripheral
-                if pendingPin == nil, case .idle = flowPhase {
+                hasStoredToken = storedToken(for: deviceId) != nil
+                if hasStoredToken {
+                    log("蓝牙探针：这台车机存有重连令牌，可免输配对码直接点「连接车机」")
+                }
+                if flowCredential == nil, case .idle = flowPhase {
                     flowPhase = .found
+                }
+                // 断线自动重连：重新扫到同一台车机就用令牌自动连回去。
+                if autoReconnectDeviceId == deviceId, flowCredential == nil {
+                    autoReconnectDeviceId = nil
+                    log("UCar 连接：自动重连——重新发现车机 \(deviceId)，用已存令牌免码连接")
+                    connectWithToken()
+                    return
                 }
             }
         }
         // 连接流程进行中（已停扫描）时不再自动发起只读连接。
-        if pendingPin == nil {
+        if flowCredential == nil {
             tryConnect(peripheral)
         }
     }
@@ -602,7 +702,7 @@ extension BleProbe: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
         log("蓝牙探针：蓝牙连接失败：\(error?.localizedDescription ?? "未知错误")")
-        if pendingPin != nil {
+        if flowCredential != nil {
             flowPhase = .failed("蓝牙连接失败")
         }
         if target === peripheral { target = nil }
@@ -612,10 +712,21 @@ extension BleProbe: CBCentralManagerDelegate {
                         error: Error?) {
         log("蓝牙探针：蓝牙已断开\(error.map { "：\($0.localizedDescription)" } ?? "")")
         if target === peripheral { target = nil }
-        if pendingPin != nil {
+        if flowCredential != nil {
             switch flowPhase {
             case .gotServerInfo:
                 log("UCar 连接：蓝牙在拿到 ServerInfo 后断开（主流程已往下走，TCP 那边继续看）")
+                // 完整会话已建立过又断开：用令牌自动重连一次（重新扫到车机时触发）。
+                if sessionEstablished, autoReconnectAttempts < 1,
+                   let deviceId = foundDeviceId, storedToken(for: deviceId) != nil {
+                    autoReconnectAttempts += 1
+                    autoReconnectDeviceId = deviceId
+                    flowCredential = nil
+                    flowUsesToken = false
+                    pendingPin = nil
+                    log("UCar 连接：已安排自动重连（第 \(autoReconnectAttempts) 次）——重新开始扫描，扫到车机 \(deviceId) 就用令牌免码连回")
+                    start()
+                }
             case .failed:
                 break
             default:
@@ -678,7 +789,7 @@ extension BleProbe: CBPeripheralDelegate {
         }
         // 用户已输码在等连接时，特征一发现齐就直接试着写 ClientInfo，
         // 不依赖订阅确认回调（有的车机不回那个回调，等它会静默卡住）。
-        if pendingPin != nil {
+        if flowCredential != nil {
             maybeWriteClientInfo()
         }
     }
@@ -687,7 +798,7 @@ extension BleProbe: CBPeripheralDelegate {
                     error: Error?) {
         if let error {
             log("蓝牙探针：订阅通知失败（\(characteristic.uuid.uuidString)）：\(error.localizedDescription)")
-            if pendingPin != nil, characteristic.uuid == Self.charServerInfo {
+            if flowCredential != nil, characteristic.uuid == Self.charServerInfo {
                 log("UCar 连接：流程进行中 …102 订阅回调报错，订阅没确认；已请求过通知的话写 ClientInfo 不等这个确认")
                 maybeWriteClientInfo()
             }
@@ -695,7 +806,7 @@ extension BleProbe: CBPeripheralDelegate {
             log("蓝牙探针：通知状态 \(characteristic.uuid.uuidString) 现在是 \(characteristic.isNotifying ? "已开启" : "已关闭")")
             if characteristic.uuid == Self.charServerInfo {
                 serverInfoSubscribed = characteristic.isNotifying
-                if pendingPin != nil {
+                if flowCredential != nil {
                     log("UCar 连接：流程进行中收到 …102 订阅回调，isNotifying=\(characteristic.isNotifying)，据此试着写 ClientInfo")
                 }
                 if characteristic.isNotifying {

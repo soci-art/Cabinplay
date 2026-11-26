@@ -36,8 +36,19 @@ final class CarLinkCore {
     private init() {}
 
     func start(headUnit: String, local: String, pin: String, stateDir: String,
-               width: UInt32, height: UInt32) -> Bool {
+               width: UInt32, height: UInt32,
+               deviceID: String, model: String) -> Bool {
         if running { return true }
+
+        // 鉴权请求里报的手机身份：id 与蓝牙 ClientInfo 同源（持久 6 字符 ID），
+        // model 用机型市场名，productName 固定 CabinPlay。
+        deviceID.withCString { idPtr in
+            model.withCString { modelPtr in
+                "CabinPlay".withCString { productPtr in
+                    clink_set_identity(idPtr, modelPtr, productPtr)
+                }
+            }
+        }
 
         var callbacks = ClinkCallbacks()
         callbacks.context = Unmanaged.passUnretained(self).toOpaque()
@@ -91,6 +102,31 @@ final class CarLinkCore {
         guard running else { return }
         _ = clink_stop()
         running = false
+    }
+
+    /// 把解码配置（avcC/hvcC 记录）推给车机；必须先于帧调用。codec：1=H.264，2=H.265。
+    /// 返回 false 表示会话没在跑或核心拒绝（核心内部还要求会话已进入出画状态）。
+    @discardableResult
+    func pushConfig(codec: UInt32, config: Data, fps: Double) -> Bool {
+        guard running, !config.isEmpty else { return false }
+        let code = config.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return -99 }
+            return clink_push_config(0, codec, base.assumingMemoryBound(to: UInt8.self),
+                                     config.count, fps)
+        }
+        return code == 0
+    }
+
+    /// 把一帧已编码画面（Annex-B）推给车机。pts 用微秒，keyFrame 标关键帧。
+    @discardableResult
+    func pushFrame(_ data: Data, ptsMicros: Int64, keyFrame: Bool) -> Bool {
+        guard running, !data.isEmpty else { return false }
+        let code = data.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return -99 }
+            return clink_push_frame(0, base.assumingMemoryBound(to: UInt8.self),
+                                    data.count, ptsMicros, keyFrame ? 1 : 0)
+        }
+        return code == 0
     }
 
     private func handleState(_ value: UInt16) {
