@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // 会话期网络变化与音频快照。

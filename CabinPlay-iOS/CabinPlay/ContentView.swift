@@ -803,20 +803,10 @@ struct ContentView: View {
             // 据同地址重新发起，最多共 3 次；回连即收手。
             armLocalCallbackRetry()
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
-            // 与本机 CarPlay 接续并行，两边靠帧桥汇合。
-            // 车机地址：先快速验入网给的候选，都不通再扫同网段 57209——
-            // 覆盖「BLE 没给地址」和「车机不在网关（.1）」两种车。
-            let seeds = result.candidates
-            HeadUnitProbe.discover(localIP: result.localIP, seeds: seeds) { discovered in
-                var merged = seeds
-                for ip in discovered where !merged.contains(ip) {
-                    merged.append(ip)
-                }
-                if !discovered.isEmpty {
-                    appendLog("CarLink 发现：探通 57209 的地址 \(discovered.joined(separator: "、"))")
-                }
-                beginClinkAttempts(candidates: merged, localIP: result.localIP)
-            }
+            // 与本机 CarPlay 接续并行，两边靠帧桥汇合。只用真连接试：
+            // 57209 只认第一个连接，裸 TCP 试探会占掉唯一的鉴权名额，
+            // 不做任何形式的预探测/扫网段（同网段发现已按此口径删除）。
+            beginClinkAttempts(candidates: result.candidates, localIP: result.localIP)
         }
     }
 
