@@ -43,15 +43,6 @@ struct SettingsView: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
-    private var sizeChoiceTitle: String {
-        switch sizeChoice {
-        case "1080": return "1080p"
-        case "720": return "720p（更流畅）"
-        case "480": return "480p（最省带宽）"
-        default: return "自动（按车记忆）"
-        }
-    }
-
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -114,23 +105,21 @@ struct SettingsView: View {
             .padding(.vertical, 11)
     }
 
-    /// 菜单式选择器行：左边名称、右边当前值（落日橙）加上下小箭头，
-    /// 与表单页里 Picker 的菜单样式一致。
-    private func menuRow<Selection: Hashable>(title: String,
-                                              valueTitle: String,
-                                              selection: Binding<Selection>,
-                                              @ViewBuilder options: () -> some View) -> some View {
-        Menu {
+    /// 选择器行：行名是普通黑字，右边是系统原生菜单式选择器（只显
+    /// 当前值＋上下小箭头，落日橙），点开的菜单与表单页时一模一样。
+    /// 别用自绘 Menu 当选择器：Menu 会把整行标签都染成强调色（行名
+    /// 跟着变橙），弹出的面板样子也与原生选择器不同（2026-11-27
+    /// 截图实锤）。
+    private func pickerRow<Selection: Hashable>(title: String,
+                                                selection: Binding<Selection>,
+                                                @ViewBuilder options: () -> some View) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
             Picker(title, selection: selection) { options() }
-        } label: {
-            HStack {
-                Text(title).foregroundStyle(.primary)
-                Spacer()
-                Text(valueTitle).foregroundStyle(Color.sunsetAccent)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Color.sunsetAccent)
-            }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .tint(Color.sunsetAccent)
         }
     }
 
@@ -181,7 +170,7 @@ struct SettingsView: View {
     private var audioCard: some View {
         card {
             row {
-                menuRow(title: "声音输出", valueTitle: audioMode.title, selection: $audioMode) {
+                pickerRow(title: "声音输出", selection: $audioMode) {
                     ForEach(AudioOutputMode.allCases) { mode in
                         Text(mode.title).tag(mode)
                     }
@@ -207,7 +196,7 @@ struct SettingsView: View {
     private var videoCard: some View {
         card {
             row {
-                menuRow(title: "画质档位", valueTitle: sizeChoiceTitle, selection: $sizeChoice) {
+                pickerRow(title: "画质档位", selection: $sizeChoice) {
                     Text("自动（按车记忆）").tag("auto")
                     Text("1080p").tag("1080")
                     Text("720p（更流畅）").tag("720")
@@ -216,7 +205,7 @@ struct SettingsView: View {
             }
             Divider()
             row {
-                menuRow(title: "请求帧率", valueTitle: "\(fpsChoice) fps", selection: $fpsChoice) {
+                pickerRow(title: "请求帧率", selection: $fpsChoice) {
                     Text("60 fps").tag(60)
                     Text("30 fps").tag(30)
                 }
