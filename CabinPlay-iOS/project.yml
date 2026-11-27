@@ -24,7 +24,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: CabinPlay/Info.plist
         CODE_SIGN_ENTITLEMENTS: CabinPlay.entitlements
-        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_all"]
+        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_clink_ios"]
         LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/generated"]
         HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated", "$(SRCROOT)/CabinPlay/LocalCarPlay"]
         SWIFT_OBJC_BRIDGING_HEADER: CabinPlay/CabinPlay-Bridging-Header.h
