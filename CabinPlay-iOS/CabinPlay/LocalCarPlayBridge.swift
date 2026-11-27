@@ -62,6 +62,8 @@ final class LocalCarPlayBridge {
                 self.audioPacketsPushed = 0
                 self.audioPushFailures = 0
                 self.audioPacketsHeldBack = 0
+                // 车机不再出画：声音回到本机（A2DP/扬声器）。
+                CarPlayAudio.carPlaysAudio = false
             }
         }
     }
@@ -227,7 +229,8 @@ final class LocalCarPlayBridge {
                 // 包」——那是更准的口径（这里数的只是核心收下入队的
                 // 包），两边都打会重复刷屏。被拒计数仍看下面失败行。
                 if audioPacketsPushed == 1 {
-                    onLog?("音频桥：首个声音包已喂给车机核心（\(samples.count) 字节）")
+                    CarPlayAudio.carPlaysAudio = true
+                    onLog?("音频桥：首个声音包已喂给车机核心（\(samples.count) 字节）——声音改由车机播放，本机不再起引擎")
                 }
             } else {
                 audioPushFailures += 1

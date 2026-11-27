@@ -29,8 +29,8 @@ final class MediaRemoteBridge {
         installed = true
 
         let center = MPRemoteCommandCenter.shared()
-        bind(center.playCommand, "播放", .play)
-        bind(center.pauseCommand, "暂停", .pause)
+        bind(center.playCommand, "播放", .playPause)
+        bind(center.pauseCommand, "暂停", .playPause)
         bind(center.togglePlayPauseCommand, "播放/暂停", .playPause)
         bind(center.nextTrackCommand, "下一曲", .next)
         bind(center.previousTrackCommand, "上一曲", .previous)
