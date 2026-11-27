@@ -106,15 +106,47 @@ struct CarLifeView: View {
                 }
 
                 Section {
-                    Button(session.running ? "停止" : "启动") {
+                    // 启动/停止：CarLink「连接车机」同款橙色长条、文字
+                    // 居中；停止时字保持红色（车主定的样式，渲染图已定案）。
+                    Button {
+                        Haptics.tap()
                         if session.running {
                             session.stop()
                         } else {
                             let size = videoSize
                             session.start(carIP: carIP, width: size.0, height: size.1, fps: fps)
                         }
+                    } label: {
+                        Text(session.running ? "停止" : "启动")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(session.running ? Color.red : Color.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 14))
                     }
-                    .foregroundStyle(session.running ? .red : .primary)
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+
+                    // 开启/关闭 CarPlay：同款长条，只在启动后、车机连上
+                    // CarLife 才显示（车主定的）；流程与 CarLink 同款——
+                    // 只动本机 CarPlay 会话，CarLife 的连接不断。
+                    if session.peerConnected {
+                        Button {
+                            Haptics.tap()
+                            session.toggleCarPlay()
+                        } label: {
+                            Text(session.carPlayOn ? "关闭 CarPlay" : "开启 CarPlay")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 14))
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                    }
                 } footer: {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(session.status)

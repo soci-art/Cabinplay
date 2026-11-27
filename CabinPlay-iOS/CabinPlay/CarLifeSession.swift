@@ -28,6 +28,8 @@ final class CarLifeSession: ObservableObject {
     @Published private(set) var streaming = false
     @Published private(set) var pausedByCar = false
     @Published private(set) var keepAliveActive = false
+    /// 本机 CarPlay 会话开没开（给页面上「开启/关闭 CarPlay」按钮看）。
+    @Published private(set) var carPlayOn = false
     /// 需要用户动手的提示（权限/端口/蓝牙）。
     @Published private(set) var hint: String?
 
@@ -37,6 +39,7 @@ final class CarLifeSession: ObservableObject {
     private let local = LocalCarPlaySession()
     private let output = CarLifeOutput()
     private var pip: CarPlayPictureInPicture?
+    private var cancellables = Set<AnyCancellable>()
     private var wired = false
     private var monitor: NWPathMonitor?
     private var pathWasReady = false
@@ -122,6 +125,23 @@ final class CarLifeSession: ObservableObject {
         append("CarLife：已停止")
     }
 
+    /// 单独开/关 CarLife 这套的本机 CarPlay 会话（与 CarLink 同款流程：
+    /// 只动会话，CarLife 的监听与连接不断）。页面只在车机连上后才显示
+    /// 这个按钮。
+    func toggleCarPlay() {
+        if local.isRunning {
+            local.stop()
+            append("CarLife：手动关了本机 CarPlay 会话（CarLife 连接还在）")
+        } else {
+            // 与降档重启同一处坑：重开自己这套会话要罩上「正在启动
+            // CarLife」，不然会被互斥守卫以「CarLife 正在运行」拦下。
+            OutputCoordinator.startingCarLife = true
+            local.start(width: size.w, height: size.h, fps: fps)
+            OutputCoordinator.startingCarLife = false
+            append("CarLife：手动重开本机 CarPlay 会话")
+        }
+    }
+
     private func stopEverything(status newStatus: String) {
         output.stop()
         local.stop()
@@ -150,6 +170,11 @@ final class CarLifeSession: ObservableObject {
         guard !wired else { return }
         wired = true
         local.onLog = { [weak self] line in self?.append(line) }
+        // 本机 CarPlay 会话的开关状态同步给页面（开启/关闭按钮的文案）。
+        local.$phase
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.carPlayOn = self?.local.isRunning ?? false }
+            .store(in: &cancellables)
         local.onPreviewConfig = { [weak self] record, codec in
             self?.decoder.configure(codec: codec == .h265 ? 2 : 1, config: record)
         }
