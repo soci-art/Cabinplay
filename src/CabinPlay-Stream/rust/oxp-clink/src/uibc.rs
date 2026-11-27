@@ -302,11 +302,15 @@ impl UibcDecoder {
     /// trustworthy visible size, or when it equals the surface on this
     /// axis, the result is exactly the legacy `raw / stream_size`.
     fn correct(raw: i64, stream: u32, surface: Option<u32>, visible: Option<u32>) -> f64 {
-        if let (Some(s), Some(v)) = (surface, visible) {
-            if s > 0 && v > 0 && v != s {
-                let drift = (s as f64 - v as f64) / 2.0;
-                return ((raw as f64 - drift) / v as f64).clamp(0.0, 1.0);
-            }
+        // 车机声明了触控面（screen）但没报 videoDisplay 时，按「画面铺满
+        // 触控面」换算：CarLink 车机普遍把视频铺满自己的屏，raw 坐标就是
+        // 触控面像素，除以触控面尺寸才是真正的归一化。缺这一步会落到
+        // raw/流尺寸（1080），2026-11-27 实测纵向偏 33%（529→0.49，应为
+        // 0.73），表现为点屏幕底部按钮永远点不中、按 OK 无效。
+        if let Some(s) = surface.filter(|s| *s > 0) {
+            let v = visible.filter(|v| *v > 0).unwrap_or(s);
+            let drift = (s as f64 - v as f64) / 2.0;
+            return ((raw as f64 - drift) / v as f64).clamp(0.0, 1.0);
         }
         (raw as f64 / stream as f64).clamp(0.0, 1.0)
     }
