@@ -81,6 +81,11 @@ struct ContentView: View {
     // 前档的生效值，只用于展示与启动参数，不再由用户选。
     private static let startupBudget: TimeInterval = 120
     private static let sizeLadder: [(Int, Int)] = [(1920, 1080), (1280, 720), (854, 480)]
+    /// 画质档位（设置页）：auto / 1080 / 720 / 480。手动档只决定「起步
+    /// 档」，协商失败仍按阶梯往下自动降，不会卡死在用户选的那一档。
+    @AppStorage("cabinplay.sizeChoice") private var sizeChoice = "auto"
+    /// 请求帧率：60 或 30。车机只解 30 的车把这里切 30，帧间隔更均匀。
+    @AppStorage("cabinplay.fpsChoice") private var fpsChoice = 60
     @State private var sizeTierIndex = 0
     @State private var targetSize: (Int, Int) = (1920, 1080)
 
@@ -247,7 +252,7 @@ struct ContentView: View {
         // 车机媒体键（蓝牙 AVRCP）→ CarPlay：音频走 A2DP 时，车机的播放/
         // 暂停/上一曲/下一曲是蓝牙媒体命令，不是 CarLink 的 UIBC 按键。
         MediaRemoteBridge.shared.install(for: localSession, log: { appendLog($0) })
-        localSession.start(width: targetSize.0, height: targetSize.1, fps: 60,
+        localSession.start(width: targetSize.0, height: targetSize.1, fps: fpsChoice,
                            addressOverride: addressOverride)
         if localSession.phase.isFailed {
             Haptics.error()
@@ -457,16 +462,27 @@ struct ContentView: View {
     /// 每轮连接在 handleUCarServerInfo 开头调一次。
     private func prepareSizeTier(for deviceId: String?) {
         var tier = 0
-        if let deviceId,
-           let saved = UserDefaults.standard.string(forKey: "cabinplay.provenSize.\(deviceId)"),
-           let index = Self.sizeLadder.firstIndex(where: { "\($0.0)x\($0.1)" == saved }) {
-            tier = index
+        // 手动档优先：用户选了 720p 就从 720p 起步，协商失败仍按阶梯继续降。
+        switch sizeChoice {
+        case "1080": tier = 0
+        case "720": tier = 1
+        case "480": tier = 2
+        default:
+            if let deviceId,
+               let saved = UserDefaults.standard.string(forKey: "cabinplay.provenSize.\(deviceId)"),
+               let index = Self.sizeLadder.firstIndex(where: { "\($0.0)x\($0.1)" == saved }) {
+                tier = index
+            }
         }
         sizeTierIndex = tier
         targetSize = Self.sizeLadder[tier]
-        appendLog(tier == 0
-            ? "分辨率自动协商：从最高档 \(targetSize.0)×\(targetSize.1) 起步，车机接受不了就自动降档"
-            : "分辨率自动协商：这台车上次定案是 \(targetSize.0)×\(targetSize.1)，这轮从这一档起步")
+        if sizeChoice == "auto" {
+            appendLog(tier == 0
+                ? "分辨率自动协商：从最高档 \(targetSize.0)×\(targetSize.1) 起步，车机接受不了就自动降档"
+                : "分辨率自动协商：这台车上次定案是 \(targetSize.0)×\(targetSize.1)，这轮从这一档起步")
+        } else {
+            appendLog("分辨率：手动档 \(targetSize.0)×\(targetSize.1)（设置页指定；协商失败仍会自动降档），请求 \(fpsChoice) fps")
+        }
     }
 
     // MARK: 连接卡阶段文案（蓝牙前段 + CarLink 后段合并）

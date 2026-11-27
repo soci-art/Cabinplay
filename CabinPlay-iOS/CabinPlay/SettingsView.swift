@@ -18,6 +18,9 @@ struct SettingsView: View {
     @State private var manualPassword = ""
     @State private var manualOpenNetwork = false
     @State private var audioMode: AudioOutputMode = AudioOutputPolicy.mode
+    // 画面档位：默认自动；手动档用于对比 1080p/720p 在车机上的实际流畅度。
+    @AppStorage("cabinplay.sizeChoice") private var sizeChoice = "auto"
+    @AppStorage("cabinplay.fpsChoice") private var fpsChoice = 60
     @State private var routeText = AudioOutputPolicy.routeSummary
     // 键盘收起：点空白处、滑动、按回车都能收（以前输完收不起来）。
     @FocusState private var fieldFocused: Bool
@@ -90,6 +93,21 @@ struct SettingsView: View {
                 Text("声音")
             }
 
+            Section("画面") {
+                Picker("画质档位", selection: $sizeChoice) {
+                    Text("自动（按车记忆）").tag("auto")
+                    Text("1080p").tag("1080")
+                    Text("720p（更流畅）").tag("720")
+                    Text("480p（最省带宽）").tag("480")
+                }
+                Picker("请求帧率", selection: $fpsChoice) {
+                    Text("60 fps").tag(60)
+                    Text("30 fps").tag(30)
+                }
+                Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("关于") {
                 HStack {
                     Text("作者")
