@@ -377,6 +377,12 @@ final class LocalCarPlaySession: ObservableObject {
         config.height = height
         config.maxFPS = fps
         config.videoCodec = .h264
+        // 「汽车」格图标:按上次/这次蓝牙认到的车名自动选车标,认不出
+        // 用 CabinPlay 兜底(见 VehicleIcons)。只显示、不接点击操作。
+        let vehicleIcon = VehicleIcons.icon(forCarName: UserDefaults.standard.string(forKey: "cabinplay.lastCarName"))
+        config.oemIconPNG = vehicleIcon.data
+        config.oemIconLabel = vehicleIcon.label
+        onLog?("本机 CarPlay：CarPlay 界面「汽车」格图标选了「\(vehicleIcon.matched)」")
         do {
             try config.validate(requiresLocalAddress: !startAddressWasOverride)
         } catch {

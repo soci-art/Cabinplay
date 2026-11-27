@@ -13,6 +13,23 @@ struct LogView: View {
     /// 所以先把日志写成真正的 .txt 文件，再分享这个文件。
     @State private var logFileURL: URL?
 
+    // 日志上传（右上角，和清空日志并排）：上传中禁用按钮；结果用弹
+    // 窗告诉用户，失败时把服务端回的原因照原样显示。
+    @State private var uploading = false
+    @State private var uploadSucceeded = false
+    @State private var uploadMessage: String?
+
+    private func doUpload() {
+        uploading = true
+        let text = lines.joined(separator: "\n")
+        Task {
+            let result = await LogUploader.upload(text: text)
+            uploading = false
+            uploadSucceeded = result.ok
+            uploadMessage = result.message
+        }
+    }
+
     /// 把当前日志写到临时目录的 .txt 文件（文件名带时间戳），供分享使用。
     private func prepareLogFile() {
         guard !lines.isEmpty else {
@@ -81,7 +98,22 @@ struct LogView: View {
         .background(Color.pageBackground)
         .onAppear { prepareLogFile() }
         .onChange(of: lines) { prepareLogFile() }
+        .alert(uploadSucceeded ? "上传成功" : "上传失败",
+               isPresented: Binding(get: { uploadMessage != nil },
+                                    set: { if !$0 { uploadMessage = nil } })) {
+            Button("好") { uploadMessage = nil }
+        } message: {
+            Text(uploadMessage ?? "")
+        }
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    doUpload()
+                } label: {
+                    Label(uploading ? "上传中…" : "上传日志", systemImage: "arrow.up.circle")
+                }
+                .disabled(lines.isEmpty || uploading)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     if let logFileURL {

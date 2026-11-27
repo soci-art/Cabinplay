@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The app shell: three tabs （驾驶舱 / 日志 / 设置）.
+// The app shell: three tabs (Carlink / 日志 / 设置).
 // 主线：本机 CarPlay 会话（LocalCarPlaySession）出帧 → 蓝牙 UCar 配对 →
 // 拿到 ServerInfo 后组网（UCarNetworkJoiner）→ CarLink（clink）把帧送上
 // 车机、把车机触摸/按键回送本机会话。全程没有手填表单：车机地址入网后
@@ -153,9 +153,15 @@ struct ContentView: View {
                     onToggleBleProbe: { bleProbe.toggle() },
                     onConnectBle: { connectCarFlow() }
                 )
-                .navigationTitle("驾驶舱")
+                .navigationTitle("CabinPlay")
             }
-            .tabItem { Label("驾驶舱", systemImage: "gauge.with.dots.needle.33percent") }
+            .tabItem {
+                Label {
+                    Text("Carlink")
+                } icon: {
+                    Image("TabCarlink")
+                }
+            }
             .tag(0)
 
             NavigationStack {

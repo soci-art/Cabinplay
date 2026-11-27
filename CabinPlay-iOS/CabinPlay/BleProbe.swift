@@ -745,6 +745,11 @@ extension BleProbe: CBCentralManagerDelegate {
                 foundDeviceId = deviceId
                 foundVersionCode = info.versionCode
                 foundName = info.name
+                // 车名落盘:本机 CarPlay 选「汽车」格图标时按这个名字认品牌
+                // (VehicleIcons),不连车单独启动时就用上次这台车的名字。
+                if let carName = info.name, !carName.isEmpty {
+                    UserDefaults.standard.set(carName, forKey: "cabinplay.lastCarName")
+                }
                 foundPeripheral = peripheral
                 hasStoredToken = storedToken(for: deviceId) != nil
                 if hasStoredToken {
