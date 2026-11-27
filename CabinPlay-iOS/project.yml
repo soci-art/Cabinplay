@@ -25,6 +25,10 @@ targets:
         INFOPLIST_FILE: CabinPlay/Info.plist
         CODE_SIGN_ENTITLEMENTS: CabinPlay.entitlements
         OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_clink_ios"]
+        # 车标 PNG 必须原样进包：Xcode 默认会把散装 .png 改写成苹果私有
+        # 格式（CgBI），尺寸字段位置都变了，接收端按标准 PNG 头读尺寸
+        # 会读错、整段 oem 图标被跳过（2026-11-27 实证）。关掉压缩改写。
+        COMPRESS_PNG_FILES: NO
         LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/generated"]
         HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated", "$(SRCROOT)/CabinPlay/LocalCarPlay"]
         SWIFT_OBJC_BRIDGING_HEADER: CabinPlay/CabinPlay-Bridging-Header.h

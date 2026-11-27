@@ -382,7 +382,7 @@ final class LocalCarPlaySession: ObservableObject {
         let vehicleIcon = VehicleIcons.icon(forCarName: UserDefaults.standard.string(forKey: "cabinplay.lastCarName"))
         config.oemIconPNG = vehicleIcon.data
         config.oemIconLabel = vehicleIcon.label
-        onLog?("本机 CarPlay：CarPlay 界面「汽车」格图标选了「\(vehicleIcon.matched)」")
+        onLog?("本机 CarPlay：CarPlay 界面「汽车」格图标选了「\(vehicleIcon.matched)」（\(vehicleIcon.data.count) 字节）")
         do {
             try config.validate(requiresLocalAddress: !startAddressWasOverride)
         } catch {

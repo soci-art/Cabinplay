@@ -625,6 +625,12 @@ final class BleProbe: NSObject, ObservableObject {
             return
         }
         var info = UCarServerInfo()
+        // ServerInfo 里带车名（如「长安UNI-V」）：蓝牙广播那边不一定报
+        // 名字（实测有「未知」的轮次），这里再落一次盘，给「汽车」格
+        // 选车标用（VehicleIcons）。
+        if let carName = dict["name"] as? String, !carName.isEmpty {
+            UserDefaults.standard.set(carName, forKey: "cabinplay.lastCarName")
+        }
         info.ssid = dict["ssid"] as? String
         info.psk = dict["psk"] as? String
         info.mac = dict["mac"] as? String
