@@ -65,6 +65,9 @@ struct ContentView: View {
     @State private var carLinkState = CarLinkCore.State.idle
     @State private var carLinkRunning = false
     @State private var netMonitor: NetworkChangeMonitor?
+    /// 启动总超时：从点「连接车机」起算，超过这个时长还没出画就整轮放弃，
+    /// 不再让用户对着「连接中」无限等（每轮内部重试仍受 30 秒预算约束）。
+    @State private var startupWatchdog: DispatchWorkItem?
 
     // 分辨率改自动（不再有手动菜单）：阶梯从高往低，连接时先用这台
     // 车上次协商定案的档（存 UserDefaults），没有就从最高档起步；
@@ -72,6 +75,7 @@ struct ContentView: View {
     // 次再试（WFD 声明、本机 CarPlay 请求、触控换算三处尺寸必须同
     // 源同值，见 abandonClinkAttempts 的降档分支）。targetSize 是当
     // 前档的生效值，只用于展示与启动参数，不再由用户选。
+    private static let startupBudget: TimeInterval = 120
     private static let sizeLadder: [(Int, Int)] = [(1920, 1080), (1280, 720), (854, 480)]
     @State private var sizeTierIndex = 0
     @State private var targetSize: (Int, Int) = (1920, 1080)
@@ -414,6 +418,7 @@ struct ContentView: View {
         // 残留未清约 30 秒回连；真楔住时由接续发起后约 35 秒的熔
         // 断换新标识兜底（见 scheduleLocalCallbackCheck）。标记的读
         // 写点不动：连上照落、stop 照落，只是不再作轮换依据。
+        armStartupDeadline()
         appendLog("本机 CarPlay：本轮先用原设备标识连接（35 秒不回连再换新标识）")
         appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
         bleProbe.connect(pin: blePin)
@@ -485,6 +490,8 @@ struct ContentView: View {
             if state == .playing {
                 carLinkDetail = "车机 \(flowCarIP) · 本机 \(flowLocalIP) · 正在输出"
                 appendLog(AudioDiagnostics.snapshot(width: targetSize.0, height: targetSize.1))
+                appendLog(AudioDiagnostics.formatMatrix())
+                appendLog(AudioDiagnostics.touchGeometry())
                 startNetworkMonitorIfNeeded()
                 // 触控定锚防丢：每轮车机会话出画后重打一行（声明几何
                 // ＋当前换算方式）——日志从会话中段导出时，开头那份
@@ -566,6 +573,7 @@ struct ContentView: View {
         flow.onDetail = { carLinkDetail = $0 }
         flow.onStop = { CarLinkCore.shared.stop() }
         flow.onHit = { _ in
+            cancelStartupDeadline()
             // 协商定案的尺寸按车记下：下次连这台车直接从这一档起步。
             if let deviceId = bleProbe.foundDeviceId ?? lastCarDeviceId {
                 UserDefaults.standard.set("\(targetSize.0)x\(targetSize.1)",
@@ -667,6 +675,7 @@ struct ContentView: View {
             appendLog("UCar 连接：已断开，本轮车机网络凭据已作废")
         }
         // 候选试序一并停：撤掉待发的重试与看门狗，别在用户断开后又自己启。
+        cancelStartupDeadline()
         clinkFlow.cancel()
         CarLinkCore.shared.stop()
         carLinkRunning = false
@@ -795,8 +804,40 @@ struct ContentView: View {
             armLocalCallbackRetry()
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
             // 与本机 CarPlay 接续并行，两边靠帧桥汇合。
-            beginClinkAttempts(candidates: result.candidates, localIP: result.localIP)
+            // 车机地址：先快速验入网给的候选，都不通再扫同网段 57209——
+            // 覆盖「BLE 没给地址」和「车机不在网关（.1）」两种车。
+            let seeds = result.candidates
+            HeadUnitProbe.discover(localIP: result.localIP, seeds: seeds) { discovered in
+                var merged = seeds
+                for ip in discovered where !merged.contains(ip) {
+                    merged.append(ip)
+                }
+                if !discovered.isEmpty {
+                    appendLog("CarLink 发现：探通 57209 的地址 \(discovered.joined(separator: "、"))")
+                }
+                beginClinkAttempts(candidates: merged, localIP: result.localIP)
+            }
         }
+    }
+
+    /// 启动总超时（默认 120 秒）：到点还没出画就整轮停掉，给一句能看懂的
+    /// 结论。命中出画时由 onHit 撤表；用户断开时 stopCarLink 也会撤。
+    private func armStartupDeadline() {
+        cancelStartupDeadline()
+        let work = DispatchWorkItem { [self] in
+            startupWatchdog = nil
+            guard !carLinkRunning, carLinkState != .playing else { return }
+            appendLog("启动超时：\(Int(Self.startupBudget)) 秒内没出画，整轮放弃——检查车机是否停在 CarLink 界面、手机是否还连着车机 Wi-Fi")
+            carLinkDetail = "启动超时：\(Int(Self.startupBudget)) 秒没出画，已放弃这一轮"
+            stopCarLink()
+        }
+        startupWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupBudget, execute: work)
+    }
+
+    private func cancelStartupDeadline() {
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
     }
 
     private func appendLog(_ line: String) {

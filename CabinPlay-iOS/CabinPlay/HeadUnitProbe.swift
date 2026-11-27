@@ -79,7 +79,7 @@ enum HeadUnitProbe {
         return (false, "连不上 errno \(error)（\(String(cString: strerror(error)))）")
     }
 
-    private static func canConnect(_ ip: String, port: UInt16) -> Bool {
+    private static func canConnect(_ ip: String, port: UInt16, timeoutMs: Int32 = 700) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
@@ -101,11 +101,62 @@ enum HeadUnitProbe {
         guard errno == EINPROGRESS else { return false }
 
         var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-        guard poll(&pfd, 1, 700) > 0 else { return false }
+        guard poll(&pfd, 1, timeoutMs) > 0 else { return false }
 
         var error: Int32 = 0
         var length = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)
         return error == 0
+    }
+
+    /// 主动发现：先快速验种子里有没有活着的（有就直接用它，不拖慢连接），
+    /// 都没有才扫同网段 1–254 的 57209 口。覆盖两种情况：BLE 没给车机
+    /// 地址、以及车机不在网关上（.1 探不通但确实在网段里）。
+    static func discover(localIP: String, seeds: [String], completion: @escaping ([String]) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            for ip in seeds where canConnect(ip, port: carLinkAuthPort, timeoutMs: 350) {
+                DispatchQueue.main.async { completion([ip]) }
+                return
+            }
+            let hits = scanSubnet(localIP: localIP)
+            DispatchQueue.main.async { completion(hits) }
+        }
+    }
+
+    /// 同网段 /24 扫 CarLink 认证口（并发 48、单机 350 毫秒），返回探通的
+    /// 地址（升序）。扫不动或地址不是私有 IPv4 就返回空。
+    static func scanSubnet(localIP: String, timeoutMs: Int32 = 350, concurrency: Int = 48) -> [String] {
+        let parts = localIP.split(separator: ".")
+        guard parts.count == 4, let last = Int(parts[3]) else { return [] }
+        let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
+        let hosts = 1...254
+        var hits: [String] = []
+        var index = 0
+        let lock = NSLock()
+        let group = DispatchGroup()
+        for _ in 0..<min(concurrency, hosts.count) {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                while true {
+                    lock.lock()
+                    let i = index
+                    index += 1
+                    lock.unlock()
+                    guard i < hosts.count else { break }
+                    let host = hosts[i]
+                    if host == last { continue }
+                    let ip = prefix + String(host)
+                    if canConnect(ip, port: carLinkAuthPort, timeoutMs: timeoutMs) {
+                        lock.lock(); hits.append(ip); lock.unlock()
+                    }
+                }
+                group.leave()
+            }
+        }
+        group.wait()
+        func lastOctet(_ ip: String) -> Int {
+            Int(ip.split(separator: ".").last.map(String.init) ?? "") ?? 0
+        }
+        return hits.sorted { lastOctet($0) < lastOctet($1) }
     }
 }
