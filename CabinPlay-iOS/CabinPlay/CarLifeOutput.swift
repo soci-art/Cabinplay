@@ -10,6 +10,8 @@
 //
 // 与 CarLink 完全独立：各自的监听、各自的会话，同一时刻只允许一路在跑。
 
+import CommonCrypto
+import CryptoKit
 import Foundation
 import Network
 
