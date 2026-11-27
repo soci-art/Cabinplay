@@ -170,7 +170,6 @@ struct ContentView: View {
                     logLines: log,
                     onClearLog: { log.removeAll() }
                 )
-                .navigationTitle("CabinPlay")
             }
             .tabItem {
                 Label {
@@ -183,7 +182,6 @@ struct ContentView: View {
 
             NavigationStack {
                 CarLifeView()
-                    .navigationTitle("CarLife")
             }
             .tabItem {
                 Label {

@@ -170,6 +170,27 @@ struct LogView: View {
     }
 }
 
+/// 日志入口按钮的样子（Carlink / CarLife 两页共用）：橙色边框、橙
+/// 图标橙字、不填色，放在页面内的标题行右边。不要放导航栏——导航
+/// 栏按钮在 iOS 27 上会被系统套一层玻璃胶囊底，橙盒子外面再多一
+/// 层灰框（2026-11-27 截图实锤，车主圈出后定的这个样式）。
+struct LogEntryLabel: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text")
+            Text("日志")
+        }
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(Color.sunsetAccent)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.sunsetAccent, lineWidth: 1.5)
+        }
+    }
+}
+
 /// 系统分享面板（存文件/隔空投送等都走它）的 SwiftUI 包装。
 private struct ActivityView: UIViewControllerRepresentable {
     let activityItems: [Any]

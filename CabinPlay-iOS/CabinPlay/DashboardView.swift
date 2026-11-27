@@ -99,6 +99,19 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                // 标题行：大标题在页面里（不用导航栏标题），右边是日志
+                // 入口——橙色边框的样子见 LogEntryLabel 的注释。
+                HStack(alignment: .center) {
+                    Text("CabinPlay")
+                        .font(.largeTitle.weight(.bold))
+                    Spacer()
+                    NavigationLink {
+                        LogView(lines: logLines, onClear: onClearLog)
+                            .navigationTitle("日志")
+                    } label: {
+                        LogEntryLabel()
+                    }
+                }
                 section(title: "Wi-Fi 名称和密码（手填）") { wifiCard }
                 section(title: "画面") { videoCard }
                 section(title: "声音") { audioCard }
@@ -112,23 +125,8 @@ struct DashboardView: View {
         }
         .background(Color.pageBackground)
         .scrollDismissesKeyboard(.interactively)
+        .navigationBarHidden(true)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink {
-                    LogView(lines: logLines, onClear: onClearLog)
-                        .navigationTitle("日志")
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "doc.text")
-                        Text("日志")
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 8))
-                }
-            }
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("完成") { blePinFocused = false; wifiFieldFocused = false }

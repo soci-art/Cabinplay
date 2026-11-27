@@ -24,6 +24,26 @@ struct CarLifeView: View {
 
     var body: some View {
         NavigationStack {
+            VStack(spacing: 0) {
+                // 标题行与 Carlink 页同款：大标题在页面里，右边是橙色
+                // 边框的日志入口（不用导航栏按钮，原因见 LogEntryLabel）。
+                HStack(alignment: .center) {
+                    Text("CarLife")
+                        .font(.largeTitle.weight(.bold))
+                    Spacer()
+                    NavigationLink {
+                        LogView(lines: session.logLines,
+                                onClear: { session.clearLog() },
+                                uploadTitle: "CabinPlay CarLife 日志",
+                                filePrefix: "CabinPlay-CarLife-log")
+                            .navigationTitle("日志")
+                    } label: {
+                        LogEntryLabel()
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
             Form {
                 Section("车机") {
                     TextField("车机 IP（可留空，靠 UDP 发现）", text: $carIP)
@@ -71,28 +91,9 @@ struct CarLifeView: View {
             }
             .scrollContentBackground(.hidden)
             .background(Color.pageBackground)
-            .navigationTitle("CarLife")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink {
-                        LogView(lines: session.logLines,
-                                onClear: { session.clearLog() },
-                                uploadTitle: "CabinPlay CarLife 日志",
-                                filePrefix: "CabinPlay-CarLife-log")
-                            .navigationTitle("日志")
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "doc.text")
-                            Text("日志")
-                        }
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 8))
-                    }
-                }
             }
+            .background(Color.pageBackground)
+            .navigationBarHidden(true)
         }
     }
 }
