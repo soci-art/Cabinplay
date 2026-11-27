@@ -123,10 +123,6 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color.sunsetAccent)
-            } else {
-                Text("没有手动开关：点蓝牙卡的「连接车机」，CarPlay 会自己跑起来送上车机屏；手机这边不再显示画面，只看车机屏。声音走手机本机出声（也可以用手机蓝牙连车机出声）。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
         .padding()

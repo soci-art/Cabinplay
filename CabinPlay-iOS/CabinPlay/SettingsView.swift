@@ -12,8 +12,7 @@ import AVFoundation
 
 struct SettingsView: View {
     // Wi-Fi 手填区直接就是已存的那一对：进页时把记住的名字/密码填进
-    // 输入框，改完点保存即覆盖。定位授权状态进页时刷新一次。
-    @State private var locationStatusText = WiFiNameAccess.authorizationStatusText
+    // 输入框，改完点保存即覆盖。
     @State private var manualSSID = ""
     @State private var manualPassword = ""
     @State private var manualOpenNetwork = false
@@ -63,16 +62,8 @@ struct SettingsView: View {
                     fieldFocused = false
                 }
                 .disabled(manualSaveDisabled)
-                HStack {
-                    Text("定位授权")
-                    Spacer()
-                    Text(locationStatusText)
-                        .foregroundStyle(.secondary)
-                }
             } header: {
                 Text("Wi-Fi 名称和密码（手填）")
-            } footer: {
-                Text("启动本机 CarPlay 时，要把当前 Wi-Fi 的名字和密码成对报给系统——在这里填一次、存好，以后就不用再填。只填名字、密码空着不行（系统会当成没密码的网络不理），除非它真是开放网络，那就把上面「没有密码」打开。连车时车机发的那个网络（DIRECT- 开头）是车机每轮现发的，名字和密码都自动存、自动用，不用在这里填。")
             }
 
             Section {
@@ -167,7 +158,6 @@ struct SettingsView: View {
             manualSSID = remembered
             manualPassword = LocalCarPlaySession.pairedPassword(for: remembered) ?? ""
             manualOpenNetwork = LocalCarPlaySession.isOpenNetwork(remembered)
-            locationStatusText = WiFiNameAccess.authorizationStatusText
             audioMode = AudioOutputPolicy.mode
             routeText = AudioOutputPolicy.routeSummary
         }
