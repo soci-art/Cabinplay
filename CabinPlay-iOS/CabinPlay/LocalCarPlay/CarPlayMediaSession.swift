@@ -239,6 +239,23 @@ final class CarPlayMediaSession {
             onLog?(CWL("音频认领：事件通道还没连上，先记下待发（{1}）", [reason]))
         }
     }
+    /// 车按钮（主页上的车标）被点时手机发 requestUI、想切去车机
+    /// 原生界面——我们没有原生界面可切，点了就该什么都不发生。
+    /// 但只装没听见不够：手机会把画面资源（resourceID 1）判给
+    /// 自己、CarPlay 界面随之退出。这里照音频认领的同款做法当场
+    /// 回话认回：画面资源 entity/permanentEntity 报配件（2），把
+    /// 界面留在 CarPlay 上。appStates 不动（不碰语音/媒体/通话
+    /// 任何一摊），只认资源本身。
+    func claimUIResource() {
+        let payload: [String: Any] = ["type": "modesChanged", "params": [
+            "resources": [["resourceID": 1, "entity": 2, "permanentEntity": 2]],
+            "appStates": [] as [[String: Any]],
+        ]]
+        if sendCommand(payload, label: CWL("画面认回")) {
+            onLog?(CWL("车按钮被点了：已回话把画面资源认回配件，留在 CarPlay 界面（按钮不做任何事）"))
+        }
+    }
+
     /// 事件通道刚连上时补发待发认领（绕过节流：这是通道就绪后的
     /// 第一次机会，建流那次多半就卡在这里）。
     private func flushPendingClaim() {

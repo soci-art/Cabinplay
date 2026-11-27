@@ -350,6 +350,9 @@ final class NativeReceiver {
                     let url = (command["params"] as? [String: Any])?["url"] as? String
                     // "videoplayback:" is the parked-video player, which CarWithin does not offer.
                     if url == nil || url?.hasPrefix("videoplayback") == false {
+                        // 车按钮不要有任何动作：当场认回画面资源，
+                        // 不让手机把界面切走（见 claimUIResource）。
+                        state.media?.claimUIResource()
                         DispatchQueue.main.async { [weak self] in self?.onCarUIRequested?() }
                     }
                 }
