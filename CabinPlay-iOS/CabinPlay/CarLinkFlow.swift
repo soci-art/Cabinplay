@@ -113,7 +113,7 @@ final class CarLinkFlow {
 
     private func runAttempt() {
         guard isActive, !hit else { return }
-        if let deadline, Date() > deadline {
+        if let deadline = self.deadline, Date() > deadline {
             abandon(reason: "\(Int(config.budget)) 秒重试预算用完")
             return
         }
@@ -141,7 +141,7 @@ final class CarLinkFlow {
     /// 中 core 可能同步回 .ended，回调看到 settled 就不会重复判。
     private func armWatchdog(carIP: String) {
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isActive, !self.hit, !self.settled else { return }
+            guard let self = self, self.isActive, !self.hit, !self.settled else { return }
             self.settled = true
             self.watchdogWork = nil
             self.onLog?("CarLink 候选 \(carIP) 本次尝试 \(Int(self.config.attemptTimeout)) 秒没走到协商，停掉算失败")
@@ -164,7 +164,7 @@ final class CarLinkFlow {
     private func decideFailure(reason: String) {
         guard let candidate = currentCandidate else { return }
         onLog?("CarLink 候选 \(candidate) 第 \(attemptsOnCandidate) 次没成：\(reason)")
-        if let deadline, Date() > deadline {
+        if let deadline = self.deadline, Date() > deadline {
             abandon(reason: "\(Int(config.budget)) 秒重试预算用完")
             return
         }
