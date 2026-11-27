@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The app shell: three tabs (Carlink / 日志 / 设置).
+// The app shell: four tabs (Carlink / CarLife / 日志 / 设置).
+// CarLife 先是空壳入口，功能与 Carlink 分开、以后各自独立。
 // 主线：本机 CarPlay 会话（LocalCarPlaySession）出帧 → 蓝牙 UCar 配对 →
 // 拿到 ServerInfo 后组网（UCarNetworkJoiner）→ CarLink（clink）把帧送上
 // 车机、把车机触摸/按键回送本机会话。全程没有手填表单：车机地址入网后
@@ -177,18 +178,31 @@ struct ContentView: View {
             .tag(0)
 
             NavigationStack {
+                CarLifeView()
+                    .navigationTitle("CarLife")
+            }
+            .tabItem {
+                Label {
+                    Text("CarLife")
+                } icon: {
+                    Image("TabCarlife")
+                }
+            }
+            .tag(1)
+
+            NavigationStack {
                 LogView(lines: log, onClear: { log.removeAll() })
                     .navigationTitle("日志")
             }
             .tabItem { Label("日志", systemImage: "doc.text") }
-            .tag(1)
+            .tag(2)
 
             NavigationStack {
                 SettingsView()
                 .navigationTitle("设置")
             }
             .tabItem { Label("设置", systemImage: "gearshape") }
-            .tag(2)
+            .tag(3)
         }
         .tint(.sunsetAccent)
         // 预览的离屏承接：界面上不再显示本机预览（只看车机屏），但显示层
