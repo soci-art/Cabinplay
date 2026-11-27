@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// 设置：只留真用得上的——Wi-Fi 名和密码手填、声音、关于。分辨率已改
-// 自动协商，不再有手动菜单。触控固定走居中模型（车主实测最准），校
-// 准功能整套已撤、设置里不再留触控区；MFi 身份是 App 自带的（包内
-// 文件，启动本机 CarPlay 时自验配对）、连接必需，设置里也不再留状态
-// 显示。不需要再导入任何文件。
+// 设置：只留真用得上的——Wi-Fi 名和密码手填、声音、画面、关于。触控
+// 固定走居中模型（车主实测最准），校准功能整套已撤、设置里不再留触
+// 控区；MFi 身份是 App 自带的（包内文件，启动本机 CarPlay 时自验配
+// 对）、连接必需，设置里也不再留状态显示。不需要再导入任何文件。
+//
+// 页面骨架与主页（DashboardView）完全同款：ScrollView＋卡片列。
+// 不要改回 Form——表单页的导航栏默认是不透明白底（标题区发白、与
+// 页面底色有接缝），内容还会滑到悬浮标签栏底下；主页的滚动页两样
+// 都没有。2026-11-27 为这个来回试过三轮（强制铺色标题消失、藏导航
+// 栏留空白加标签栏变悬浮、UIKit 改栏透明没生效），最终定案照主页
+// 原样搭。
 
 import SwiftUI
 import AVFoundation
@@ -22,7 +28,7 @@ struct SettingsView: View {
     @AppStorage("cabinplay.fpsChoice") private var fpsChoice = 60
     @State private var routeText = AudioOutputPolicy.routeSummary
     @StateObject private var updateChecker = UpdateChecker()
-    // 键盘收起：点空白处、滑动、按回车都能收（以前输完收不起来）。
+    // 键盘收起：点空白处、滑动、按回车、键盘工具栏「完成」都能收。
     @FocusState private var fieldFocused: Bool
 
     private var manualSSIDTrimmed: String {
@@ -37,126 +43,41 @@ struct SettingsView: View {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
-    var body: some View {
-        Form {
-            Section {
-                TextField("Wi-Fi 名称", text: $manualSSID)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .focused($fieldFocused)
-                    .submitLabel(.done)
-                    .onSubmit { fieldFocused = false }
-                SecureField("Wi-Fi 密码", text: $manualPassword)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .focused($fieldFocused)
-                    .submitLabel(.done)
-                    .onSubmit { fieldFocused = false }
-                    .disabled(manualOpenNetwork)
-                Toggle("这个网络没有密码（开放网络）", isOn: $manualOpenNetwork)
-                Button("保存名字和密码") {
-                    let name = manualSSIDTrimmed
-                    guard !name.isEmpty else { return }
-                    LocalCarPlaySession.rememberWiFiPairManually(
-                        ssid: name, password: manualPassword, isOpen: manualOpenNetwork)
-                    fieldFocused = false
-                }
-                .disabled(manualSaveDisabled)
-            } header: {
-                Text("Wi-Fi 名称和密码（手填）")
-            }
-
-            Section {
-                Picker("声音输出", selection: $audioMode) {
-                    ForEach(AudioOutputMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .onChange(of: audioMode) { _, value in
-                    AudioOutputPolicy.mode = value
-                    routeText = AudioOutputPolicy.routeSummary
-                }
-                HStack {
-                    Text("当前路由")
-                    Spacer()
-                    Text(routeText).foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("声音")
-            }
-
-            Section("画面") {
-                Picker("画质档位", selection: $sizeChoice) {
-                    Text("自动（按车记忆）").tag("auto")
-                    Text("1080p").tag("1080")
-                    Text("720p（更流畅）").tag("720")
-                    Text("480p（最省带宽）").tag("480")
-                }
-                Picker("请求帧率", selection: $fpsChoice) {
-                    Text("60 fps").tag(60)
-                    Text("30 fps").tag(30)
-                }
-                Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("关于") {
-                HStack {
-                    Text("作者")
-                    Spacer()
-                    Link("soci-art", destination: URL(string: "https://github.com/soci-art")!)
-                }
-                HStack {
-                    Text("版本")
-                    Spacer()
-                    Text(versionText).foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("软件更新")
-                    Spacer()
-                    switch updateChecker.status {
-                    case .idle, .failed:
-                        Button("检查更新") { Task { await updateChecker.check() } }
-                    case .checking:
-                        Text("正在检查…").foregroundStyle(.secondary)
-                    case .upToDate:
-                        Text("已是最新").foregroundStyle(.secondary)
-                    case .available(let version, let url):
-                        Link("有新版本 \(version)", destination: url)
-                    }
-                }
-                HStack {
-                    Text("协议")
-                    Spacer()
-                    Text("CabinPlay · AGPL-3.0").foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text("上游")
-                    Spacer()
-                    Text("基于 CarWithin 整合").foregroundStyle(.secondary)
-                }
-            }
+    private var sizeChoiceTitle: String {
+        switch sizeChoice {
+        case "1080": return "1080p"
+        case "720": return "720p（更流畅）"
+        case "480": return "480p（最省带宽）"
+        default: return "自动（按车记忆）"
         }
-        .scrollContentBackground(.hidden)
-        // 点空白收键盘的手势只能挂背景层：挂在表单本体上时，手指抬起的
-        // 瞬间会触发刷新，把菜单式选择器（声音输出/画质档位/请求帧率）
-        // 刚要弹出的菜单打掉，表现为三个选择器点了一点没反应（2026-11-27
-        // 实测）。背景层只接没落在控件上的点，控件自己的点按不受干扰。
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                section(title: "Wi-Fi 名称和密码（手填）") { wifiCard }
+                section(title: "声音") { audioCard }
+                section(title: "画面") { videoCard }
+                section(title: "关于") { aboutCard }
+            }
+            .padding()
+        }
         .background {
+            // 点空白收键盘的手势只挂背景层：控件自己的点按先被控件接
+            // 走，落到空白处才收键盘，不会打掉菜单式选择器的弹出。
             Color.pageBackground
+                .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture { fieldFocused = false }
         }
         .scrollDismissesKeyboard(.interactively)
-        // 照主页的样子：主页是滚动视图、导航栏背景天生透明，栏后透
-        // 出页面底色、大标题照常显示；表单页的栏默认是不透明白底，
-        // 才会有发白接缝。改法：标题照常用导航栏大标题，栏背景用
-        // NavigationBarClearance 改成透明（见文件末尾）。别再试的两
-        // 条路（2026-11-27 截图实锤）：给栏强制铺色会让大标题消失；
-        // 把整条栏藏掉，顶部会多出一大片空白、底部标签栏还会改成
-        // 压在内容上的悬浮式。
         .navigationTitle("设置")
-        .background { NavigationBarClearance() }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("完成") { fieldFocused = false }
+            }
+        }
         .task { await updateChecker.check() }
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID
@@ -167,28 +88,202 @@ struct SettingsView: View {
             routeText = AudioOutputPolicy.routeSummary
         }
     }
-}
 
-/// 把本页所在导航栏的背景改成透明（照主页的样子）：栏后透出页面
-/// 底色，大标题照常显示，整页同色无接缝。只动设置页自己这一条
-/// 导航栏，其他标签页不受影响。
-private struct NavigationBarClearance: UIViewControllerRepresentable {
-    func makeUIViewController(context: Context) -> UIViewController {
-        let vc = UIViewController()
-        DispatchQueue.main.async { Self.apply(from: vc) }
-        return vc
+    // MARK: 分区（灰色小标题＋白色卡片，与主页卡片同款圆角与底色）
+
+    private func section<Content: View>(title: String,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 16)
+            content()
+        }
     }
 
-    func updateUIViewController(_ vc: UIViewController, context: Context) {
-        DispatchQueue.main.async { Self.apply(from: vc) }
+    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0, content: content)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+            .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
     }
 
-    private static func apply(from vc: UIViewController) {
-        guard let nav = vc.navigationController else { return }
-        let appearance = UINavigationBarAppearance()
-        appearance.configureWithTransparentBackground()
-        nav.navigationBar.scrollEdgeAppearance = appearance
-        nav.navigationBar.standardAppearance = appearance
-        nav.navigationBar.compactAppearance = appearance
+    private func row<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.vertical, 11)
+    }
+
+    /// 菜单式选择器行：左边名称、右边当前值（落日橙）加上下小箭头，
+    /// 与表单页里 Picker 的菜单样式一致。
+    private func menuRow<Selection: Hashable>(title: String,
+                                              valueTitle: String,
+                                              selection: Binding<Selection>,
+                                              @ViewBuilder options: () -> some View) -> some View {
+        Menu {
+            Picker(title, selection: selection) { options() }
+        } label: {
+            HStack {
+                Text(title).foregroundStyle(.primary)
+                Spacer()
+                Text(valueTitle).foregroundStyle(Color.sunsetAccent)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.sunsetAccent)
+            }
+        }
+    }
+
+    // MARK: Wi-Fi 手填
+
+    private var wifiCard: some View {
+        card {
+            row {
+                TextField("Wi-Fi 名称", text: $manualSSID)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .focused($fieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit { fieldFocused = false }
+            }
+            Divider()
+            row {
+                SecureField("Wi-Fi 密码", text: $manualPassword)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .focused($fieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit { fieldFocused = false }
+                    .disabled(manualOpenNetwork)
+            }
+            Divider()
+            row {
+                Toggle("这个网络没有密码（开放网络）", isOn: $manualOpenNetwork)
+            }
+            Divider()
+            row {
+                Button("保存名字和密码") {
+                    let name = manualSSIDTrimmed
+                    guard !name.isEmpty else { return }
+                    LocalCarPlaySession.rememberWiFiPairManually(
+                        ssid: name, password: manualPassword, isOpen: manualOpenNetwork)
+                    fieldFocused = false
+                }
+                .foregroundStyle(manualSaveDisabled ? Color.secondary : Color.sunsetAccent)
+                .disabled(manualSaveDisabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    // MARK: 声音
+
+    private var audioCard: some View {
+        card {
+            row {
+                menuRow(title: "声音输出", valueTitle: audioMode.title, selection: $audioMode) {
+                    ForEach(AudioOutputMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .onChange(of: audioMode) { _, value in
+                    AudioOutputPolicy.mode = value
+                    routeText = AudioOutputPolicy.routeSummary
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("当前路由")
+                    Spacer()
+                    Text(routeText).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    // MARK: 画面
+
+    private var videoCard: some View {
+        card {
+            row {
+                menuRow(title: "画质档位", valueTitle: sizeChoiceTitle, selection: $sizeChoice) {
+                    Text("自动（按车记忆）").tag("auto")
+                    Text("1080p").tag("1080")
+                    Text("720p（更流畅）").tag("720")
+                    Text("480p（最省带宽）").tag("480")
+                }
+            }
+            Divider()
+            row {
+                menuRow(title: "请求帧率", valueTitle: "\(fpsChoice) fps", selection: $fpsChoice) {
+                    Text("60 fps").tag(60)
+                    Text("30 fps").tag(30)
+                }
+            }
+            Divider()
+            Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 11)
+        }
+    }
+
+    // MARK: 关于
+
+    private var aboutCard: some View {
+        card {
+            row {
+                HStack {
+                    Text("作者")
+                    Spacer()
+                    Link("soci-art", destination: URL(string: "https://github.com/soci-art")!)
+                        .foregroundStyle(Color.sunsetAccent)
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("版本")
+                    Spacer()
+                    Text(versionText).foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("软件更新")
+                    Spacer()
+                    switch updateChecker.status {
+                    case .idle, .failed:
+                        Button("检查更新") { Task { await updateChecker.check() } }
+                            .foregroundStyle(Color.sunsetAccent)
+                    case .checking:
+                        Text("正在检查…").foregroundStyle(.secondary)
+                    case .upToDate:
+                        Text("已是最新").foregroundStyle(.secondary)
+                    case .available(let version, let url):
+                        Link("有新版本 \(version)", destination: url)
+                            .foregroundStyle(Color.sunsetAccent)
+                    }
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("协议")
+                    Spacer()
+                    Text("CabinPlay · AGPL-3.0").foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("上游")
+                    Spacer()
+                    Text("基于 CarWithin 整合").foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }
