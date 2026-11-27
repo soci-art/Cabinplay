@@ -10,6 +10,9 @@
 //
 // 与 CarLink 完全独立：各自的监听、各自的会话，同一时刻只允许一路在跑。
 
+import Foundation
+import Network
+
 final class CarLifeOutput {
     static let ports: [UInt16] = [7240, 8240, 9240, 9241, 9242, 9340, 9440]
     static let discoveryPort: UInt16 = 7999
