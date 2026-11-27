@@ -4,14 +4,24 @@
 // 日志页：等宽小字，关键节点带图标；右上角菜单可分享/清空。
 
 import SwiftUI
+import UIKit
 
 struct LogView: View {
     let lines: [String]
     let onClear: () -> Void
 
-    /// 分享用的日志文件地址。纯文字分享在 iOS 上没有「存储到文件」，
-    /// 所以先把日志写成真正的 .txt 文件，再分享这个文件。
-    @State private var logFileURL: URL?
+    /// 分享用的日志文件：点「分享日志」那一刻才把当前日志写成一份
+    /// 定格的 .txt 快照，分享面板打开期间不再改它。以前是每来一行新
+    /// 日志就重写一遍（还跨分钟换名删旧），连接状态下日志不停滚动，
+    /// 用户在分享面板里选「存储到文件」时脚下的文件已被换掉/删掉，
+    /// 存不下去（2026-11-27 实测）。上传按钮是点下即定格内容，所以
+    /// 一直没事，分享照此改。
+    @State private var shareItem: ShareItem?
+
+    struct ShareItem: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
 
     // 日志上传（右上角，和清空日志并排）：上传中禁用按钮；结果用弹
     // 窗告诉用户，失败时把服务端回的原因照原样显示。
@@ -30,29 +40,20 @@ struct LogView: View {
         }
     }
 
-    /// 把当前日志写到临时目录的 .txt 文件（文件名带时间戳），供分享使用。
-    private func prepareLogFile() {
-        guard !lines.isEmpty else {
-            logFileURL = nil
-            return
-        }
+    /// 点分享时才写一份定格快照（文件名精确到秒、每次唯一），写完
+    /// 不再动它；临时目录由系统回收，不在这里删任何文件。
+    private func writeSnapshot() -> URL? {
+        guard !lines.isEmpty else { return nil }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmm"
-        let fileName = "CabinPlay-log-\(formatter.string(from: Date())).txt"
-        let dir = FileManager.default.temporaryDirectory
-        // 顺手清掉上次的日志文件，别越攒越多。
-        if let old = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for url in old where url.lastPathComponent.hasPrefix("CabinPlay-log-") && url.lastPathComponent != fileName {
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-        let url = dir.appendingPathComponent(fileName)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CabinPlay-log-\(formatter.string(from: Date())).txt")
         do {
             try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-            logFileURL = url
+            return url
         } catch {
-            logFileURL = nil
+            return nil
         }
     }
 
@@ -96,8 +97,9 @@ struct LogView: View {
             }
         }
         .background(Color.pageBackground)
-        .onAppear { prepareLogFile() }
-        .onChange(of: lines) { prepareLogFile() }
+        .sheet(item: $shareItem) { item in
+            ActivityView(activityItems: [item.url])
+        }
         .alert(uploadSucceeded ? "上传成功" : "上传失败",
                isPresented: Binding(get: { uploadMessage != nil },
                                     set: { if !$0 { uploadMessage = nil } })) {
@@ -116,11 +118,14 @@ struct LogView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    if let logFileURL {
-                        ShareLink(item: logFileURL) {
-                            Label("分享日志", systemImage: "square.and.arrow.up")
+                    Button {
+                        if let url = writeSnapshot() {
+                            shareItem = ShareItem(url: url)
                         }
+                    } label: {
+                        Label("分享日志", systemImage: "square.and.arrow.up")
                     }
+                    .disabled(lines.isEmpty)
                     Button(role: .destructive) {
                         onClear()
                     } label: {
@@ -158,4 +163,15 @@ struct LogView: View {
                 .padding(.top, 3)
         }
     }
+}
+
+/// 系统分享面板（存文件/隔空投送等都走它）的 SwiftUI 包装。
+private struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
