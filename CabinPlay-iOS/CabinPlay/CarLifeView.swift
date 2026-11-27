@@ -4,7 +4,9 @@
 // CarLife 页：与 CarLink 完全独立的一套输出。
 //
 // 车机当客户端、手机当服务端；画面走 H.264，声音留在手机经蓝牙到车机。
-// 这里只负责启动/停止、填车机地址、看状态与日志，别的一概不碰 CarLink。
+// 这里只负责启动/停止、填车机地址、看状态；日志与 CarLink 那边同规格：
+// 右上角橙色入口进二级日志页（上传/清除/导出都有），只记 CarLife 自己
+// 的这一套，与 CarLink 的日志互不干扰。
 
 import SwiftUI
 
@@ -66,23 +68,31 @@ struct CarLifeView: View {
                 } footer: {
                     Text(session.status)
                 }
-
-                Section("日志") {
-                    if session.logLines.isEmpty {
-                        Text("启动后这里会记下每一步")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(Array(session.logLines.suffix(60).enumerated()), id: \.offset) { _, line in
-                            Text(line)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
             }
             .scrollContentBackground(.hidden)
             .background(Color.pageBackground)
             .navigationTitle("CarLife")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                        LogView(lines: session.logLines,
+                                onClear: { session.clearLog() },
+                                uploadTitle: "CabinPlay CarLife 日志",
+                                filePrefix: "CabinPlay-CarLife-log")
+                            .navigationTitle("日志")
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.text")
+                            Text("日志")
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
         }
     }
 }

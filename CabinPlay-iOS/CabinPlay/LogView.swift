@@ -9,6 +9,11 @@ import UIKit
 struct LogView: View {
     let lines: [String]
     let onClear: () -> Void
+    /// 上传时在日志正文最前面加的一行标题（只进上传文件、页面不显示）：
+    /// CarLink 与 CarLife 两边日志都传同一个收件箱，靠这一行分清是谁的。
+    var uploadTitle: String? = nil
+    /// 导出快照的文件名前缀（CarLife 那边传自己的，存文件时分得清）。
+    var filePrefix: String = "CabinPlay-log"
 
     /// 分享用的日志文件：点「分享日志」那一刻才把当前日志写成一份
     /// 定格的 .txt 快照，分享面板打开期间不再改它。以前是每来一行新
@@ -31,7 +36,7 @@ struct LogView: View {
 
     private func doUpload() {
         uploading = true
-        let text = lines.joined(separator: "\n")
+        let text = (uploadTitle.map { "\($0)\n" } ?? "") + lines.joined(separator: "\n")
         Task {
             let result = await LogUploader.upload(text: text)
             uploading = false
@@ -48,7 +53,7 @@ struct LogView: View {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CabinPlay-log-\(formatter.string(from: Date())).txt")
+            .appendingPathComponent("\(filePrefix)-\(formatter.string(from: Date())).txt")
         do {
             try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
             return url

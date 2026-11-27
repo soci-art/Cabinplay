@@ -1,0 +1,86 @@
+name: build-ipa
+
+# 云端构建未签名 IPA（与 codemagic.yaml 的 ios-unsigned 同一套步骤搬到
+# GitHub Actions）：Rust 核心 → XcodeGen → xcodebuild 未签名 Release →
+# 打成 IPA 作为构建产物上传。只构建、不发发行版。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-ipa-main
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: unsigned-ipa
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          LATEST="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "Using $LATEST"
+          sudo xcode-select -s "$LATEST/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-apple-ios
+          cargo --version
+
+      - name: Build Rust receiver core for iOS
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd CabinPlay-iOS
+          ./scripts/build-rust-ios.sh
+          ls -lh generated/
+
+      - name: Generate Xcode project
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          cd CabinPlay-iOS
+          xcodegen generate
+
+      - name: Build unsigned app
+        run: |
+          cd CabinPlay-iOS
+          xcodebuild -project CabinPlay.xcodeproj \
+            -scheme CabinPlay \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Check app bundle contents
+        run: |
+          APP="CabinPlay-iOS/build/Build/Products/Release-iphoneos/CabinPlay.app"
+          ls -lh "$APP"
+          echo "--- identity files in bundle ---"
+          find "$APP" -name "identity.pk8" -o -name "certificate.p7b"
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -r "CabinPlay-iOS/build/Build/Products/Release-iphoneos/CabinPlay.app" Payload/
+          zip -r -X CabinPlay-unsigned.ipa Payload
+          ls -lh CabinPlay-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CabinPlay-unsigned
+          path: CabinPlay-unsigned.ipa
+          if-no-files-found: error

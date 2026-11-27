@@ -1,18 +1,24 @@
 // SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// 驾驶舱（主页）：一条主线——本机 CarPlay（纯状态卡，启停由连接车机
-// 流程自动走、画面只上车机屏）→ 蓝牙连接车机 → 连接车机 CarLink（纯
-// 状态卡）→ 上车状态汇总。CarLink 没有任何手填表单：车机地址入网后
-// 自动推导、本机 IP 实测、配对码只用蓝牙卡的输入框、热点凭据由蓝牙
-// ServerInfo 带回静默存下。
+// 驾驶舱（Carlink 页）：教程式分步——Wi-Fi 设置（第一步）→ 画质 →
+// 声音 → 蓝牙配对码（第二步）→ 连接车机 CarLink（第三步）→ 上车状态。
+// 必须按顺序完成一步才解锁下一步，未解锁的卡置灰不可用；画质与声音
+// 不受步骤控制、随时可调。原来在设置页的 Wi-Fi 手填、画质、声音三区
+// 已整段搬到这里（那些本来就是适配 CarLink 的），文字照原样搬、不加
+// 不改。本机 CarPlay 的分辨率显示、失败提示与手动开关并入画质卡（它
+// 的状态在上车状态卡里有汇总行）。右上角橙色「日志」入口进二级日志
+// 页（原日志标签页已删，日志功能整体搬到这里）。
+//
+// CarLink 没有任何手填表单：车机地址入网后自动推导、本机 IP 实测、
+// 配对码只用蓝牙卡的输入框、热点凭据由蓝牙 ServerInfo 带回静默存下。
 
 import SwiftUI
 import AVFoundation
 
 struct DashboardView: View {
     // 本机 CarPlay（启停平时由「连接车机」流程自动走；连上 CarLink 后
-    // 卡里多一个手动开关按钮，可只停/只开 CarPlay、不断 CarLink；
+    // 画质卡里多一个手动开关按钮，可只停/只开 CarPlay、不断 CarLink；
     // 预览也不在这里——画面只上车机屏，本机显示层在根层离屏承接）
     let localPhaseText: String
     let localPhaseFailed: Bool
@@ -42,25 +48,64 @@ struct DashboardView: View {
     /// 当前生效的分辨率（自动协商的当前档，只展示、不可手选）。
     let currentSizeLabel: String
 
-    /// 首次连某台没校准记录的车且已出画时，给一行可点的校准提示。
-
     let onDisconnectCarLink: () -> Void
     let onToggleBleProbe: () -> Void
     let onConnectBle: () -> Void
 
+    // 日志二级页（右上角橙色入口）：本页只管 CarLink 这一套日志。
+    let logLines: [String]
+    let onClearLog: () -> Void
+
+    // MARK: 从设置页搬来的三区（状态与存法照旧）
+
+    // Wi-Fi 手填区直接就是已存的那一对：进页时把记住的名字/密码填进
+    // 输入框，改完点保存即覆盖。
+    @State private var manualSSID = ""
+    @State private var manualPassword = ""
+    @State private var manualOpenNetwork = false
+    /// 第一步是否完成：已存下一对能用的 Wi-Fi 名字＋密码（或开放网络）。
+    @State private var wifiSavedPair = false
+    @State private var audioMode: AudioOutputMode = AudioOutputPolicy.mode
+    // 画面档位：默认自动；手动档用于对比 1080p/720p 在车机上的实际流畅度。
+    @AppStorage("cabinplay.sizeChoice") private var sizeChoice = "auto"
+    @AppStorage("cabinplay.fpsChoice") private var fpsChoice = 60
+    @State private var routeText = AudioOutputPolicy.routeSummary
+
     @FocusState private var blePinFocused: Bool
+    @FocusState private var wifiFieldFocused: Bool
     /// 已配对时用户手动点开输码框（重新配对用）。
     @State private var showPinEntry = false
 
     /// 输码框什么时候露出来：没配对过、用户手动点开、或免码失败被上层要求。
     private var pinEntryVisible: Bool { !blePaired || showPinEntry || pinEntryForced }
 
+    // MARK: 步骤解锁（教程式：完成一步才解锁下一步）
+
+    /// 第二步（蓝牙配对码）：第一步存好 Wi-Fi 才解锁。
+    private var bleLocked: Bool { !wifiSavedPair }
+    /// 第三步（连接 CarLink）：蓝牙流程已经起步（状态离开未开始）才解锁。
+    private var carLinkLocked: Bool {
+        !(wifiSavedPair && (carLinkState != .idle || carLinkRunning))
+    }
+
+    private var manualSSIDTrimmed: String {
+        manualSSID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var manualSaveDisabled: Bool {
+        manualSSIDTrimmed.isEmpty || (!manualOpenNetwork && manualPassword.isEmpty)
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                localCarPlayCard
+                section(title: "Wi-Fi 名称和密码（手填）") { wifiCard }
+                section(title: "画面") { videoCard }
+                section(title: "声音") { audioCard }
                 bleProbeCard
+                    .stepLocked(bleLocked)
                 carLinkCard
+                    .stepLocked(carLinkLocked)
                 onboardCard
             }
             .padding()
@@ -68,49 +113,180 @@ struct DashboardView: View {
         .background(Color.pageBackground)
         .scrollDismissesKeyboard(.interactively)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    LogView(lines: logLines, onClear: onClearLog)
+                        .navigationTitle("日志")
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.text")
+                        Text("日志")
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button("完成") { blePinFocused = false }
+                Button("完成") { blePinFocused = false; wifiFieldFocused = false }
+            }
+        }
+        .onAppear {
+            let remembered = LocalCarPlaySession.rememberedInfraSSID
+            manualSSID = remembered
+            manualPassword = LocalCarPlaySession.pairedPassword(for: remembered) ?? ""
+            manualOpenNetwork = LocalCarPlaySession.isOpenNetwork(remembered)
+            audioMode = AudioOutputPolicy.mode
+            routeText = AudioOutputPolicy.routeSummary
+            refreshWifiSaved()
+        }
+    }
+
+    private func refreshWifiSaved() {
+        let ssid = LocalCarPlaySession.rememberedInfraSSID
+        wifiSavedPair = !ssid.isEmpty
+            && (LocalCarPlaySession.isOpenNetwork(ssid)
+                || !(LocalCarPlaySession.pairedPassword(for: ssid) ?? "").isEmpty)
+    }
+
+    // MARK: 分区（灰色小标题＋白色卡片，与设置页原样同款）
+
+    private func section<Content: View>(title: String,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 16)
+            content()
+        }
+    }
+
+    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0, content: content)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+            .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func row<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.vertical, 11)
+    }
+
+    /// 选择器行：行名是普通黑字，右边是系统原生菜单式选择器（只显
+    /// 当前值＋上下小箭头，落日橙），点开的菜单与表单页时一模一样。
+    /// 别用自绘 Menu 当选择器：Menu 会把整行标签都染成强调色（行名
+    /// 跟着变橙），弹出的面板样子也与原生选择器不同（2026-11-27
+    /// 截图实锤）。
+    private func pickerRow<Selection: Hashable>(title: String,
+                                                selection: Binding<Selection>,
+                                                @ViewBuilder options: () -> some View) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Picker(title, selection: selection) { options() }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .tint(Color.sunsetAccent)
+        }
+    }
+
+    // MARK: 第一步：Wi-Fi 名称和密码（手填）（从设置页整段搬来）
+
+    private var wifiCard: some View {
+        card {
+            row {
+                TextField("Wi-Fi 名称", text: $manualSSID)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .focused($wifiFieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit { wifiFieldFocused = false }
+            }
+            Divider()
+            row {
+                SecureField("Wi-Fi 密码", text: $manualPassword)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .focused($wifiFieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit { wifiFieldFocused = false }
+                    .disabled(manualOpenNetwork)
+            }
+            Divider()
+            row {
+                Toggle("这个网络没有密码（开放网络）", isOn: $manualOpenNetwork)
+            }
+            Divider()
+            row {
+                Button("保存名字和密码") {
+                    let name = manualSSIDTrimmed
+                    guard !name.isEmpty else { return }
+                    LocalCarPlaySession.rememberWiFiPairManually(
+                        ssid: name, password: manualPassword, isOpen: manualOpenNetwork)
+                    wifiFieldFocused = false
+                    refreshWifiSaved()
+                }
+                .foregroundStyle(manualSaveDisabled ? Color.secondary : Color.sunsetAccent)
+                .disabled(manualSaveDisabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
-    // MARK: 第一步：本机 CarPlay（纯状态卡）
+    // MARK: 画面（从设置页整段搬来，本机 CarPlay 的分辨率与开关并入此卡）
 
-    private var localCarPlayCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("本机 CarPlay").font(.cardTitle)
-                Spacer()
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(localStreaming ? Color.green : Color.secondary.opacity(0.5))
-                        .frame(width: 7, height: 7)
-                    Text(localPhaseText).font(.caption).foregroundStyle(.secondary)
+    private var videoCard: some View {
+        card {
+            row {
+                pickerRow(title: "画质档位", selection: $sizeChoice) {
+                    Text("自动（按车记忆）").tag("auto")
+                    Text("1080p").tag("1080")
+                    Text("720p（更流畅）").tag("720")
+                    Text("480p（最省带宽）").tag("480")
                 }
             }
-
-            HStack {
-                Text("分辨率").font(.footnote.weight(.medium))
-                Spacer()
-                HStack(spacing: 4) {
-                    Image(systemName: "aspectratio")
-                    Text("自动 · 当前 \(currentSizeLabel)")
-                        .font(.caption2.weight(.semibold))
+            Divider()
+            row {
+                pickerRow(title: "请求帧率", selection: $fpsChoice) {
+                    Text("60 fps").tag(60)
+                    Text("30 fps").tag(30)
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 38)
-                .background(.ultraThinMaterial, in: Capsule())
-                .accessibilityLabel("分辨率（自动协商）")
             }
-
+            Divider()
+            row {
+                HStack {
+                    Text("分辨率")
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Image(systemName: "aspectratio")
+                        Text("自动 · 当前 \(currentSizeLabel)")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 38)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .accessibilityLabel("分辨率（自动协商）")
+                }
+            }
+            Divider()
+            Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 11)
             if localPhaseFailed {
+                Divider()
                 Text(localPhaseText)
                     .font(.footnote)
                     .foregroundStyle(.red)
+                    .padding(.vertical, 11)
             }
-
             if carLinkState == .playing {
+                Divider()
                 // 连上 CarLink 后才有手动开关：只停/只开本机 CarPlay
                 // 会话，CarLink 连接不断。
                 Button {
@@ -123,10 +299,35 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color.sunsetAccent)
+                .padding(.vertical, 7)
             }
         }
-        .padding()
-        .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: 声音（从设置页整段搬来）
+
+    private var audioCard: some View {
+        card {
+            row {
+                pickerRow(title: "声音输出", selection: $audioMode) {
+                    ForEach(AudioOutputMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .onChange(of: audioMode) { _, value in
+                    AudioOutputPolicy.mode = value
+                    routeText = AudioOutputPolicy.routeSummary
+                }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("当前路由")
+                    Spacer()
+                    Text(routeText).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     // MARK: 第二步：蓝牙连接车机卡（探针 + UCar 连接前段）
@@ -295,5 +496,14 @@ struct DashboardView: View {
             Spacer()
             Text(state).font(.footnote).foregroundStyle(.secondary)
         }
+    }
+}
+
+/// 步骤未解锁时的样子：整卡置灰、不可点。
+private extension View {
+    func stepLocked(_ locked: Bool) -> some View {
+        self.disabled(locked)
+            .opacity(locked ? 0.45 : 1)
+            .saturation(locked ? 0.3 : 1)
     }
 }

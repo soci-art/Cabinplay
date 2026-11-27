@@ -32,6 +32,7 @@ final class CarLifeOutput {
     private var querySocket: Int32 = -1
     private var queryReplies = 0
     private var discoveryErrorLogged = false
+    private var discoveryLogged = false
     private var timer: DispatchSourceTimer?
 
     var onLog: ((String) -> Void)?
@@ -64,10 +65,19 @@ final class CarLifeOutput {
                 }
                 // Announce every 2 s until a head unit has authenticated.
                 if ticks % 2 == 0, self.session?.authenticated != true { self.discover() }
+                // 每 10 秒打一份发送统计，日志从中段导出也看得出画面在不在走。
+                if ticks > 0, ticks % 10 == 0, let session = self.session, session.authenticated {
+                    self.log("CarLife " + session.statsLine())
+                }
                 ticks += 1
             }
             timer.resume(); self.timer = timer
             self.state(CWL("CarLife：正在等待车机连接（端口 {1}）", [String(describing: Self.ports[0])]))
+            self.log(CWL("CarLife：本轮参数——监听端口 {1}，画面 {2}×{3} @ {4} FPS，发现方式：{5}",
+                         [Self.ports.map { String(describing: $0) }.joined(separator: "/"),
+                          String(describing: width), String(describing: height),
+                          String(describing: self.maxFPS),
+                          self.targetAddress.map { CWL("只通知车机 {1}", [String(describing: $0)]) } ?? CWL("同网段逐个通知")]))
         }
     }
 
@@ -215,6 +225,10 @@ final class CarLifeOutput {
                 targets.append(contentsOf: network.hosts)
             }
         }
+        if !discoveryLogged {
+            discoveryLogged = true
+            log(CWL("CarLife 发现：向 {1} 个地址发通知（UDP {2}）", [String(describing: targets.count), String(describing: Self.discoveryPort)]))
+        }
         var failures = 0, lastError: Int32 = 0
         for target in targets {
             var address = sockaddr_in()
@@ -331,6 +345,7 @@ final class CarLifeOutput {
         parameters = VideoParameterSets(codec: .h264); warnedCodec = false
         if discoverySocket >= 0 { close(discoverySocket); discoverySocket = -1 }
         discoveryErrorLogged = false
+        discoveryLogged = false
         if querySocket >= 0 { close(querySocket); querySocket = -1 }
         queryReplies = 0
     }
@@ -604,6 +619,9 @@ private final class Session {
     private var lastKeyframeRequest = DispatchTime(uptimeNanoseconds: 0)
     private let createdAt = DispatchTime.now()
     private var framesSent = 0
+    private var keyframesSent = 0
+    private var bytesSent = 0
+    private var touchLogged = false
     private var waitingForKeyframe = true
     private var parameterSetsSent = false
     private var skips = 0
@@ -765,9 +783,21 @@ private final class Session {
                 }
             }
         }
-        guard send(2, 131073, annexB(units)) else { return }
+        let payload = annexB(units)
+        guard send(2, 131073, payload) else { return }
         framesSent += 1
+        if keyframe { keyframesSent += 1 }
+        bytesSent += payload.count
         if framesSent == 1 { onState?(CWL("CarLife：正在向车机 {1} 发送 CarPlay 画面", [String(describing: peer)])) }
+    }
+
+    /// 发送统计一行（外层每 10 秒打一次）：帧数、关键帧、流量、跳帧、会话时长。
+    func statsLine() -> String {
+        let seconds = Int((DispatchTime.now().uptimeNanoseconds - createdAt.uptimeNanoseconds) / 1_000_000_000)
+        return CWL("统计：已送 {1} 帧（关键帧 {2}），约 {3} KB，跳帧 {4} 次，会话 {5} 秒",
+                   [String(describing: framesSent), String(describing: keyframesSent),
+                    String(describing: bytesSent / 1024), String(describing: skips),
+                    String(describing: seconds)])
     }
 
     func tick() {
@@ -806,6 +836,7 @@ private final class Session {
 
     /// Action (low byte): 0 down, 1 up, 2 move, 3 cancel, 5 pointer down, 6 pointer up (index in bits 8–15).
     private func touch(_ payload: Data, raw: Bool) throws {
+        if !touchLogged { touchLogged = true; log?(CWL("收到车机触控（通道已通）")) }
         var contacts: [(id: Int, x: Int, y: Int)] = []
         let action: Int
         if raw {

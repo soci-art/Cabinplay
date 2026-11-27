@@ -22,12 +22,19 @@ final class CarLifeSession: ObservableObject {
     private let output = CarLifeOutput()
     private var wired = false
 
+    /// 与 CarLink 那边同一规格：每行带时间戳、上限同为 1200 行；
+    /// 只记 CarLife 这一套，两边日志互不干扰。
     private func append(_ line: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.logLines.append(line)
-            if self.logLines.count > 300 { self.logLines.removeFirst(self.logLines.count - 300) }
+            let stamp = DateFormatter.logFormatter.string(from: Date())
+            self.logLines.append("[\(stamp)] \(line)")
+            if self.logLines.count > 1200 { self.logLines.removeFirst(self.logLines.count - 1200) }
         }
+    }
+
+    func clearLog() {
+        DispatchQueue.main.async { [weak self] in self?.logLines.removeAll() }
     }
 
     func start(carIP: String, width: Int, height: Int, fps: Int) {

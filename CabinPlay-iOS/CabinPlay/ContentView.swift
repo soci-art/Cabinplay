@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 CabinPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// The app shell: four tabs (Carlink / CarLife / 日志 / 设置).
-// CarLife 先是空壳入口，功能与 Carlink 分开、以后各自独立。
+// The app shell: three tabs (Carlink / CarLife / 设置).
+// 日志不再是独立标签页：Carlink 与 CarLife 各自在页内右上角有橙色
+// 日志入口、进各自的二级日志页，两边日志只管各自的、互不干扰。
+// CarLife 与 Carlink 功能分开、各自独立。
 // 主线：本机 CarPlay 会话（LocalCarPlaySession）出帧 → 蓝牙 UCar 配对 →
 // 拿到 ServerInfo 后组网（UCarNetworkJoiner）→ CarLink（clink）把帧送上
 // 车机、把车机触摸/按键回送本机会话。全程没有手填表单：车机地址入网后
@@ -164,7 +166,9 @@ struct ContentView: View {
                     currentSizeLabel: "\(targetSize.0)×\(targetSize.1)",
                     onDisconnectCarLink: { stopCarLink() },
                     onToggleBleProbe: { bleProbe.toggle() },
-                    onConnectBle: { connectCarFlow() }
+                    onConnectBle: { connectCarFlow() },
+                    logLines: log,
+                    onClearLog: { log.removeAll() }
                 )
                 .navigationTitle("CabinPlay")
             }
@@ -191,17 +195,10 @@ struct ContentView: View {
             .tag(1)
 
             NavigationStack {
-                LogView(lines: log, onClear: { log.removeAll() })
-                    .navigationTitle("日志")
-            }
-            .tabItem { Label("日志", systemImage: "doc.text") }
-            .tag(2)
-
-            NavigationStack {
                 SettingsView()
             }
             .tabItem { Label("设置", systemImage: "gearshape") }
-            .tag(3)
+            .tag(2)
         }
         .tint(.sunsetAccent)
         // 预览的离屏承接：界面上不再显示本机预览（只看车机屏），但显示层
