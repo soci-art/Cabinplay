@@ -228,9 +228,37 @@ final class CarPlayAudio {
 
         } catch {
             rejected += 1
-            if rejected <= 3 { onLog?(CWL("音频数据包被拒绝：{1}", [String(describing: error.localizedDescription)])) }
+            if rejected <= 3 { onLog?(CWL("音频数据包被拒绝：{1}（第 {2} 次）", [String(describing: error.localizedDescription), String(describing: rejected)])) }
+            #if os(iOS)
+            // -50（paramErr）几乎都发生在「刚起播」：音频会话/引擎还带着
+            // 上一次会话的残留状态（切网后重启、CarPlay 会话刚建立都会
+            // 遇到）。以前这里按 0.5 秒一次重试，开头连丢 4–6 个包（约
+            // 1 秒声音）。现在当场拆掉引擎、注销会话，并把重试提前到下一
+            // 个包，让第二包就能起播。
+            if !playing, rejected <= 6 { resetAudioStackForRetry() }
+            #endif
         }
     }
+
+    #if os(iOS)
+    /// 起播失败后的硬重置：拆引擎/播放节点、注销音频会话，重试提前到
+    /// 下一个包（retryPlaybackAt = 0）。只在前几次失败时调用，避免音频
+    /// 会话真的不可用时无限重建。
+    private func resetAudioStackForRetry() {
+        player?.stop()
+        engine?.stop()
+        if let engine, let player { engine.detach(player) }
+        player = nil
+        engine = nil
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            onLog?(CWL("音频起播失败：已拆掉引擎并注销音频会话，下一个包立即重试"))
+        } catch {
+            onLog?(CWL("音频起播失败：注销音频会话也失败：{1}", [String(describing: error.localizedDescription)]))
+        }
+        retryPlaybackAt = 0
+    }
+    #endif
     private func browserTimestamp(_ rtp: UInt32, arrival: UInt64) -> UInt64 {
         if let anchor = browserClock {
             let samples = Int64(Int32(bitPattern: rtp &- anchor.rtp))
