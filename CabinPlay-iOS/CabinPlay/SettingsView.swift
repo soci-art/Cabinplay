@@ -132,9 +132,16 @@ struct SettingsView: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Color.pageBackground)
+        // 点空白收键盘的手势只能挂背景层：挂在表单本体上时，手指抬起的
+        // 瞬间会触发刷新，把菜单式选择器（声音输出/画质档位/请求帧率）
+        // 刚要弹出的菜单打掉，表现为三个选择器点了一点没反应（2026-11-27
+        // 实测）。背景层只接没落在控件上的点，控件自己的点按不受干扰。
+        .background {
+            Color.pageBackground
+                .contentShape(Rectangle())
+                .onTapGesture { fieldFocused = false }
+        }
         .scrollDismissesKeyboard(.interactively)
-        .simultaneousGesture(TapGesture().onEnded { fieldFocused = false })
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID
             manualSSID = remembered

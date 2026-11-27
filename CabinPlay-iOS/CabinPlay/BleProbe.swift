@@ -398,12 +398,18 @@ final class BleProbe: NSObject, ObservableObject {
     }
 
     /// 这台车机有没有本机存下的配对信任记录：核心配对成功后把 peer 密钥
-    /// 存进 CabinPlay/clink 状态目录（peer-<deviceId>.key），与核心鉴权时
-    /// 读的是同一份。目录口径与 ContentView 的 clinkStateDirectory 一致。
+    /// 存进 CabinPlay/clink 状态目录，与核心鉴权时读的是同一份。目录口径
+    /// 与 ContentView 的 clinkStateDirectory 一致。
+    /// 注意文件名：核心那边 peer 文件用的是车机 IP（peer-<车机IP>.key，
+    /// ClinkAddresses 的 head_unit_id 默认取 IPv4），不是蓝牙 deviceId——
+    /// 首版按 deviceId 找、永远找不到，卡片一直当没配对过（2026-11-27
+    /// 实测）。这里认目录里任何一份 peer 记录；万一换了台车免码连不上，
+    /// 已有兜底会把输码框重新亮出来，不会卡死。
     func pairedRecordExists(for deviceId: String) -> Bool {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let path = base.appendingPathComponent("CabinPlay/clink/peer-\(deviceId).key").path
-        return FileManager.default.fileExists(atPath: path)
+        let dir = base.appendingPathComponent("CabinPlay/clink")
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return files.contains { $0.hasPrefix("peer-") && $0.hasSuffix(".key") }
     }
 
     /// 已存的重连令牌（ServerInfo 的 authentication，按车机 deviceId 落盘）。
