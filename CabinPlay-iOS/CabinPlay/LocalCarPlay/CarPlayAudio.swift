@@ -53,6 +53,13 @@ final class CarPlayAudio {
     private let cipher: AudioStream
     // Construct the playback graph only when authenticated audio actually arrives. Creating
     // it during RTSP SETUP can block for seconds while iOS switches the CarPlay audio route.
+    /// 车机已经在放这条声音时（CarLink media_audio 通道在推包），本机就
+    /// 不再解码播放：iPhone 本机扬声器播放会和车机抢音频会话——实测
+    /// 起播被 -50 拒绝、后台保活被顶掉、CarPlay 还会 TEARDOWN 音频流
+    /// 重新 SETUP。桥那边首个包真正推进车机后把它置 true，CarLink 掉出
+    /// 画时置回 false。
+    static var carPlaysAudio = false
+
     private var engine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
     private let output: AVAudioFormat
@@ -130,6 +137,10 @@ final class CarPlayAudio {
                 onEncodedAudio(packet.samples, browserTimestamp(packet.timestamp, arrival: arrival))
             }
             guard let buffer = try decoder.decode(packet.samples) else { return }
+            // 车机自己在放这条声音：解码保持编解码器状态，但不起本机引擎。
+            // 只让 102（媒体流）让位；101（语音/提示）车机那边没有通道，
+            // 必须留在本机播。
+            if Self.carPlaysAudio, streamType == 102, onBrowserAudio == nil { return }
             if let onBrowserAudio {
                 onBrowserAudio(buffer, browserTimestamp(packet.timestamp, arrival: arrival))
                 return
@@ -229,36 +240,13 @@ final class CarPlayAudio {
         } catch {
             rejected += 1
             if rejected <= 3 { onLog?(CWL("音频数据包被拒绝：{1}（第 {2} 次）", [String(describing: error.localizedDescription), String(describing: rejected)])) }
-            #if os(iOS)
-            // -50（paramErr）几乎都发生在「刚起播」：音频会话/引擎还带着
-            // 上一次会话的残留状态（切网后重启、CarPlay 会话刚建立都会
-            // 遇到）。以前这里按 0.5 秒一次重试，开头连丢 4–6 个包（约
-            // 1 秒声音）。现在当场拆掉引擎、注销会话，并把重试提前到下一
-            // 个包，让第二包就能起播。
-            if !playing, rejected <= 6 { resetAudioStackForRetry() }
-            #endif
+            // 起播失败按 0.5 秒重试（原有节奏）。2026-11-27 15:20 的实测
+            // 表明「拆引擎+注销会话」会让后台保活停摆、CarPlay 直接
+            // TEARDOWN 音频流 102 再 SETUP，反而更糟，所以撤销那套硬重置；
+            // 真正的解法见 carPlaysAudio：车机在放这条声音时本机不抢音频。
         }
     }
 
-    #if os(iOS)
-    /// 起播失败后的硬重置：拆引擎/播放节点、注销音频会话，重试提前到
-    /// 下一个包（retryPlaybackAt = 0）。只在前几次失败时调用，避免音频
-    /// 会话真的不可用时无限重建。
-    private func resetAudioStackForRetry() {
-        player?.stop()
-        engine?.stop()
-        if let engine, let player { engine.detach(player) }
-        player = nil
-        engine = nil
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            onLog?(CWL("音频起播失败：已拆掉引擎并注销音频会话，下一个包立即重试"))
-        } catch {
-            onLog?(CWL("音频起播失败：注销音频会话也失败：{1}", [String(describing: error.localizedDescription)]))
-        }
-        retryPlaybackAt = 0
-    }
-    #endif
     private func browserTimestamp(_ rtp: UInt32, arrival: UInt64) -> UInt64 {
         if let anchor = browserClock {
             let samples = Int64(Int32(bitPattern: rtp &- anchor.rtp))
