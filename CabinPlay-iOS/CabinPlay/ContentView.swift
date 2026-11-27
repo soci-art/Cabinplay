@@ -285,6 +285,8 @@ struct ContentView: View {
     /// 1 秒或约 30 秒，35 秒刚越过慢峰，正常慢轮次不会误触发）。
     /// 连接开头不再预轮换（connectCarFlow 已撤）：先用原标识连，
     /// 系统状态好时同身份 1 秒回连、慢时约 30 秒，都轮不到换。
+    /// B 方案（2026-11-27）：发起挪到入网之后，等待期不再 20 秒重启，
+    /// 第一窗直接 35 秒，只观察不打断系统的回连。
     private func armLocalCallbackRetry() {
         localRetryGeneration += 1
         localAttemptCount = 1
@@ -296,16 +298,14 @@ struct ContentView: View {
 
     private func scheduleLocalCallbackCheck(generation: Int) {
         localRetryWork?.cancel()
-        // 本轮检查窗：常规 20 秒（定版依据见 armLocalCallbackRetry
-        // 的注释）；但未轮换时下一检查点不许越过 35 秒熔断线——把
-        // 窗收短到熔断点，让熔断在约 35 秒准时触发，而不是拖到
-        // 40 秒那次常规检查。在排期这一刻定格，日志如实对账。
-        var waitSeconds = 20
+        // B 方案：等待期只观察、不在中途重启。2026-11-27 实测 20 秒那次
+        // 重启没有换来更早回连（系统仍在切网后整 30 秒才回连），所以第
+        // 一窗直接放到 35 秒熔断线：回连了就收手，没回连才按反应式轮换
+        // 重启一次（只此一次，不叠加中途重试）。轮换后的新身份仍按 20 秒
+        // 一窗，最多 3 次。
+        var waitSeconds = localRotatedThisFlow ? 20 : 35
         if !localRotatedThisFlow, let fuseStart = localFuseStartedAt {
-            let remaining = 35 - Date().timeIntervalSince(fuseStart)
-            if remaining < 20 {
-                waitSeconds = max(1, Int(remaining.rounded()))
-            }
+            waitSeconds = max(1, Int((35 - Date().timeIntervalSince(fuseStart)).rounded()))
         }
         let item = DispatchWorkItem {
             guard generation == localRetryGeneration else { return }
@@ -399,7 +399,7 @@ struct ContentView: View {
         attempt()
     }
 
-    // MARK: 连接车机总流程（顺序：蓝牙先行 → 旧网络上预发起会话 → 入网 → 切网后接续 + 无回连自动重试，clink 并行）
+    // MARK: 连接车机总流程（B 方案：蓝牙先行 → 入网 → 在新网络上发起会话 + 无回连观察，clink 并行）
 
     /// 点「连接车机」的总入口：第一件事就是走蓝牙写 ClientInfo。车机
     /// 的 30 秒看门狗从蓝牙连上那刻起算，而蓝牙在扫描发现车机时就已
@@ -420,7 +420,7 @@ struct ContentView: View {
         // 写点不动：连上照落、stop 照落，只是不再作轮换依据。
         armStartupDeadline()
         appendLog("本机 CarPlay：本轮先用原设备标识连接（35 秒不回连再换新标识）")
-        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先在当前网络发起 CarPlay 会话、再入网，切网后接续")
+        appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先入网、网络稳定后再在新网络上发起 CarPlay（B 方案：不再在旧网络预发起、不再切网重启）")
         bleProbe.connect(pin: blePin)
     }
 
@@ -724,35 +724,22 @@ struct ContentView: View {
             UserDefaults.standard.set(deviceId, forKey: "cabinplay.lastCarDeviceId")
         }
         prepareSizeTier(for: bleProbe.foundDeviceId)
-        // 本轮唯一的机会先占住，别在链条中间浪费掉。真机规律（与全
-        // 部日志吻合）：重启后第一次发起的 CarPlay 会话才能成；一旦
-        // 有会话真正跑起来又结束，之后的新会话再也起不来，直到下次
-        // 重启（1548 重启后 #1 出画、被停后 #2/#3 全败；1532 同理且
-        // 卡死带到下一轮）。而入网切到车机 DIRECT- 网络之后「新发
-        // 起」从没成过（四次全败，含上一版先停后入网再一次启动）；
-        // 唯一成功（1530）是切网「之前」就发起的谈话：StartSession
-        // 用本轮新鲜车机凭据在旧网络上先发出去、没等到回连，地址一
-        // 切过来接收端按新地址重开、重发 StartSession，iOS 立刻回
-        // 连并全程出画。所以顺序定死：入网之前先把会话发起在旧网络
-        // 上，中间不插入任何会真正建立又结束的会话。
+        // 历史记录（已由 B 方案取代）：早期规律是「重启后第一次发起的会话
+        // 才能成」，且入网之后新发起四次全败，所以当时把发起放在入网之前。
+        // 2026-11-27 的日志证明那条路的代价是切网后 iOS 断线重连的 30 秒；
+        // 现在的做法见下面 B 方案注释。
+        // B 方案（先入网、再起会话）：以前是「旧网络先发起 → 入网 → 切网后
+        // 按新地址重启接续」。2026-11-27 10:39 的日志量出这条路要 31 秒：
+        // 切网让 iOS 走无线 CarPlay 的「断线重连」退避，10:39:50 切网、
+        // 10:40:20 才回连（整 30 秒），中间 20 秒那次重启并没有让它变快。
+        // 现在把会话发起挪到入网之后：网络不再中途变化，iOS 走「配件在
+        // 当前网络出现」的正常连接路径，预期 1–5 秒回连。
+        // 入网前若还有在跑的会话（上一轮残留），先停干净——留着它会被切网
+        // 掐死，反而占掉这次唯一的发起机会。
         var flowInitiatedLocalSession = false
         if localSession.isRunning {
-            if localSession.controlConnected || localSession.phase == .streaming {
-                // 正在出画/已建立：留着它会被切网中途掐死、同样卡死，
-                // 唯一可走的路是先干净停掉、再立刻重新发起。
-                appendLog("本机 CarPlay：会话正在出画——先停掉，马上在当前网络重新发起，切网后接续（发起机会只有重启后这一次，不能让它被切网掐死）")
-                stopLocalSession(reason: "连接车机：停掉已出画会话以便重新发起接续")
-                startLocalSession()
-                flowInitiatedLocalSession = true
-            } else {
-                // 已发起、还没回连：这就是正在谈的那次机会，留着它，
-                // 切网后靠地址重开接续，不要重启它。
-                appendLog("本机 CarPlay：会话已发起、正在等系统回连——留着这次谈话，切网后接续，不重启它")
-            }
-        } else {
-            appendLog("本机 CarPlay：先在当前网络发起 CarPlay 会话，切网后接续（用本轮车机凭据「\(info.ssid ?? "?")」，这是本轮唯一的那次发起）")
-            startLocalSession()
-            flowInitiatedLocalSession = true
+            appendLog("本机 CarPlay：入网前先把旧会话停干净（避免切网把这次发起机会掐死；入网完成后再在新网络发起）")
+            stopLocalSession(reason: "连接车机：先入网，停掉入网前的旧会话")
         }
         joinPhase = .joining
         carLinkDetail = "入网中：加入车机网络「\(info.ssid ?? "?")」"
@@ -781,26 +768,13 @@ struct ContentView: View {
             joinPhase = .idle
             flowLocalIP = result.localIP
             carLinkDetail = "本机 \(result.localIP) · 正在连接车机"
-            // 切网后接续：切网前发起的那次谈话还在等回连、且还绑在旧
-            // 地址上，就按新地址重开接续——同凭据重启接收端、重发
-            // StartSession，这正是 1530 成的那一步。会话内的启动期地
-            // 址看门狗可能已先一步重开对齐（boundAddress 已是新地
-            // 址），那就不重复动它。已回连/出画的会话是终点：绝不再
-            // 停它、重开它（帧桥汇合、clink 那边都不碰它的生命周期）。
-            if localSession.isRunning, !localSession.controlConnected,
-               localSession.boundAddress != result.localIP {
-                appendLog("本机 CarPlay：切网后接续——会话还绑在旧地址 \(localSession.boundAddress ?? "?")，按新地址 \(result.localIP) 重开、重发 StartSession（凭据不变）")
-                stopLocalSession(reason: "连接车机：切网后按新地址接续重开")
-                startLocalSession()
-            } else if localSession.isRunning {
-                appendLog("本机 CarPlay：切网后接续已就位（会话已在新地址上或已回连），不重复动它")
-            } else {
-                // 极端兜底：预发起的会话不知为何没在跑，现在补发起。
-                appendLog("本机 CarPlay：入网完成，会话没在跑，兜底现在发起（用本轮车机凭据）")
-                startLocalSession()
-            }
-            // 无回连自动重试挂上：接续后每轮等 20 秒仍无回连就同凭
-            // 据同地址重新发起，最多共 3 次；回连即收手。
+            // 入网完成、地址已稳定：现在在车机网络上发起唯一那次 CarPlay。
+            // 不再有「切网后接续」这一步——那是 30 秒等待的来源。
+            appendLog("本机 CarPlay：入网完成（本机 \(result.localIP)），现在在车机网络上发起 CarPlay 会话（不再切网，避开 iOS 的断线重连退避）")
+            flowInitiatedLocalSession = true
+            startLocalSession()
+            // 无回连观察挂上：第一窗 35 秒只观察，期间不重启；没回连才
+            // 按反应式轮换（仅一次），轮换后按 20 秒一窗、最多 3 次。
             armLocalCallbackRetry()
             // 车机地址候选逐个启 clink 真连接试（被拒自动重试/换候选），
             // 与本机 CarPlay 接续并行，两边靠帧桥汇合。只用真连接试：
