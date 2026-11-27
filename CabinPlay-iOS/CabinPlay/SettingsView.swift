@@ -39,15 +39,6 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            // 页内大标题（代替导航栏大标题，见 body 末尾的说明）。
-            Section {
-                Text("设置")
-                    .font(.largeTitle.weight(.bold))
-                    .listRowInsets(EdgeInsets(top: 4, leading: 2, bottom: 2, trailing: 16))
-                    .listRowSeparator(.hidden)
-            }
-            .listRowBackground(Color.pageBackground)
-
             Section {
                 TextField("Wi-Fi 名称", text: $manualSSID)
                     .autocorrectionDisabled()
@@ -157,12 +148,15 @@ struct SettingsView: View {
                 .onTapGesture { fieldFocused = false }
         }
         .scrollDismissesKeyboard(.interactively)
-        // 标题不走导航栏：导航栏铺色与大标题在这个系统上只能二选一
-        // （强制铺色标题消失、不强制标题区发白，2026-11-27 三张截图
-        // 对照实锤）。导航栏整条藏掉，「设置」二字画进页面内容里，
-        // 标题和颜色就都稳了。藏栏用老接口 navigationBarHidden：
-        // 工程最低 iOS 17.4，toolbarVisibility 要 iOS 18、编不过。
-        .navigationBarHidden(true)
+        // 照主页的样子：主页是滚动视图、导航栏背景天生透明，栏后透
+        // 出页面底色、大标题照常显示；表单页的栏默认是不透明白底，
+        // 才会有发白接缝。改法：标题照常用导航栏大标题，栏背景用
+        // NavigationBarClearance 改成透明（见文件末尾）。别再试的两
+        // 条路（2026-11-27 截图实锤）：给栏强制铺色会让大标题消失；
+        // 把整条栏藏掉，顶部会多出一大片空白、底部标签栏还会改成
+        // 压在内容上的悬浮式。
+        .navigationTitle("设置")
+        .background { NavigationBarClearance() }
         .task { await updateChecker.check() }
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID
@@ -172,5 +166,29 @@ struct SettingsView: View {
             audioMode = AudioOutputPolicy.mode
             routeText = AudioOutputPolicy.routeSummary
         }
+    }
+}
+
+/// 把本页所在导航栏的背景改成透明（照主页的样子）：栏后透出页面
+/// 底色，大标题照常显示，整页同色无接缝。只动设置页自己这一条
+/// 导航栏，其他标签页不受影响。
+private struct NavigationBarClearance: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> UIViewController {
+        let vc = UIViewController()
+        DispatchQueue.main.async { Self.apply(from: vc) }
+        return vc
+    }
+
+    func updateUIViewController(_ vc: UIViewController, context: Context) {
+        DispatchQueue.main.async { Self.apply(from: vc) }
+    }
+
+    private static func apply(from vc: UIViewController) {
+        guard let nav = vc.navigationController else { return }
+        let appearance = UINavigationBarAppearance()
+        appearance.configureWithTransparentBackground()
+        nav.navigationBar.scrollEdgeAppearance = appearance
+        nav.navigationBar.standardAppearance = appearance
+        nav.navigationBar.compactAppearance = appearance
     }
 }
