@@ -315,6 +315,12 @@ final class LocalCarPlaySession: ObservableObject {
     /// 地址自动重开对齐，不会长期用错地址跑。
     func start(width: Int, height: Int, fps: Int, addressOverride: String? = nil) {
         guard !isRunning else { return }
+        // 互斥：CarLife 在跑时不再起第二路（同一个本机 CarPlay 会话 + 7001 端口）。
+        if OutputCoordinator.carLifeActive, !OutputCoordinator.startingCarLife {
+            phase = .failed("CarLife 正在运行")
+            onLog?("本机 CarPlay：CarLife 正在运行，先停止 CarLife 再连 CarLink（两路输出互斥）")
+            return
+        }
         startParams = (width, height, fps)
         bridge.setFPS(Double(fps))
         let loadedIdentity: AccessoryIdentity
@@ -597,6 +603,11 @@ final class LocalCarPlaySession: ObservableObject {
         } else {
             receiver.touches(source: "carlink", [])
         }
+    }
+
+    /// CarLife 的触控：车机给的是一组归一化（0…1）触点，原样转给本机会话。
+    func touchesFromCarLife(_ points: [TouchPoint]) {
+        receiver.touches(source: "carlife", points)
     }
 
     /// clink 按键码（oxp-core KeyCode）：0 主页 1 返回 2 选择 3 旋钮左 4 旋钮右

@@ -40,9 +40,12 @@ final class CarLifeSession: ObservableObject {
         let ip = carIP.trimmingCharacters(in: .whitespacesAndNewlines)
         // 声音留本机：CarLife 没有音频通道。
         CarPlayAudio.carPlaysAudio = false
+        OutputCoordinator.startingCarLife = true
+        OutputCoordinator.carLifeActive = true
         wire()
         local.start(width: width, height: height, fps: fps)
         output.start(targetAddress: ip.isEmpty ? nil : ip, width: width, height: height, fps: fps)
+        OutputCoordinator.startingCarLife = false
         running = true
         status = ip.isEmpty
             ? "正在启动：本机 CarPlay + CarLife 监听（靠 UDP 发现车机）"
@@ -52,6 +55,8 @@ final class CarLifeSession: ObservableObject {
     func stop() {
         output.stop()
         local.stop()
+        OutputCoordinator.startingCarLife = false
+        OutputCoordinator.carLifeActive = false
         running = false
         status = "已停止"
         append("CarLife：已停止")
@@ -69,19 +74,13 @@ final class CarLifeSession: ObservableObject {
             DispatchQueue.main.async { self?.status = line }
         }
         output.onTouches = { [weak self] points in
-            guard let self else { return }
-            if let first = points.first {
-                self.local.touchesFromCarLink(pressed: true, x: first.x, y: first.y)
-            } else {
-                self.local.touchesFromCarLink(pressed: false, x: 0, y: 0)
-            }
+            self?.local.touchesFromCarLife(points)
         }
         output.onControl = { [weak self] control in
             self?.local.pressRemote(control)
         }
-        output.onKeyframeRequest = { [weak self] _ in
-            // 复用现有的「进入出画」入口，它会向本机 CarPlay 请求关键帧。
-            self?.local.carLinkPlayingChanged(true)
+        output.onKeyframeRequest = { [weak self] reason in
+            self?.local.previewNeedsKeyFrame(reason: "CarLife：\(reason)")
         }
     }
 }
