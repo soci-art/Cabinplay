@@ -12,6 +12,7 @@ import SwiftUI
 
 struct CarLifeView: View {
     @StateObject private var session = CarLifeSession()
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("cabinplay.carLifeAddress") private var carIP = ""
     // CarLife 自己的参数，和 CarLink 的设置互不影响：默认 720p30（这条
     // 协议的实际能力上限就是 1080p30），实际帧率仍以车机请求为准。
@@ -134,6 +135,15 @@ struct CarLifeView: View {
             }
             .background(Color.pageBackground)
             .navigationBarHidden(true)
+            .onChange(of: scenePhase) { _, phase in
+                // 画中画保活的联动：切后台时推一把让它自动吊起，
+                // 回前台收尾（与 CarLink 主页同款，CarLife 原来缺这环）。
+                switch phase {
+                case .inactive: session.sceneBecameInactive()
+                case .active: session.sceneReturnedToForeground()
+                default: break
+                }
+            }
         }
     }
 }

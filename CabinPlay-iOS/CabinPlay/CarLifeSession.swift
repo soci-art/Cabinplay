@@ -36,10 +36,11 @@ final class CarLifeSession: ObservableObject {
 
     private let local = LocalCarPlaySession()
     private let output = CarLifeOutput()
-    private let keepAlive = BackgroundKeepAlive()
     private var pip: CarPlayPictureInPicture?
     private var wired = false
     private var monitor: NWPathMonitor?
+    private var pathWasReady = false
+    private var startedAt = Date()
     private var address = ""
     private var size: (w: Int, h: Int) = (1280, 720)
     private var fps = 30
@@ -83,11 +84,13 @@ final class CarLifeSession: ObservableObject {
             return
         }
         address = carIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        size = (width, height)
+        size = effectiveStartSize(selectedW: width, selectedH: height)
         self.fps = fps
         userStopped = false
         downgraded = false
         firstTouchLogged = false
+        pathWasReady = false
+        startedAt = Date()
         streamingStartedAt = nil
         peerConnected = false
         streaming = false
@@ -99,8 +102,8 @@ final class CarLifeSession: ObservableObject {
         OutputCoordinator.carLifeActive = true
         wire()
         decoder.reset()
-        local.start(width: width, height: height, fps: fps)
-        output.start(targetAddress: address.isEmpty ? nil : address, width: width, height: height, fps: fps)
+        local.start(width: size.w, height: size.h, fps: fps)
+        output.start(targetAddress: address.isEmpty ? nil : address, width: size.w, height: size.h, fps: fps)
         OutputCoordinator.startingCarLife = false
         startMonitor()
         running = true
@@ -122,7 +125,6 @@ final class CarLifeSession: ObservableObject {
     private func stopEverything(status newStatus: String) {
         output.stop()
         local.stop()
-        keepAlive.stop()
         pip?.stop()
         pip = nil
         monitor?.cancel()
@@ -179,7 +181,6 @@ final class CarLifeSession: ObservableObject {
                 self.streamingStartedAt = Date()
             }
             self.rememberProvenSize()
-            self.startKeepAlive()
         }
         output.onTouches = { [weak self] points in
             guard let self else { return }
@@ -201,19 +202,17 @@ final class CarLifeSession: ObservableObject {
         }
         decoder.onFirstFrameEnqueued = { [weak self] in
             guard let self else { return }
+            // 静音音频保活只有一条腿：本机 会话在首帧进显示层时自己
+            // 拉起（与 CarLink 完全同一条），这里只把状态同步给页面
+            // 的步骤卡。原来这里另起一份保活，两份静音播放器同时转，
+            // 纯多余（验收时查出，已删）。
             self.local.previewDidDisplayFirstFrame()
+            DispatchQueue.main.async { self.keepAliveActive = self.local.keepAliveActive }
             self.startPictureInPicture()
         }
     }
 
-    // MARK: 两条保活腿
-
-    private func startKeepAlive() {
-        keepAlive.onLog = { [weak self] line in self?.append(line) }
-        let started = keepAlive.start()
-        DispatchQueue.main.async { [weak self] in self?.keepAliveActive = self?.keepAlive.isRunning ?? false }
-        append("CarLife：静音音频保活\(started ? "已拉起" : "没能拉起（可能被别的音频占着）")")
-    }
+    // MARK: 画中画保活腿
 
     private func startPictureInPicture() {
         if pip == nil {
@@ -227,6 +226,12 @@ final class CarLifeSession: ObservableObject {
         append("CarLife：画中画保活已请求")
     }
 
+    /// 页面把前后台变化转进来（与 CarLink 主页同款联动：切后台时推
+    /// 一把让画中画自动吊起，回到前台收尾）。原来缺这一环，画中画
+    /// 备好了也未必弹得出来。
+    func sceneBecameInactive() { pip?.awaitAutomaticStart() }
+    func sceneReturnedToForeground() { pip?.returnedToForeground() }
+
     // MARK: 网络变化（切网后重建监听）
 
     private func startMonitor() {
@@ -238,11 +243,21 @@ final class CarLifeSession: ObservableObject {
             DispatchQueue.main.async { self.networkReady = wifi }
             guard self.running else { return }
             if !wifi {
-                self.append("CarLife：网络不可用（可能没连上 Wi-Fi），等网络回来再重建监听")
+                if self.pathWasReady {
+                    self.pathWasReady = false
+                    self.append("CarLife：网络断了（Wi-Fi 不可用），等网络回来再重建监听")
+                }
                 return
             }
+            // 只在「从断到通」时才重建：监测刚启动会先报一次当前状态、
+            // 运行中 Wi-Fi 参数微调也会反复回调，那些都不该把监听推倒
+            // 重来（原来每次回调都重建，启动时平白多重建一遍，运行中
+            // 网络一抖还可能把正连着的车机掀一下）。
+            let recovering = !self.pathWasReady
+            self.pathWasReady = true
+            guard recovering, Date().timeIntervalSince(self.startedAt) > 3 else { return }
             // 切网后旧监听绑在旧地址上，重建一遍并重新宣告。
-            self.append("CarLife：网络已就绪（Wi-Fi），重建监听与通知")
+            self.append("CarLife：网络恢复（Wi-Fi），重建监听与通知")
             self.output.start(targetAddress: self.address.isEmpty ? nil : self.address,
                               width: self.size.w, height: self.size.h, fps: self.fps)
         }
@@ -258,6 +273,30 @@ final class CarLifeSession: ObservableObject {
 
     private func rememberProvenSize() {
         UserDefaults.standard.set("\(size.w)x\(size.h)", forKey: provenKey)
+    }
+
+    /// 尺寸记忆的读法（原来只存不读，等于没做）：页面换过档位就清掉
+    /// 记忆、按所选档重新试；没换档且存着更低的「跑通尺寸」（上次降
+    /// 档降下来的），直接按跑通的起，不再白白失败一次。所选档比记忆
+    /// 还低时按所选档（低的更稳妥）。
+    private func effectiveStartSize(selectedW: Int, selectedH: Int) -> (w: Int, h: Int) {
+        let defaults = UserDefaults.standard
+        let scope = address.isEmpty ? "default" : address
+        let selectedKey = "cabinplay.carLifeSelectedSize.\(scope)"
+        let selected = "\(selectedW)x\(selectedH)"
+        if defaults.string(forKey: selectedKey) != selected {
+            defaults.set(selected, forKey: selectedKey)
+            defaults.removeObject(forKey: provenKey)
+            return (selectedW, selectedH)
+        }
+        if let proven = defaults.string(forKey: provenKey) {
+            let parts = proven.split(separator: "x").compactMap { Int($0) }
+            if parts.count == 2, parts[0] * parts[1] < selectedW * selectedH {
+                append("CarLife：这台车上次跑通的是 \(proven)，这次直接按这个尺寸起")
+                return (parts[0], parts[1])
+            }
+        }
+        return (selectedW, selectedH)
     }
 
     /// 车机刚连上就断（20 秒内），按 1080p → 720p → 480p 降一档重试一次。
@@ -278,8 +317,13 @@ final class CarLifeSession: ObservableObject {
             self?.streaming = false
             self?.peerConnected = false
         }
+        // 重启本机 会话要罩上「正在启动 CarLife」：互斥守卫分不清这是
+        // CarLife 自己在重启，不罩就会以「CarLife 正在运行」把它拦下，
+        // 降档反而把会话杀了（验收 5fac2ae 时查出的硬伤）。
+        OutputCoordinator.startingCarLife = true
         local.stop()
         local.start(width: next.0, height: next.1, fps: fps)
+        OutputCoordinator.startingCarLife = false
         output.start(targetAddress: address.isEmpty ? nil : address, width: next.0, height: next.1, fps: fps)
     }
 
