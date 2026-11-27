@@ -11,6 +11,12 @@ import SwiftUI
 struct CarLifeView: View {
     @StateObject private var session = CarLifeSession()
     @AppStorage("cabinplay.carLifeAddress") private var carIP = ""
+    // CarLife 自己的参数，和 CarLink 的设置互不影响：默认 720p30（这条
+    // 协议的实际能力上限就是 1080p30），实际帧率仍以车机请求为准。
+    @AppStorage("cabinplay.carLifeSize") private var sizeTag = "720"
+    @AppStorage("cabinplay.carLifeFPS") private var fps = 30
+
+    private var videoSize: (Int, Int) { sizeTag == "1080" ? (1920, 1080) : (1280, 720) }
 
     private var startDisabled: Bool { session.running }
 
@@ -29,18 +35,16 @@ struct CarLifeView: View {
                 }
 
                 Section("输出") {
-                    HStack {
-                        Text("分辨率")
-                        Spacer()
-                        Text("1280×720")
-                            .foregroundStyle(.secondary)
+                    Picker("分辨率", selection: $sizeTag) {
+                        Text("1280×720").tag("720")
+                        Text("1920×1080").tag("1080")
                     }
-                    HStack {
-                        Text("帧率")
-                        Spacer()
-                        Text("30 fps")
-                            .foregroundStyle(.secondary)
+                    .disabled(session.running)
+                    Picker("帧率", selection: $fps) {
+                        Text("30 fps").tag(30)
+                        Text("60 fps（最多，实际听车机的）").tag(60)
                     }
+                    .disabled(session.running)
                     HStack {
                         Text("声音")
                         Spacer()
@@ -54,7 +58,8 @@ struct CarLifeView: View {
                         if session.running {
                             session.stop()
                         } else {
-                            session.start(carIP: carIP, width: 1280, height: 720, fps: 30)
+                            let size = videoSize
+                            session.start(carIP: carIP, width: size.0, height: size.1, fps: fps)
                         }
                     }
                     .foregroundStyle(session.running ? .red : .primary)
