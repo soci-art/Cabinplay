@@ -28,7 +28,10 @@ struct DashboardView: View {
     let bleScanning: Bool
     let bleSummary: String
     let bleFound: Bool
-    let bleHasToken: Bool
+    /// 这台车机配对过（有车机令牌或本机配对记录）：蓝牙卡免输码形态。
+    let blePaired: Bool
+    /// 免码连接失败后上层要求亮出输码框（车机多半把手机忘了）。
+    let pinEntryForced: Bool
     let blePhaseText: String
 
     /// 后台保活状态（本机 CarPlay 会话运行期间自动生效）。
@@ -46,6 +49,11 @@ struct DashboardView: View {
     let onConnectBle: () -> Void
 
     @FocusState private var blePinFocused: Bool
+    /// 已配对时用户手动点开输码框（重新配对用）。
+    @State private var showPinEntry = false
+
+    /// 输码框什么时候露出来：没配对过、用户手动点开、或免码失败被上层要求。
+    private var pinEntryVisible: Bool { !blePaired || showPinEntry || pinEntryForced }
 
     var body: some View {
         ScrollView {
@@ -145,18 +153,31 @@ struct DashboardView: View {
             Text(blePhaseText)
                 .font(.footnote.weight(.medium))
                 .foregroundStyle(.primary)
-            TextField("车机屏幕上的 6 位配对码", text: $blePinField)
-                .keyboardType(.numberPad)
-                .focused($blePinFocused)
-                .submitLabel(.done)
-                .onSubmit { blePinFocused = false }
-                .onChange(of: blePinField) { _, newValue in
-                    if newValue.count >= 6 { blePinFocused = false }
+            if pinEntryVisible {
+                TextField("车机屏幕上的 6 位配对码", text: $blePinField)
+                    .keyboardType(.numberPad)
+                    .focused($blePinFocused)
+                    .submitLabel(.done)
+                    .onSubmit { blePinFocused = false }
+                    .onChange(of: blePinField) { _, newValue in
+                        if newValue.count >= 6 { blePinFocused = false }
+                    }
+                    .font(.title3.monospaced())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.sunsetAccent)
+                    Text("这台车已经配对过，不用输配对码")
+                        .font(.footnote.weight(.medium))
                 }
-                .font(.title3.monospaced())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.sunsetAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+            }
             HStack(spacing: 10) {
                 Button {
                     Haptics.tap()
@@ -179,14 +200,29 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color.sunsetAccent)
-                .disabled(!bleFound || (blePinField.count != 6 && !bleHasToken))
+                .disabled(!bleFound || (pinEntryVisible && blePinField.count != 6))
             }
             if !bleFound {
-                Text("先点「开始探测」，等上面显示发现车机，再输配对码连接")
+                Text("先点「开始探测」，等上面显示发现车机，再连接")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else if bleHasToken && blePinField.count != 6 {
-                Text("这台车机存有上次配对的重连令牌，不用输码，直接点「连接车机」就能连")
+            } else if !pinEntryVisible {
+                Button("连不上、车机要重新配对？点这里输码") {
+                    Haptics.tap()
+                    showPinEntry = true
+                }
+                .font(.caption)
+                .tint(Color.sunsetAccent)
+            } else if pinEntryForced {
+                Text("车机把手机忘了，要重新输一次码配对；配对成功后又能免码连")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if blePaired {
+                Text("输一次码重新配对；配对成功后又能免码连")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("第一次连接要输一次车机屏幕上的 6 位码；配对成功后，以后连接就不用再输了")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

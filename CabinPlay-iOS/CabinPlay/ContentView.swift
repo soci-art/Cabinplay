@@ -63,6 +63,10 @@ struct ContentView: View {
     @State private var tab = 0
     @State private var blePin = ""
     @State private var carLinkState = CarLinkCore.State.idle
+    /// 免码连接失败后置真：蓝牙卡把输码框重新亮出来（车机多半把手机忘了）。
+    @State private var pinEntryForced = false
+    /// 本轮免码连接有没有到过出画（到过再断开是正常断开，不亮输码框）。
+    @State private var pinlessReachedPlaying = false
     @State private var carLinkRunning = false
     @State private var netMonitor: NetworkChangeMonitor?
     /// 启动总超时：从点「连接车机」起算，超过这个时长还没出画就整轮放弃，
@@ -85,7 +89,7 @@ struct ContentView: View {
         case idle, joining, failed(String)
     }
     @State private var joinPhase: JoinPhase = .idle
-    @State private var carLinkDetail = "先在蓝牙卡输配对码连接车机，后面的入网和 CarLink 都自动走"
+    @State private var carLinkDetail = "先在蓝牙卡连接车机，后面的入网和 CarLink 都自动走"
     @State private var flowCarIP = ""
     @State private var flowLocalIP = ""
     @State private var joiner = UCarNetworkJoiner()
@@ -146,7 +150,8 @@ struct ContentView: View {
                     bleScanning: bleProbe.scanning,
                     bleSummary: bleProbe.lastFoundSummary ?? "还没发现车机——在车里打开车机的 CarLink，再点开始探测",
                     bleFound: bleProbe.foundDeviceId != nil,
-                    bleHasToken: bleProbe.hasStoredToken,
+                    blePaired: bleProbe.hasStoredToken || bleProbe.hasPairedRecord,
+                    pinEntryForced: pinEntryForced,
                     blePhaseText: bleStageText,
                     keepAliveActive: localSession.keepAliveActive,
                     blePinField: $blePin,
@@ -441,6 +446,7 @@ struct ContentView: View {
         // 断换新标识兜底（见 scheduleLocalCallbackCheck）。标记的读
         // 写点不动：连上照落、stop 照落，只是不再作轮换依据。
         armStartupDeadline()
+        pinlessReachedPlaying = false
         appendLog("本机 CarPlay：本轮先用原设备标识连接（35 秒不回连再换新标识）")
         appendLog("连接车机：先走蓝牙写 ClientInfo（车机 30 秒窗口从蓝牙连上起算，不能先等本机 CarPlay），拿到 ServerInfo 后先入网、网络稳定后再在新网络上发起 CarPlay（B 方案：不再在旧网络预发起、不再切网重启）")
         bleProbe.connect(pin: blePin)
@@ -505,6 +511,15 @@ struct ContentView: View {
         }
         core.onState = { state in
             carLinkState = state
+            if state == .playing {
+                pinlessReachedPlaying = true
+                pinEntryForced = false
+            }
+            if state == .ended, bleProbe.flowUsesPairedRecord, !pinlessReachedPlaying {
+                // 免码连没连上就结束了：多半是车机把手机忘了、临时要码——
+                // 把输码框重新亮出来，用户输一次码重新配对即可。
+                pinEntryForced = true
+            }
             carLinkRunning = (state != .idle && state != .ended)
             if state == .negotiating || state == .playing {
                 clinkFlow.noteHit()

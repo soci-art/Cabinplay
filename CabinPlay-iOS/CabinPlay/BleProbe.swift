@@ -92,6 +92,9 @@ final class BleProbe: NSObject, ObservableObject {
     private var flowCredential: String?
     /// 本轮是不是在用令牌免码连接。
     private var flowUsesToken = false
+    /// 本轮走的是「已存配对免码」路径（凭据留空、鉴权靠本机信任记录）。
+    /// 上层据此在失败时把输码框重新亮出来。
+    private(set) var flowUsesPairedRecord = false
     /// ClientInfo 的 type 候选链（CarWith 口径）：车机版本码 ≥1002 时 [1002, 1001]，否则 [1001]。
     private var clientInfoTypes: [Int] = []
     /// 写 …101 失败后是否已按 CarWith 口径同值重写过一次（只重写一次）。
@@ -105,6 +108,10 @@ final class BleProbe: NSObject, ObservableObject {
     private var autoReconnectDeviceId: String?
     /// 当前发现的车机有没有已存的重连令牌（连接按钮免输码用）。
     @Published private(set) var hasStoredToken = false
+    /// 当前发现的车机有没有本机存下的配对信任记录（核心 peer 密钥文件）。
+    /// 车机从没给这台手机发过重连令牌（实测 ServerInfo 的 authentication
+    /// 恒为「无」），免码与否以这份本机记录为准。
+    @Published private(set) var hasPairedRecord = false
     private var clientInfoWritten = false
     private var serverInfoSubscribed = false
     /// 已调用 setNotifyValue(true) 请求 …102 通知。有的车机不回订阅确认回调，
@@ -322,8 +329,10 @@ final class BleProbe: NSObject, ObservableObject {
             connectWithPin(trimmed)
         } else if hasStoredToken {
             connectWithToken()
+        } else if hasPairedRecord {
+            connectWithPairedRecord()
         } else if trimmed.isEmpty {
-            log("UCar 连接：先输车机屏幕上的 6 位配对码再连（这台车机还没有存下的重连令牌）")
+            log("UCar 连接：先输车机屏幕上的 6 位配对码再连（这台车机还没有配对过）")
         } else {
             log("UCar 连接：配对码要是 6 位，现在是 \(trimmed.count) 位，先输对再连")
         }
@@ -343,6 +352,7 @@ final class BleProbe: NSObject, ObservableObject {
         pendingPin = trimmed
         flowCredential = trimmed
         flowUsesToken = false
+        flowUsesPairedRecord = false
         autoReconnectAttempts = 0
         autoReconnectDeviceId = nil
         beginFlow(peripheral: peripheral, credentialDescription: "配对码 **\(trimmed.suffix(2))")
@@ -362,8 +372,38 @@ final class BleProbe: NSObject, ObservableObject {
         pendingPin = nil
         flowCredential = token
         flowUsesToken = true
+        flowUsesPairedRecord = false
         log("UCar 连接：用已存令牌免码重连（令牌共 \(token.count) 位，已打码）")
         beginFlow(peripheral: peripheral, credentialDescription: "已存令牌免码")
+    }
+
+    /// 用本机存下的配对信任记录免码连接：凭据留空，TCP 鉴权时核心读到
+    /// 已存的 peer 密钥就走已配对通道、不问码。车机要是把手机忘了、临时
+    /// 改口要码，这轮会失败，上层会把输码框重新亮出来让用户输一次。
+    func connectWithPairedRecord() {
+        guard let deviceId = foundDeviceId, pairedRecordExists(for: deviceId) else {
+            log("UCar 连接：这台车机还没有配对记录，还是输配对码连一次")
+            return
+        }
+        guard let peripheral = foundPeripheral ?? target else {
+            log("UCar 连接：还没发现车机，先点「开始探测」，等卡片显示发现车机再连")
+            return
+        }
+        pendingPin = nil
+        flowCredential = ""
+        flowUsesToken = false
+        flowUsesPairedRecord = true
+        log("UCar 连接：这台车机配对过，用已存配对免码连接")
+        beginFlow(peripheral: peripheral, credentialDescription: "已存配对免码")
+    }
+
+    /// 这台车机有没有本机存下的配对信任记录：核心配对成功后把 peer 密钥
+    /// 存进 CabinPlay/clink 状态目录（peer-<deviceId>.key），与核心鉴权时
+    /// 读的是同一份。目录口径与 ContentView 的 clinkStateDirectory 一致。
+    func pairedRecordExists(for deviceId: String) -> Bool {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let path = base.appendingPathComponent("CabinPlay/clink/peer-\(deviceId).key").path
+        return FileManager.default.fileExists(atPath: path)
     }
 
     /// 已存的重连令牌（ServerInfo 的 authentication，按车机 deviceId 落盘）。
@@ -758,8 +798,11 @@ extension BleProbe: CBCentralManagerDelegate {
                 }
                 foundPeripheral = peripheral
                 hasStoredToken = storedToken(for: deviceId) != nil
+                hasPairedRecord = pairedRecordExists(for: deviceId)
                 if hasStoredToken {
                     log("蓝牙探针：这台车机存有重连令牌，可免输配对码直接点「连接车机」")
+                } else if hasPairedRecord {
+                    log("蓝牙探针：这台车机配对过（本机存有配对记录），可免输配对码直接点「连接车机」")
                 }
                 if flowCredential == nil, case .idle = flowPhase {
                     flowPhase = .found
