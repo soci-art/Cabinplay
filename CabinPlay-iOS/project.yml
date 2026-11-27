@@ -24,7 +24,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: CabinPlay/Info.plist
         CODE_SIGN_ENTITLEMENTS: CabinPlay.entitlements
-        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_clink_ios"]
+        OTHER_LDFLAGS: ["-lc++", "-lz", "-loxp_all"]
         LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/generated"]
         HEADER_SEARCH_PATHS: ["$(SRCROOT)/generated", "$(SRCROOT)/CabinPlay/LocalCarPlay"]
         SWIFT_OBJC_BRIDGING_HEADER: CabinPlay/CabinPlay-Bridging-Header.h
@@ -41,3 +41,16 @@ targets:
       - sdk: Security.framework
       - sdk: UIKit.framework
       - sdk: UniformTypeIdentifiers.framework
+
+  # 单元测试：CarLinkFlow 是纯逻辑（不依赖 SwiftUI/网络），最值得先测住。
+  CabinPlayTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: CabinPlayTests
+    dependencies:
+      - target: CabinPlay
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: top.cabinplay.yyds.tests
+        GENERATE_INFOPLIST_FILE: YES
