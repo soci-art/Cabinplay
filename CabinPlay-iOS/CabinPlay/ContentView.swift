@@ -137,6 +137,8 @@ struct ContentView: View {
                     localPhaseText: localSession.phase.text,
                     localPhaseFailed: localSession.phase.isFailed,
                     localStreaming: localSession.phase == .streaming,
+                    localSessionRunning: localSession.isRunning,
+                    onToggleCarPlay: { toggleLocalCarPlay() },
                     carLinkState: carLinkState,
                     carLinkRunning: carLinkRunning,
                     carLinkStatusText: carLinkStatusText,
@@ -241,6 +243,17 @@ struct ContentView: View {
                            addressOverride: addressOverride)
         if localSession.phase.isFailed {
             Haptics.error()
+        }
+    }
+
+    /// 主页手动开关（连上 CarLink 后才显示）：只停/只开本机 CarPlay
+    /// 会话，CarLink 连接保持不动；重开走与流程相同的 startLocalSession，
+    /// 帧桥挂在会话/解码器上，会话回来画面自己续上。
+    private func toggleLocalCarPlay() {
+        if localSession.isRunning {
+            stopLocalSession(reason: "用户手动关闭 CarPlay（CarLink 保持连接）")
+        } else {
+            startLocalSession()
         }
     }
 

@@ -11,11 +11,14 @@ import SwiftUI
 import AVFoundation
 
 struct DashboardView: View {
-    // 本机 CarPlay（纯状态：启停只由「连接车机」流程自动走，没有手动开关；
+    // 本机 CarPlay（启停平时由「连接车机」流程自动走；连上 CarLink 后
+    // 卡里多一个手动开关按钮，可只停/只开 CarPlay、不断 CarLink；
     // 预览也不在这里——画面只上车机屏，本机显示层在根层离屏承接）
     let localPhaseText: String
     let localPhaseFailed: Bool
     let localStreaming: Bool
+    let localSessionRunning: Bool
+    let onToggleCarPlay: () -> Void
     // CarLink（纯状态）
     let carLinkState: CarLinkCore.State
     let carLinkRunning: Bool
@@ -99,9 +102,24 @@ struct DashboardView: View {
                     .foregroundStyle(.red)
             }
 
-            Text("没有手动开关：点蓝牙卡的「连接车机」，CarPlay 会自己跑起来送上车机屏；手机这边不再显示画面，只看车机屏。声音走手机本机出声（也可以用手机蓝牙连车机出声）。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if carLinkState == .playing {
+                // 连上 CarLink 后才有手动开关：只停/只开本机 CarPlay
+                // 会话，CarLink 连接不断。
+                Button {
+                    Haptics.tap()
+                    onToggleCarPlay()
+                } label: {
+                    Text(localSessionRunning ? "关闭 CarPlay" : "开启 CarPlay")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.sunsetAccent)
+            } else {
+                Text("没有手动开关：点蓝牙卡的「连接车机」，CarPlay 会自己跑起来送上车机屏；手机这边不再显示画面，只看车机屏。声音走手机本机出声（也可以用手机蓝牙连车机出声）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding()
         .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: 20))
