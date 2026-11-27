@@ -1,0 +1,15 @@
+CabinPlay — 第三方声明
+======================
+
+本项目的无线 CarLife 输出（CabinPlay-iOS/CabinPlay/CarLifeOutput.swift）
+参考并移植自 CarLife 协议的开源实现，遵循 AGPL-3.0-only：
+  - CarWithin（作者 xmz28）：https://github.com/xmz28/CarWithin
+  - 其上游 OpenXPlay-Stream 的 kotlin/carlife 实现
+
+移植时做了以下修改：
+  - 设备信息与认证哈希的品牌字段改为 CabinPlay；
+  - 日志文案、队列标签、注释改为本项目的写法；
+  - 接入本项目的本机 CarPlay 会话（画面/触控/按键/关键帧回调）。
+
+本项目整体按 AGPL-3.0-only 发布，详见 LICENSE 与各源文件头部的
+SPDX 声明。
