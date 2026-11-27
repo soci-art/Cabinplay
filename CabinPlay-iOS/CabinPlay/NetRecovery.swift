@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 CabinPlay.org
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // 会话期网络变化与音频快照。
@@ -19,10 +19,12 @@ final class NetworkChangeMonitor {
     private var lastSignature: String?
     private var onChange: ((String) -> Void)?
 
-    /// 当前主接口的地址签名（接口名 + IPv4 列表），用于判定「地址变了」。
+    /// 只认 Wi-Fi（en0）地址做签名：蜂窝/VPN/第二个接口一出现就被当成
+    /// 「换网」，还会把 10.x 这类地址当本机地址传下去（2026-11-27 14:25
+    /// 实测因此连续 4 次误重启，把正在出画的会话打断）。空串表示 Wi-Fi
+    /// 当前没有地址（掉线或还没连上）。
     static func signature() -> String {
-        let interfaces = ReceiverConfiguration.localIPv4Addresses().sorted()
-        return interfaces.joined(separator: ",")
+        ReceiverConfiguration.wifiIPv4Address() ?? ""
     }
 
     func start(onChange: @escaping (String) -> Void) {

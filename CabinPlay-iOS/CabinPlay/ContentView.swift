@@ -239,6 +239,9 @@ struct ContentView: View {
 
     private func startLocalSession(addressOverride: String? = nil) {
         decoder.reset()
+        // 车机媒体键（蓝牙 AVRCP）→ CarPlay：音频走 A2DP 时，车机的播放/
+        // 暂停/上一曲/下一曲是蓝牙媒体命令，不是 CarLink 的 UIBC 按键。
+        MediaRemoteBridge.shared.install(for: localSession, log: { appendLog($0) })
         localSession.start(width: targetSize.0, height: targetSize.1, fps: 60,
                            addressOverride: addressOverride)
         if localSession.phase.isFailed {
@@ -664,19 +667,38 @@ struct ContentView: View {
         let monitor = NetworkChangeMonitor()
         monitor.start { signature in
             DispatchQueue.main.async {
-                appendLog("网络变化：当前网卡地址变为 [\(signature)]")
+                appendLog("网络变化：Wi-Fi 地址变为「\(signature.isEmpty ? "无" : signature)」")
                 guard carLinkRunning || clinkFlow.isActive else { return }
-                let current = ReceiverConfiguration.localIPv4Addresses()
-                guard let local = current.first(where: { UCarNetworkJoiner.isValidIPv4($0) }) else {
-                    appendLog("网络变化：拿不到可用的本机地址，暂不重连")
+                // 只认 Wi-Fi（en0）：蜂窝/VPN 接口出现不算换网，更不能拿它当本机地址。
+                guard let local = ReceiverConfiguration.wifiIPv4Address(),
+                      UCarNetworkJoiner.isValidIPv4(local) else {
+                    appendLog("网络变化：Wi-Fi 当前没有地址（掉线或正在重连），先不动正在跑的会话")
                     return
                 }
-                appendLog("网络变化：停掉当前 CarLink，用新地址 \(local) 重走候选试序")
-                CarLinkCore.shared.stop()
-                carLinkState = .idle
-                carLinkRunning = false
-                flowLocalIP = local
-                beginClinkAttempts(candidates: clinkFlow.candidates, localIP: local)
+                guard local != flowLocalIP else {
+                    appendLog("网络变化：Wi-Fi 地址没变（\(local)），忽略这次接口变化")
+                    return
+                }
+                // 必须和车机同一 /24：否则用这个地址重连只会 8 秒超时×4。
+                func prefix(_ ip: String) -> String {
+                    ip.split(separator: ".").dropLast().joined(separator: ".")
+                }
+                guard UCarNetworkJoiner.isValidIPv4(flowCarIP),
+                      prefix(local) == prefix(flowCarIP) else {
+                    appendLog("网络变化：Wi-Fi 地址 \(local) 与车机 \(flowCarIP) 不在同一网段，不重连")
+                    return
+                }
+                // 去抖：地址站稳 2 秒再做，避免 DHCP 过渡期的半成品地址触发重启。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    guard ReceiverConfiguration.wifiIPv4Address() == local,
+                          carLinkRunning || clinkFlow.isActive else { return }
+                    appendLog("网络变化：Wi-Fi 地址稳定为 \(local)，停掉当前 CarLink 重走候选试序")
+                    CarLinkCore.shared.stop()
+                    carLinkState = .idle
+                    carLinkRunning = false
+                    flowLocalIP = local
+                    beginClinkAttempts(candidates: clinkFlow.candidates, localIP: local)
+                }
             }
         }
         netMonitor = monitor

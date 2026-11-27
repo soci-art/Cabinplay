@@ -605,6 +605,7 @@ final class LocalCarPlaySession: ObservableObject {
         guard down else { return }
         let control: CarPlayControl?
         switch code {
+        // oxp-core KeyCode（车机 UIBC 键）
         case 0: control = .home
         case 1: control = .back
         case 2: control = .select
@@ -614,6 +615,15 @@ final class LocalCarPlaySession: ObservableObject {
         case 8: control = .next
         case 9: control = .previous
         case 10: control = .siri
+        // Android keycode（部分车机直接透传 AOSP 键值；3/4 与 oxp 键冲突，不重映射）
+        case 19, 21: control = .knobPrevious
+        case 20, 22: control = .knobNext
+        case 23, 66: control = .select
+        case 79: control = .hookSwitch
+        case 85, 126, 127: control = .playPause
+        case 87: control = .next
+        case 88: control = .previous
+        case 219, 231: control = .siri
         default: control = nil
         }
         if let control {
@@ -621,6 +631,14 @@ final class LocalCarPlaySession: ObservableObject {
         } else {
             onLog?("车机按键：收到键码 \(code)，暂时没有对应的 CarPlay 动作，先记下")
         }
+    }
+
+    /// 车机媒体键（蓝牙 AVRCP / MPRemoteCommand）转给 CarPlay 的媒体 HID。
+    /// 车机音响的播放/暂停/上一曲/下一曲走蓝牙媒体命令，进不了 CarLink 的
+    /// UIBC 通道；没挂 MPRemoteCommandCenter 时这些命令落到空实现，车机
+    /// 按键就等于没反应。
+    func pressRemote(_ control: CarPlayControl) {
+        receiver.press(control)
     }
 
     /// 预览显示层把首个画面样本真正 enqueue 成功后由 ContentView 回调：
