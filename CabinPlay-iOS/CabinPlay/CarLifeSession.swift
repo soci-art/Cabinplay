@@ -162,9 +162,9 @@ final class CarLifeSession: ObservableObject {
         output.onLog = { [weak self] line in self?.append(line) }
         output.onState = { [weak self] line in
             guard let self else { return }
-            DispatchQueue.main.async { self?.status = line }
+            DispatchQueue.main.async { self.status = line }
             if line.contains("暂停了画面") {
-                DispatchQueue.main.async { self?.pausedByCar = true }
+                DispatchQueue.main.async { self.pausedByCar = true }
             }
             if line.contains("已断开"), self.streamingStartedAt != nil, !self.userStopped {
                 self.downgradeIfNeeded()
@@ -301,7 +301,7 @@ final class CarLifeSession: ObservableObject {
 
     /// 车机刚连上就断（20 秒内），按 1080p → 720p → 480p 降一档重试一次。
     private func downgradeIfNeeded() {
-        guard !dowgraded, let startedAt = streamingStartedAt,
+        guard !downgraded, let startedAt = streamingStartedAt,
               Date().timeIntervalSince(startedAt) < 20 else { return }
         downgraded = true
         let next: (Int, Int)
