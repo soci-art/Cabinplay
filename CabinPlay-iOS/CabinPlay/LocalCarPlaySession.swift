@@ -627,6 +627,7 @@ final class LocalCarPlaySession: ObservableObject {
         default: control = nil
         }
         if let control {
+            onLog?("车机按键：键码 \(code) → \(control.title)")
             receiver.press(control)
         } else {
             onLog?("车机按键：收到键码 \(code)，暂时没有对应的 CarPlay 动作，先记下")
