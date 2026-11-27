@@ -36,7 +36,7 @@ final class MediaRemoteBridge {
         bind(center.previousTrackCommand, "上一曲", .previous)
         // 下面这些不一定被派发，但接上并记录，才能看出「OK」是不是被系统
         // 派成了 stop / skip / seek 之类。
-        bind(center.stopCommand, "停止", .pause)
+        bind(center.stopCommand, "停止", .playPause)
         bind(center.skipForwardCommand, "快进(跳过)", .next)
         bind(center.skipBackwardCommand, "快退(跳过)", .previous)
         observe(center.seekForwardCommand, "快进")
