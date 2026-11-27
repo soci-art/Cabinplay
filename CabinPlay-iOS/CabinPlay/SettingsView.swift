@@ -148,10 +148,12 @@ struct SettingsView: View {
                 .onTapGesture { fieldFocused = false }
         }
         .scrollDismissesKeyboard(.interactively)
-        // 导航栏（含大标题区）铺与页面同色：不铺时大标题区是系统白底、
-        // 表单是暖纸底，区标题正好骑在接缝上像错位（2026-11-27 截图）。
+        // 标题直接挂在表单上（外层挂过一次，标题没显示出来）。
+        .navigationTitle("设置")
+        // 导航栏铺与页面同色消接缝：只给颜色、不强制 .visible——强制
+        // 显示背景那版，大标题「设置」跟着不见了（2026-11-27 两张截
+        // 图对照：铺色前标题在、强制 visible 后标题空了）。
         .toolbarBackground(Color.pageBackground, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
         .task { await updateChecker.check() }
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID

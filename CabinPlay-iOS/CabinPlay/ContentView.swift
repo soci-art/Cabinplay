@@ -199,7 +199,6 @@ struct ContentView: View {
 
             NavigationStack {
                 SettingsView()
-                .navigationTitle("设置")
             }
             .tabItem { Label("设置", systemImage: "gearshape") }
             .tag(3)
