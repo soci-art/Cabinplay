@@ -11,6 +11,7 @@
 // 子品牌(深蓝/哈弗/腾势…)排在母品牌(长安/长城/比亚迪)前面。
 
 import Foundation
+import UIKit
 
 enum VehicleIcons {
     struct Entry {
@@ -109,13 +110,22 @@ enum VehicleIcons {
     }
 
     private static func pngData(_ slug: String) -> Data? {
+        let raw: Data?
         if let url = Bundle.main.url(forResource: slug, withExtension: "png", subdirectory: "VehicleIcons") {
-            return try? Data(contentsOf: url)
+            raw = try? Data(contentsOf: url)
+        } else if let url = Bundle.main.url(forResource: slug, withExtension: "png") {
+            raw = try? Data(contentsOf: url)
+        } else {
+            raw = nil
         }
-        if let url = Bundle.main.url(forResource: slug, withExtension: "png") {
-            return try? Data(contentsOf: url)
+        guard let raw else { return nil }
+        // 包里的散装 PNG 可能被 Xcode 改写成苹果私有格式（CgBI、尺寸
+        // 字段移位）：接收端按标准 PNG 头读尺寸会读错、整段图标被跳
+        // 过。一律先解码再按标准 PNG 重新编码，保证发出去的是标准图。
+        if let image = UIImage(data: raw), let standard = image.pngData() {
+            return standard
         }
-        return nil
+        return raw
     }
 }
 
