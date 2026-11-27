@@ -160,8 +160,9 @@ struct SettingsView: View {
         // 标题不走导航栏：导航栏铺色与大标题在这个系统上只能二选一
         // （强制铺色标题消失、不强制标题区发白，2026-11-27 三张截图
         // 对照实锤）。导航栏整条藏掉，「设置」二字画进页面内容里，
-        // 标题和颜色就都稳了。
-        .toolbarVisibility(.hidden, for: .navigationBar)
+        // 标题和颜色就都稳了。藏栏用老接口 navigationBarHidden：
+        // 工程最低 iOS 17.4，toolbarVisibility 要 iOS 18、编不过。
+        .navigationBarHidden(true)
         .task { await updateChecker.check() }
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID
