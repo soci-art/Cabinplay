@@ -204,7 +204,23 @@ final class LocalCarPlayBridge {
                     onLog?("音频桥：音频格式登记被拒（CarLink 没在跑？），后续声音包继续试")
                 }
             }
-            if CarLinkCore.shared.pushAudioPacket(stream: UInt32(stream), data: samples, ptsMicros: ptsMicros) {
+            var pushCode = CarLinkCore.shared.pushAudioPacket(stream: UInt32(stream), data: samples, ptsMicros: ptsMicros)
+            if pushCode == 1 {
+                // 流与核心登记对不上：输入会话重置时核心会把格式
+                // 登记整表清掉，而桥只在格式键变化时才登记一次，
+                // 同格式的新流会被整批拦死（2026-11-27 12:02 日志：
+                // 1296 个真音乐包全灭）。当场重新登记再重试这一包，
+                // 后续包就又对得上了。
+                let cookie = Data(format.sampleRate == 44100 ? [0x12, 0x10] : [0x11, 0x90])
+                let reRegistered = CarLinkCore.shared.pushAudioFormat(
+                    stream: UInt32(stream), sampleRate: UInt32(format.sampleRate),
+                    channels: UInt32(format.channels), config: cookie)
+                onLog?("音频桥：核心那边的格式登记被清掉了，已重新登记（流 \(stream)，AAC-LC \(format.sampleRate) Hz / \(format.channels) 声道），声音续上")
+                if reRegistered {
+                    pushCode = CarLinkCore.shared.pushAudioPacket(stream: UInt32(stream), data: samples, ptsMicros: ptsMicros)
+                }
+            }
+            if pushCode == 0 {
                 audioPacketsPushed += 1
                 // 周期计数不在这里打了：改由核心侧按「真正写进 TS 发
                 // 往车机的帧数」每 500 帧打一行「已向车机送出 N 个声音

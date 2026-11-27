@@ -23,7 +23,7 @@ mod voice_buffer;
 mod voice_delivery;
 pub mod wfd;
 pub use interfaces::*;
-pub use output::ClinkOutput;
+pub use output::{AudioPacketOutcome, ClinkOutput};
 pub use session::ClinkSession;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

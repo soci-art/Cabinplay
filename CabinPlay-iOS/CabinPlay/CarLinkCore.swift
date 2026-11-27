@@ -88,14 +88,32 @@ final class CarLinkCore {
             Unmanaged<CarLinkCore>.fromOpaque(context).takeUnretainedValue().emitLog(text)
         }
 
-        let code = headUnit.withCString { head in
-            local.withCString { localIp in
-                pin.withCString { pinText in
-                    stateDir.withCString { state in
-                        clink_start(head, localIp, pinText, state, width, height, callbacks)
+        // 开跑前先对齐核心侧：上一轮核心报「已结束」时状态回调只
+        // 改了这边的标记，核心的运行槽里还留着那个已结束的实例，
+        // 不清掉的话这次启动会被「已在运行」（-2）直接拒绝、整轮
+        // 连不上（2026-11-27 11:59 日志实证：8 次尝试全死在 -2，
+        // 还带着上一轮没释放的端口报「地址已被占用」）。
+        if clink_is_running() != 0 {
+            _ = clink_stop()
+            onLog?("CarLink 启动前清掉上一轮残留的核心实例")
+        }
+        let attemptStart: () -> Int32 = {
+            headUnit.withCString { head in
+                local.withCString { localIp in
+                    pin.withCString { pinText in
+                        stateDir.withCString { state in
+                            clink_start(head, localIp, pinText, state, width, height, callbacks)
+                        }
                     }
                 }
             }
+        }
+        var code = attemptStart()
+        if code == -2 {
+            // 仍被拒就再清一次重试：结束状态的回调可能刚好在这
+            // 中间才落地。
+            _ = clink_stop()
+            code = attemptStart()
         }
         running = code == 0
         if !running {
@@ -170,15 +188,18 @@ final class CarLinkCore {
 
     /// 把一个裸 AAC 访问单元（不带 ADTS 头，核心自己加）推给车机。
     /// pts 与视频帧共用同一条单调时间线（微秒）。
+    /// 返回核心的原样结果码：0 已入队；1 流与登记对不上（登记被
+    /// 输入会话重置清掉，调用方重新登记后可重试）；2 其他原因被
+    /// 拦；负数是没在跑/参数问题。
     @discardableResult
-    func pushAudioPacket(stream: UInt32, data: Data, ptsMicros: Int64) -> Bool {
-        guard running, !data.isEmpty else { return false }
+    func pushAudioPacket(stream: UInt32, data: Data, ptsMicros: Int64) -> Int32 {
+        guard running, !data.isEmpty else { return -1 }
         let code = data.withUnsafeBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return -99 }
             return clink_push_audio_packet(stream, base.assumingMemoryBound(to: UInt8.self),
                                             data.count, ptsMicros)
         }
-        return code == 0
+        return code
     }
 
     /// UI 回调统一回主线程：核心的回调来自 Rust 线程，直接写 SwiftUI

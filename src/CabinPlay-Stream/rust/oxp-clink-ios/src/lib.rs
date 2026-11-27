@@ -17,8 +17,8 @@
 use oxp_clink::protocol::AuthIdentity;
 use oxp_clink::session::SessionOptions;
 use oxp_clink::{
-    ClinkAddresses, ClinkListener, ClinkOutput, ClinkState, ClinkStatistics, PinProvider,
-    StaticClinkLink, TrustStore,
+    AudioPacketOutcome, ClinkAddresses, ClinkListener, ClinkOutput, ClinkState, ClinkStatistics,
+    PinProvider, StaticClinkLink, TrustStore,
 };
 use oxp_core::model::{
     AudioCodec, AudioFormat, AudioPacket, AudioRole, ControlEvent, Origin, OutputCapabilities,
@@ -732,6 +732,10 @@ pub extern "C" fn clink_push_audio_format(
 /// Push one raw AAC access unit (no ADTS header; the core adds it) for a
 /// previously registered media stream. pts_us must share the video
 /// timeline (microseconds from the same monotonic start).
+/// Returns 0 = queued, 1 = stream mismatch (the core's format
+/// registration is gone — an input-session reset clears it; the caller
+/// should re-register the format and retry), 2 = dropped for another
+/// reason (session fence / bad size), -1 = not running, -2 = bad args.
 #[no_mangle]
 pub extern "C" fn clink_push_audio_packet(
     stream: u32,
@@ -744,13 +748,16 @@ pub extern "C" fn clink_push_audio_packet(
         return -2;
     }
     let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-    running.output.on_audio_packet(AudioPacket {
+    match running.output.on_audio_packet(AudioPacket {
         stream,
         session: 1,
         data: Arc::from(bytes.to_vec().into_boxed_slice()),
         pts_us,
-    });
-    0
+    }) {
+        AudioPacketOutcome::Queued => 0,
+        AudioPacketOutcome::StreamMismatch => 1,
+        AudioPacketOutcome::Dropped => 2,
+    }
 }
 
 #[no_mangle]

@@ -188,6 +188,18 @@ impl SessionCallbacks for Callbacks {
     }
 }
 /// Callbacks retain immutable shared frames in a bounded queue. Reopen after ENDED.
+/// on_audio_packet 的结果。StreamMismatch 专指「包的流与核心登记
+/// 的主流对不上」——输入会话一重置，登记会被 on_session 清掉，但
+/// 喂包的桥只在格式键变化时才登记一次，于是新流的包会被整批拦
+/// 下（2026-11-27 12:02 日志实证：1296 个真音乐包全灭）。调用方
+/// 收到这个结果就知道要重新登记格式再重试，而不是继续盲喂。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPacketOutcome {
+    Queued,
+    StreamMismatch,
+    Dropped,
+}
+
 pub struct ClinkOutput {
     link: Arc<dyn ClinkLink>,
     pin: Arc<dyn PinProvider>,
@@ -562,7 +574,7 @@ impl ClinkOutput {
             run.voice.format(stream, format);
         }
     }
-    pub fn on_audio_packet(&self, packet: AudioPacket) {
+    pub fn on_audio_packet(&self, packet: AudioPacket) -> AudioPacketOutcome {
         if let Some(run) = self.current.lock().unwrap().clone() {
             let mut h = run.handoff.lock().unwrap();
             if !run.active.load(Ordering::Acquire) || h.input_session != Some(packet.session) {
@@ -573,7 +585,7 @@ impl ClinkOutput {
                         "音频桥：声音包被核心入口围栏拦下（输出未激活或输入会话未对齐），累计 {total} 个"
                     ));
                 }
-                return;
+                return AudioPacketOutcome::Dropped;
             }
             if h.media_stream == Some(packet.stream) {
                 if !(1..=8184).contains(&packet.data.len()) {
@@ -585,7 +597,7 @@ impl ClinkOutput {
                             packet.data.len()
                         ));
                     }
-                    return;
+                    return AudioPacketOutcome::Dropped;
                 }
                 if let Some(skew) = h.clock_mix.audio(packet.pts_us, Instant::now()) {
                     h.diagnostic(format!("audio clock mixed skew_ms={}", skew / 1000));
@@ -603,8 +615,10 @@ impl ClinkOutput {
                 }
                 h.audio_bytes += packet.data.len();
                 h.audio.push_back(packet);
+                return AudioPacketOutcome::Queued;
             } else if h.voice_streams.contains(&packet.stream) {
                 run.voice.packet(packet);
+                return AudioPacketOutcome::Queued;
             } else {
                 h.audio_drop_stream += 1;
                 let total = h.audio_drop_stream;
@@ -618,8 +632,10 @@ impl ClinkOutput {
                         packet.stream
                     ));
                 }
+                return AudioPacketOutcome::StreamMismatch;
             }
         }
+        AudioPacketOutcome::Dropped
     }
     pub fn on_microphone(&self, stream: u32, request: Option<MicRequest>) {
         if let Some(run) = self.current.lock().unwrap().clone() {
@@ -1669,7 +1685,7 @@ impl oxp_core::ProjectionOutput for ClinkOutput {
         ClinkOutput::on_audio_format(self, s, f);
     }
     fn on_audio_packet(&self, p: AudioPacket) {
-        ClinkOutput::on_audio_packet(self, p);
+        let _ = ClinkOutput::on_audio_packet(self, p);
     }
     fn on_microphone(&self, s: u32, r: Option<MicRequest>) {
         ClinkOutput::on_microphone(self, s, r);
