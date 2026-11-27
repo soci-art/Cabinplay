@@ -14,6 +14,7 @@ import CommonCrypto
 import CryptoKit
 import Foundation
 import Network
+import Security
 
 final class CarLifeOutput {
     static let ports: [UInt16] = [7240, 8240, 9240, 9241, 9242, 9340, 9440]
@@ -41,6 +42,9 @@ final class CarLifeOutput {
     var onTouches: (([TouchPoint]) -> Void)?
     var onControl: ((CarPlayControl) -> Void)?
     var onKeyframeRequest: ((String) -> Void)?
+    /// 车机连上（认证通过）与「开始推画面」两个节点，给页面做步骤状态。
+    var onPeer: ((String) -> Void)?
+    var onStreaming: (() -> Void)?
 
     func start(targetAddress: String?, width: Int, height: Int, fps: Int) {
         queue.async { [weak self] in
@@ -145,6 +149,8 @@ final class CarLifeOutput {
         session.onTouches = { [weak self] in self?.onTouches?($0) }
         session.onControl = { [weak self] in self?.onControl?($0) }
         session.onKeyframeRequest = { [weak self] in self?.onKeyframeRequest?("CarLife：\($0)") }
+        session.onPeer = { [weak self] peer in self?.onPeer?(peer) }
+        session.onStreaming = { [weak self] in self?.onStreaming?() }
         return session
     }
 
@@ -635,6 +641,8 @@ private final class Session {
     var onTouches: (([TouchPoint]) -> Void)?
     var onControl: ((CarPlayControl) -> Void)?
     var onKeyframeRequest: ((String) -> Void)?
+    var onPeer: ((String) -> Void)?
+    var onStreaming: (() -> Void)?
 
     init(peer: String, width: Int, height: Int, maxFPS: Int) {
         self.peer = peer; self.width = width; self.height = height; self.maxFPS = maxFPS; fps = maxFPS
@@ -718,6 +726,7 @@ private final class Session {
         case 98313:
             try require(authenticated, "unexpected_phase")
             streaming = true; waitingForKeyframe = true
+            onStreaming?()
             onState?(CWL("CarLife：车机已请求画面，正在等待关键帧"))
             requestKeyframe(CWL("车机请求画面"))
         case 98314:
@@ -741,6 +750,7 @@ private final class Session {
 
     private func established(reason: String) {
         authenticated = true
+        onPeer?(peer)
         onState?(CWL("CarLife：已与车机 {1} 建立会话（{2}）", [String(describing: peer), String(describing: reason)]))
     }
 
@@ -906,7 +916,7 @@ private final class Session {
         case 19, 21: .knobPrevious
         case 20, 22: .knobNext
         case 23, 66: .select
-        case 79, 85: .playPause
+        case 79, 85, 86, 126, 127: .playPause
         case 87: .next
         case 88: .previous
         case 219, 231: .siri

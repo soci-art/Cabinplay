@@ -22,6 +22,18 @@ struct CarLifeView: View {
 
     private var startDisabled: Bool { session.running }
 
+    private func stepRow(_ title: String, done: Bool, active: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: done ? "checkmark.circle.fill" : (active ? "circle.dotted" : "circle"))
+                .foregroundStyle(done ? Color.green : Color.secondary)
+            Text(title)
+            Spacer()
+            Text(done ? "完成" : (active ? "进行中" : "未开始"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -56,6 +68,23 @@ struct CarLifeView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("进度") {
+                    stepRow("Wi-Fi 网络", done: session.networkReady, active: session.running)
+                    stepRow("监听端口", done: session.listening, active: session.running)
+                    stepRow("车机连上", done: session.peerConnected, active: session.running)
+                    stepRow("画面在走", done: session.streaming, active: session.running)
+                    if session.pausedByCar {
+                        Text("车机侧暂停了画面（它会自己恢复）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if session.keepAliveActive {
+                        Text("保活已拉起：回桌面/锁屏也能撑住")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("输出") {
                     Picker("分辨率", selection: $sizeTag) {
                         Text("1280×720").tag("720")
@@ -86,11 +115,22 @@ struct CarLifeView: View {
                     }
                     .foregroundStyle(session.running ? .red : .primary)
                 } footer: {
-                    Text(session.status)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(session.status)
+                        if let hint = session.hint {
+                            Text(hint)
+                                .foregroundStyle(.orange)
+                        }
+                    }
                 }
             }
             .scrollContentBackground(.hidden)
             .background(Color.pageBackground)
+            .background {
+                VideoSurface(decoder: session.decoder)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+            }
             }
             .background(Color.pageBackground)
             .navigationBarHidden(true)
