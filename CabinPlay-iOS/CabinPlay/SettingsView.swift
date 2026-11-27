@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage("cabinplay.sizeChoice") private var sizeChoice = "auto"
     @AppStorage("cabinplay.fpsChoice") private var fpsChoice = 60
     @State private var routeText = AudioOutputPolicy.routeSummary
+    @StateObject private var updateChecker = UpdateChecker()
     // 键盘收起：点空白处、滑动、按回车都能收（以前输完收不起来）。
     @FocusState private var fieldFocused: Bool
 
@@ -120,6 +121,20 @@ struct SettingsView: View {
                     Text(versionText).foregroundStyle(.secondary)
                 }
                 HStack {
+                    Text("软件更新")
+                    Spacer()
+                    switch updateChecker.status {
+                    case .idle, .failed:
+                        Button("检查更新") { Task { await updateChecker.check() } }
+                    case .checking:
+                        Text("正在检查…").foregroundStyle(.secondary)
+                    case .upToDate:
+                        Text("已是最新").foregroundStyle(.secondary)
+                    case .available(let version, let url):
+                        Link("有新版本 \(version)", destination: url)
+                    }
+                }
+                HStack {
                     Text("协议")
                     Spacer()
                     Text("CabinPlay · AGPL-3.0").foregroundStyle(.secondary)
@@ -142,6 +157,7 @@ struct SettingsView: View {
                 .onTapGesture { fieldFocused = false }
         }
         .scrollDismissesKeyboard(.interactively)
+        .task { await updateChecker.check() }
         .onAppear {
             let remembered = LocalCarPlaySession.rememberedInfraSSID
             manualSSID = remembered
