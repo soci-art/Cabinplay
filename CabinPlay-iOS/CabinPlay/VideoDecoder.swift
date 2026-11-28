@@ -142,9 +142,18 @@ final class VideoDecoder {
         statAppends = 0
         statEnqueues = 0
         statDrops = 0
+        // isReadyForDisplay 是 iOS 17.4 才有的接口，低系统以已入队
+        // 首帧为准（与 isReadyForPictureInPicture 同一口径）。最低
+        // 系统降到 17.0（d8612e3）后这里漏包会编译不过，验收时补上。
+        let layerReady: Bool
+        if #available(iOS 17.4, *) {
+            layerReady = layer.isReadyForDisplay
+        } else {
+            layerReady = hasEnqueuedFrame
+        }
         // 帧流全静默且层自认在显示时不打，避免日志刷屏；其余情况都打。
-        guard appends > 0 || drops > 0 || !layer.isReadyForDisplay else { return }
-        onLog?("本机预览心跳：近 2 秒 append \(appends) 次、enqueue \(enqueues) 次、丢弃 \(drops) 次、待入队 \(pending.count) 帧；层状态 status=\(layer.status.rawValue)\(layer.error.map { " error=\($0.localizedDescription)" } ?? "") isReadyForDisplay=\(layer.isReadyForDisplay) isReadyForMoreMediaData=\(layer.isReadyForMoreMediaData) 层 frame \(Self.describe(layer.frame))")
+        guard appends > 0 || drops > 0 || !layerReady else { return }
+        onLog?("本机预览心跳：近 2 秒 append \(appends) 次、enqueue \(enqueues) 次、丢弃 \(drops) 次、待入队 \(pending.count) 帧；层状态 status=\(layer.status.rawValue)\(layer.error.map { " error=\($0.localizedDescription)" } ?? "") isReadyForDisplay=\(layerReady) isReadyForMoreMediaData=\(layer.isReadyForMoreMediaData) 层 frame \(Self.describe(layer.frame))")
     }
 
     @objc private func decodeFailed(_ note: Notification) {

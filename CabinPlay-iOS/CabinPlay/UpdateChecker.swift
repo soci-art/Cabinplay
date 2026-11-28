@@ -155,6 +155,19 @@ final class UpdateChecker: ObservableObject {
         downloadState = .none
     }
 
+    /// 清除缓存时连已下载的更新包一起清（车主定的，归在缓存里）：
+    /// 删文件、去下载记录，状态回到没下载。
+    func clearDownloadedUpdate() {
+        let dir = Self.updatesDirectory
+        if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for file in files where file.pathExtension.lowercased() == "ipa" {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+        UserDefaults.standard.removeObject(forKey: Self.downloadedVersionKey)
+        if case .downloaded = downloadState { downloadState = .none }
+    }
+
     /// 把下好的临时文件搬进 Documents/Updates（旧包清掉，只留当前一份）。
     private func moveIntoPlace(staged: URL, name: String) throws {
         let dir = Self.updatesDirectory

@@ -23,6 +23,7 @@ struct SettingsView: View {
     /// 本轮是用户刚点下载下完的 → 自动弹一次分享菜单（以前下好的不弹）。
     @State private var downloadTapped = false
     @State private var sharePresented = false
+    @State private var cacheBytes: Int64 = 0
 
     private var versionText: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.1"
@@ -37,13 +38,17 @@ struct SettingsView: View {
         }
         .background(Color.pageBackground)
         .navigationTitle("设置")
-        .task { await updateChecker.check() }
+        .task {
+            await updateChecker.check()
+            refreshCacheSize()
+        }
         .sheet(isPresented: $sharePresented) {
             if let file = updateChecker.downloadedFileURL {
                 ActivityShareSheet(items: [file])
             }
         }
         .onChange(of: updateChecker.downloadState) { _, state in
+            refreshCacheSize()
             if state == .downloaded && downloadTapped {
                 downloadTapped = false
                 sharePresented = true
@@ -118,6 +123,17 @@ struct SettingsView: View {
             if case .available(_, let pageURL, let asset) = updateChecker.status {
                 Divider()
                 row { updateActionRow(pageURL: pageURL, asset: asset) }
+            }
+            Divider()
+            row {
+                HStack {
+                    Text("清除缓存")
+                    Spacer()
+                    Text(cacheSizeText)
+                        .foregroundStyle(.secondary)
+                    Button("清除") { clearCache() }
+                        .foregroundStyle(Color.sunsetAccent)
+                }
             }
             Divider()
             row {
@@ -198,6 +214,57 @@ struct SettingsView: View {
                 .foregroundStyle(Color.sunsetAccent)
             }
         }
+    }
+
+    // MARK: 清除缓存（网络缓存＋临时文件＋缓存目录＋已下载的更新包，
+    // 车主定：已下载的包也归在缓存里一起清；配对记录在 Application
+    // Support、不在这里面，不会误伤）
+
+    private var cacheSizeText: String {
+        cacheBytes > 0
+            ? ByteCountFormatter.string(fromByteCount: cacheBytes, countStyle: .file)
+            : "0 KB"
+    }
+
+    private static func directoryBytes(_ url: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total: Int64 = 0
+        for case let file as URL in enumerator {
+            total += Int64((try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
+    }
+
+    private func refreshCacheSize() {
+        let downloaded = updateChecker.downloadedFileURL
+        Task.detached {
+            var total = Int64(URLCache.shared.currentDiskUsage)
+            total += Self.directoryBytes(FileManager.default.temporaryDirectory)
+            if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                total += Self.directoryBytes(caches)
+            }
+            if let downloaded,
+               let size = try? downloaded.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                total += Int64(size)
+            }
+            await MainActor.run { cacheBytes = total }
+        }
+    }
+
+    private func clearCache() {
+        URLCache.shared.removeAllCachedResponses()
+        var dirs = [FileManager.default.temporaryDirectory]
+        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            dirs.append(caches)
+        }
+        for dir in dirs {
+            if let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                for item in items { try? FileManager.default.removeItem(at: item) }
+            }
+        }
+        updateChecker.clearDownloadedUpdate()
+        refreshCacheSize()
     }
 }
 
