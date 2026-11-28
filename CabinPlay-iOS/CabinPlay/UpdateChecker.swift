@@ -25,7 +25,7 @@ final class UpdateChecker: ObservableObject {
     private static let apiURL = "https://api.github.com/repos/soci-art/Cabinplay/releases/latest"
 
     var currentVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.1"
     }
 
     func check() async {

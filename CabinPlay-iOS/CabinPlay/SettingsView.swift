@@ -21,7 +21,7 @@ struct SettingsView: View {
     @StateObject private var updateChecker = UpdateChecker()
 
     private var versionText: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.1"
     }
 
     var body: some View {
