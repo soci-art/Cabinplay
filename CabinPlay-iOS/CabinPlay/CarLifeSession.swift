@@ -63,14 +63,81 @@ final class CarLifeSession: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let stamp = DateFormatter.logFormatterMillis.string(from: Date())
-            let formatted = "[\(stamp)] \(line)"
+            let tag = Self.levelTag(line)
+            let formatted = "[\(stamp)] \(tag) \(line)"
             self.logLines.append(formatted)
             // 与 CarLink 同口径：保头 300 + 保尾 900。
             if self.logLines.count > 1200 { self.logLines.removeSubrange(300..<(self.logLines.count - 900)) }
             LogArchive.shared.append(scope: "carlife", line: formatted)
             self.noteHint(in: line)
+            if let summary = Self.timeline.note(line) {
+                let summaryStamp = DateFormatter.logFormatterMillis.string(from: Date())
+                let summaryLine = "[\(summaryStamp)] [I] \(summary)"
+                self.logLines.append(summaryLine)
+                if self.logLines.count > 1200 { self.logLines.removeSubrange(300..<(self.logLines.count - 900)) }
+                LogArchive.shared.append(scope: "carlife", line: summaryLine)
+            }
         }
     }
+
+    static func levelTag(_ line: String) -> String {
+        if line.contains("失败") || line.contains("错误") || line.contains("拒绝")
+            || line.contains("断开") || line.contains("超时") || line.contains("不受支持") {
+            return "[E]"
+        }
+        if line.contains("等待") || line.contains("重连") || line.contains("降档")
+            || line.contains("暂停") || line.contains("丢弃") || line.contains("迟到") {
+            return "[W]"
+        }
+        return "[I]"
+    }
+
+    /// CarLife 的阶段耗时（监听→车机 TCP→认证→请求画面→首帧→画中画）。
+    final class Timeline {
+        private var listen: Date?
+        private var peer: Date?
+        private var auth: Date?
+        private var requested: Date?
+        private var frame: Date?
+        private var pip: Date?
+        private var emitted = false
+
+        func note(_ line: String) -> String? {
+            let now = Date()
+            if line.contains("正在等待车机连接") { listen = listen ?? now; emitted = false }
+            if line.contains("车机已连上") || line.contains("车机 已连接") || line.contains("TCP channel 1 connected") {
+                peer = peer ?? now
+            }
+            if line.contains("建立会话") { auth = auth ?? now }
+            if line.contains("已请求画面") { requested = requested ?? now }
+            if line.contains("画中画保活已请求") { pip = now }
+            if line.contains("发送 CarPlay 画面") || line.contains("首个样本已入队") {
+                frame = frame ?? now
+                return summary()
+            }
+            return nil
+        }
+
+        func reset() {
+            listen = nil; peer = nil; auth = nil; requested = nil; frame = nil; pip = nil; emitted = false
+        }
+
+        private func summary() -> String? {
+            guard !emitted, let listen, let frame else { return nil }
+            emitted = true
+            func ms(_ from: Date?, _ to: Date?) -> String {
+                guard let from, let to else { return "—" }
+                return String(Int(to.timeIntervalSince(from) * 1000)) + " ms"
+            }
+            return "阶段耗时（CarLife）：监听→车机 " + ms(listen, peer)
+                + "，车机→认证 " + ms(peer, auth)
+                + "，认证→请求画面 " + ms(auth, requested)
+                + "，请求→首帧 " + ms(requested, frame)
+                + "，合计 " + ms(listen, frame)
+                + (pip.map { _ in "，画中画 " + ms(frame, pip) } ?? "")
+        }
+    }
+    static let timeline = Timeline()
 
     func clearLog() {
         DispatchQueue.main.async { [weak self] in self?.logLines.removeAll() }
@@ -128,6 +195,12 @@ final class CarLifeSession: ObservableObject {
         status = address.isEmpty
             ? "正在启动：本机 CarPlay + CarLife 监听（靠 UDP 发现车机）"
             : "正在启动：本机 CarPlay + CarLife 监听（只通知车机 \(address)）"
+        Self.timeline.reset()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.running else { return }
+            let failures = self.logLines.filter { $0.contains("无法监听") || $0.contains("监听失败") }.count
+            self.append(failures == 0 ? "CarLife：端口就绪 7/7" : "CarLife：端口就绪 \(7 - failures)/7（失败 \(failures) 个）")
+        }
         append("CarLife 启动：\(size.w)×\(size.h) @ \(fps) fps，车机地址 \(address.isEmpty ? "（UDP 发现）" : address)，本机 IP \(ReceiverConfiguration.wifiIPv4Address() ?? "无")")
         if !bluetoothAudioLikely() {
             hint = "蓝牙可能没连：声音会从手机扬声器出，先在系统蓝牙里连上车机"
