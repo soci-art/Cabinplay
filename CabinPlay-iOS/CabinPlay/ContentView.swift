@@ -931,15 +931,38 @@ struct ContentView: View {
         return "\(scope) 启动：版本 \(version)(\(build))，iOS \(UIDevice.current.systemVersion)，机型 \(UIDevice.current.model)，热状态 \(thermal)，低电量模式 \(lowPower)，本机 IP \(ip)"
     }
 
+    /// 日志级别标签：只为方便过滤，不改变任何行为。
+    static func levelTag(_ line: String) -> String {
+        if line.contains("失败") || line.contains("错误") || line.contains("拒绝")
+            || line.contains("断开") || line.contains("超时") || line.contains("告警")
+            || line.contains("不受支持") || line.contains("中止") {
+            return "[E]"
+        }
+        if line.contains("重试") || line.contains("降档") || line.contains("暂停")
+            || line.contains("丢弃") || line.contains("被拦") || line.contains("迟到")
+            || line.contains("等待") || line.contains("轮换") {
+            return "[W]"
+        }
+        return "[I]"
+    }
+
     private func appendLog(_ line: String) {
+        appendFormatted(line, noteTimeline: true)
+    }
+
+    private func appendFormatted(_ line: String, noteTimeline: Bool) {
         let stamp = DateFormatter.logFormatterMillis.string(from: Date())
-        let formatted = "[\(stamp)] \(line)"
+        let formatted = "[\(stamp)] \(Self.levelTag(line)) \(line)"
         log.append(formatted)
         // 保头保尾：前 300 行（启动窗口：蓝牙→入网→回连→首帧）永远留着，
         // 中间丢，尾部留最近 900 行。原来「超过 1200 就从头上删」会把最好
         // 用的启动段先删掉。
         if log.count > 1200 { log.removeSubrange(300..<(log.count - 900)) }
         LogArchive.shared.append(scope: "carlink", line: formatted)
+        guard noteTimeline else { return }
+        if let summary = PhaseTimeline.shared.note(line) {
+            appendFormatted(summary, noteTimeline: false)
+        }
     }
 }
 
@@ -956,6 +979,47 @@ extension DateFormatter {
         formatter.dateFormat = "HH:mm:ss.SSS"
         return formatter
     }()
+}
+
+/// 阶段耗时：把「点连接 → 入网 → 回连 → 首帧 → 画中画」的时间点收在
+/// 一起，首帧到达时吐一行汇总。只读日志文本里的关键行，不改任何流程。
+final class PhaseTimeline {
+    static let shared = PhaseTimeline()
+    private var start: Date?
+    private var join: Date?
+    private var control: Date?
+    private var frame: Date?
+    private var pip: Date?
+    private var emitted = false
+
+    func note(_ line: String) -> String? {
+        let now = Date()
+        if line.contains("先走蓝牙写 ClientInfo") || line.contains("本轮先用原设备标识") {
+            if start == nil { start = now; emitted = false }
+        }
+        if line.contains("入网成功") { join = now }
+        if line.contains("收到控制连接") { control = now }
+        if line.contains("画中画保活已请求") || line.contains("画中画保活已拉起") { pip = now }
+        if line.contains("首个样本已入队") {
+            frame = now
+            return summary()
+        }
+        return nil
+    }
+
+    private func summary() -> String? {
+        guard !emitted, let start, let frame else { return nil }
+        emitted = true
+        func ms(_ from: Date?, _ to: Date?) -> String {
+            guard let from, let to else { return "—" }
+            return String(Int(to.timeIntervalSince(from) * 1000)) + " ms"
+        }
+        return "阶段耗时（Carlink）：蓝牙→入网 " + ms(start, join)
+            + "，入网→回连 " + ms(join, control)
+            + "，回连→首帧 " + ms(control, frame)
+            + "，启动合计 " + ms(start, frame)
+            + (pip.map { _ in "，画中画 " + ms(frame, pip) } ?? "")
+    }
 }
 
 // MARK: - 日志落盘（与界面日志同源；单独放这里，避免再建新文件）
