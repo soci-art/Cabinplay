@@ -97,44 +97,34 @@ struct DashboardView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 标题行固定在顶部、不随内容滚动（原来放在滚动区里会跟着
-            // 滚走，车主指出的）；与 CarLife 页同一套边距（左右 16、
-            // 上 8、下 8），两页日志按钮位置一致；垫页面底色，往上滚
-            // 的内容不会透到标题下面。按钮样子见 LogEntryLabel。
-            HStack(alignment: .center) {
-                Text("CabinPlay")
-                    .font(.largeTitle.weight(.bold))
-                Spacer()
+        ScrollView {
+            VStack(spacing: 16) {
+                section(title: "Wi-Fi 名称和密码（手填）") { wifiCard }
+                section(title: "画面") { videoCard }
+                section(title: "声音") { audioCard }
+                bleProbeCard
+                    .stepLocked(bleLocked)
+                carLinkCard
+                    .stepLocked(carLinkLocked)
+                onboardCard
+            }
+            .padding()
+        }
+        .background(Color.pageBackground)
+        .scrollDismissesKeyboard(.interactively)
+        // 标题与设置页同款：交给系统导航栏（高度三页齐平，2026-11-28
+        // 车主定）。日志入口在导航栏右上角，样子见 LogToolbarLabel。
+        .navigationTitle("CabinPlay")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {
                     LogView(lines: logLines, onClear: onClearLog)
                         .navigationTitle("日志")
                 } label: {
-                    LogEntryLabel()
+                    LogToolbarLabel()
                 }
+                .tint(Color.sunsetAccent)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 8)
-            .padding(.bottom, 8)
-            .background(Color.pageBackground)
-            ScrollView {
-                VStack(spacing: 16) {
-                    section(title: "Wi-Fi 名称和密码（手填）") { wifiCard }
-                    section(title: "画面") { videoCard }
-                    section(title: "声音") { audioCard }
-                    bleProbeCard
-                        .stepLocked(bleLocked)
-                    carLinkCard
-                        .stepLocked(carLinkLocked)
-                    onboardCard
-                }
-                .padding()
-            }
-            .scrollDismissesKeyboard(.interactively)
-        }
-        .background(Color.pageBackground)
-        .navigationBarHidden(true)
-        .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("完成") { blePinFocused = false; wifiFieldFocused = false }

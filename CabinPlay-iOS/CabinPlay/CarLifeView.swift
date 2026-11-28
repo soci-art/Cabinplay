@@ -36,29 +36,7 @@ struct CarLifeView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                // 标题行与 Carlink 页同款：大标题在页面里，右边是橙色
-                // 边框的日志入口（不用导航栏按钮，原因见 LogEntryLabel）。
-                HStack(alignment: .center) {
-                    Text("CarLife")
-                        .font(.largeTitle.weight(.bold))
-                    Spacer()
-                    NavigationLink {
-                        LogView(lines: session.logLines,
-                                onClear: { session.clearLog() },
-                                uploadTitle: "CabinPlay CarLife 日志",
-                                filePrefix: "CabinPlay-CarLife-log")
-                            .navigationTitle("日志")
-                    } label: {
-                        LogEntryLabel()
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 8)
-                .background(Color.pageBackground)
-            Form {
+        Form {
                 Section("车机") {
                     TextField("车机 IP（可留空，靠 UDP 发现）", text: $carIP)
                         .keyboardType(.decimalPad)
@@ -158,24 +136,39 @@ struct CarLifeView: View {
                     }
                 }
             }
-            .scrollContentBackground(.hidden)
-            .background(Color.pageBackground)
-            .background {
-                VideoSurface(decoder: session.decoder)
-                    .opacity(0)
-                    .allowsHitTesting(false)
-            }
-            }
-            .background(Color.pageBackground)
-            .navigationBarHidden(true)
-            .onChange(of: scenePhase) { _, phase in
-                // 画中画保活的联动：切后台时推一把让它自动吊起，
-                // 回前台收尾（与 CarLink 主页同款，CarLife 原来缺这环）。
-                switch phase {
-                case .inactive: session.sceneBecameInactive()
-                case .active: session.sceneReturnedToForeground()
-                default: break
+        .scrollContentBackground(.hidden)
+        .background(Color.pageBackground)
+        .background {
+            VideoSurface(decoder: session.decoder)
+                .opacity(0)
+                .allowsHitTesting(false)
+        }
+        // 标题与设置页同款：交给系统导航栏（高度三页齐平，2026-11-28
+        // 车主定）；原来多套的一层 NavigationStack 一并去掉（外层
+        // ContentView 已有一层）。日志入口在导航栏右上角，样子见
+        // LogToolbarLabel。
+        .navigationTitle("CarLife")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    LogView(lines: session.logLines,
+                            onClear: { session.clearLog() },
+                            uploadTitle: "CabinPlay CarLife 日志",
+                            filePrefix: "CabinPlay-CarLife-log")
+                        .navigationTitle("日志")
+                } label: {
+                    LogToolbarLabel()
                 }
+                .tint(Color.sunsetAccent)
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // 画中画保活的联动：切后台时推一把让它自动吊起，
+            // 回前台收尾（与 CarLink 主页同款，CarLife 原来缺这环）。
+            switch phase {
+            case .inactive: session.sceneBecameInactive()
+            case .active: session.sceneReturnedToForeground()
+            default: break
             }
         }
     }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // The app shell: three tabs (Carlink / CarLife / 设置).
-// 日志不再是独立标签页：Carlink 与 CarLife 各自在页内右上角有橙色
+// 日志不再是独立标签页：Carlink 与 CarLife 各自在导航栏右上角有橙色
 // 日志入口、进各自的二级日志页，两边日志只管各自的、互不干扰。
 // CarLife 与 Carlink 功能分开、各自独立。
 // 主线：本机 CarPlay 会话（LocalCarPlaySession）出帧 → 蓝牙 UCar 配对 →
