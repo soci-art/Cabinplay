@@ -16,9 +16,13 @@
 // 原样搭。
 
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @StateObject private var updateChecker = UpdateChecker()
+    /// 本轮是用户刚点下载下完的 → 自动弹一次分享菜单（以前下好的不弹）。
+    @State private var downloadTapped = false
+    @State private var sharePresented = false
 
     private var versionText: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.1"
@@ -34,6 +38,17 @@ struct SettingsView: View {
         .background(Color.pageBackground)
         .navigationTitle("设置")
         .task { await updateChecker.check() }
+        .sheet(isPresented: $sharePresented) {
+            if let file = updateChecker.downloadedFileURL {
+                ActivityShareSheet(items: [file])
+            }
+        }
+        .onChange(of: updateChecker.downloadState) { _, state in
+            if state == .downloaded && downloadTapped {
+                downloadTapped = false
+                sharePresented = true
+            }
+        }
     }
 
     // MARK: 分区（灰色小标题＋白色卡片，与主页卡片同款圆角与底色）
@@ -94,11 +109,15 @@ struct SettingsView: View {
                         Text("正在检查…").foregroundStyle(.secondary)
                     case .upToDate:
                         Text("已是最新").foregroundStyle(.secondary)
-                    case .available(let version, let url):
-                        Link("有新版本 \(version)", destination: url)
+                    case .available(let version, _, _):
+                        Text("有新版本 \(version)")
                             .foregroundStyle(Color.sunsetAccent)
                     }
                 }
+            }
+            if case .available(_, let pageURL, let asset) = updateChecker.status {
+                Divider()
+                row { updateActionRow(pageURL: pageURL, asset: asset) }
             }
             Divider()
             row {
@@ -118,4 +137,77 @@ struct SettingsView: View {
             }
         }
     }
+
+    /// 软件更新的第二行（有新版时才出现）：在 App 里直接下载新包，
+    /// 带进度、能取消；下完自动弹分享菜单，包留在 App 里、之后点
+    /// 「分享」还能再发。装更新仍要去签名工具签了再装（系统不让
+    /// App 自己装），这一行省的是去网页翻发行版找附件的步骤。
+    @ViewBuilder
+    private func updateActionRow(pageURL: URL, asset: UpdateChecker.Asset?) -> some View {
+        switch updateChecker.downloadState {
+        case .none:
+            HStack {
+                if asset != nil {
+                    Button("下载") {
+                        downloadTapped = true
+                        updateChecker.startDownload()
+                    }
+                    .foregroundStyle(Color.sunsetAccent)
+                }
+                Spacer()
+                Link("去发行页", destination: pageURL)
+                    .foregroundStyle(.secondary)
+            }
+        case .downloading(let fraction):
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("正在下载…")
+                    Spacer()
+                    if let fraction {
+                        Text("\(Int(fraction * 100))%")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("取消") { updateChecker.cancelDownload() }
+                        .foregroundStyle(Color.sunsetAccent)
+                }
+                if let fraction {
+                    ProgressView(value: fraction)
+                        .tint(Color.sunsetAccent)
+                } else {
+                    ProgressView()
+                        .tint(Color.sunsetAccent)
+                }
+            }
+        case .downloaded:
+            HStack {
+                Text("已下载")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("分享") { sharePresented = true }
+                    .foregroundStyle(Color.sunsetAccent)
+            }
+        case .downloadFailed:
+            HStack {
+                Text("下载失败")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("重试") {
+                    downloadTapped = true
+                    updateChecker.startDownload()
+                }
+                .foregroundStyle(Color.sunsetAccent)
+            }
+        }
+    }
+}
+
+/// 系统分享菜单（把下好的包送去签名工具、或存到文件）。
+private struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
