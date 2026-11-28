@@ -22,6 +22,11 @@ struct CarLifeView: View {
     /// 本页自己的画中画开关；与 Carlink 页的开关互不影响。
     @AppStorage("cabinplay.pip.carLife") private var pipCarLife = true
     @AppStorage("cabinplay.carLifeFPS") private var fps = 30
+    // CarLife 自己的一份 Wi-Fi 名字＋密码（与 Carlink 页那份分开存、
+    // 分开读，两边各管各的）：本机 CarPlay 启动时要报给系统的是这一份。
+    @State private var wifiSSID = ""
+    @State private var wifiPassword = ""
+    @State private var wifiOpenNetwork = false
 
     private var videoSize: (Int, Int) {
         switch sizeTag {
@@ -50,6 +55,33 @@ struct CarLifeView: View {
 
     var body: some View {
         Form {
+                Section {
+                    TextField("Wi-Fi 名称", text: $wifiSSID)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .disabled(session.running)
+                    SecureField("Wi-Fi 密码", text: $wifiPassword)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .disabled(session.running || wifiOpenNetwork)
+                    Toggle("这个网络没有密码（开放网络）", isOn: $wifiOpenNetwork)
+                        .disabled(session.running)
+                    Button("保存名字和密码") {
+                        Haptics.tap()
+                        let name = wifiSSID.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !name.isEmpty else { return }
+                        LocalCarPlaySession.rememberWiFiPairManually(
+                            ssid: name, password: wifiPassword,
+                            isOpen: wifiOpenNetwork, scope: .carLife)
+                    }
+                    .disabled(session.running
+                        || wifiSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } header: {
+                    Text("Wi-Fi 名称和密码（手填）")
+                } footer: {
+                    Text("本机 CarPlay 启动时要把当前 Wi-Fi 的名字和密码报给系统，画面才连得过来。这是 CarLife 自己的一份，跟 Carlink 那份分开存。一个网络填一次就行。")
+                }
+
                 Section("车机") {
                     TextField("车机 IP（可留空，靠 UDP 发现）", text: $carIP)
                         .keyboardType(.decimalPad)
@@ -175,6 +207,12 @@ struct CarLifeView: View {
                 }
                 .tint(Color.sunsetAccent)
             }
+        }
+        .onAppear {
+            let remembered = LocalCarPlaySession.rememberedInfraSSID(scope: .carLife)
+            wifiSSID = remembered
+            wifiPassword = LocalCarPlaySession.pairedPassword(for: remembered, scope: .carLife) ?? ""
+            wifiOpenNetwork = LocalCarPlaySession.isOpenNetwork(remembered, scope: .carLife)
         }
         .onChange(of: scenePhase) { _, phase in
             // 画中画保活的联动：切后台时推一把让它自动吊起，

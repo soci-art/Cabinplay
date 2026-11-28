@@ -44,6 +44,14 @@ final class LocalCarPlaySession: ObservableObject {
         }
     }
 
+    /// Wi-Fi 名字—密码存哪一份：CarLink 与 CarLife 两边各管各的
+    /// （车主 2026-11-28 定的），键、读取都按这个分开，互不串。
+    enum WiFiScope { case carLink, carLife }
+
+    /// 本实例读哪一份 Wi-Fi 存储：默认 CarLink 那份；CarLife 的会话
+    /// 建好实例后改成 .carLife。
+    var wifiScope: WiFiScope = .carLink
+
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var controlConnected = false
     /// 本轮会话是否真正连上过（控制连接建立过）：连上那一刻据此落
@@ -100,13 +108,26 @@ final class LocalCarPlaySession: ObservableObject {
 
     // MARK: Wi-Fi 凭据（车机热点）与新鲜度
 
+    /// 两份 Wi-Fi 存储的键：CarLink 用原来的键（已存的凭据不能丢）；
+    /// CarLife 用带 carlife. 的一套，两边各管各的。
+    private static func scopedKey(_ base: String, scope: WiFiScope) -> String {
+        scope == .carLink ? "cabinplay.\(base)" : "cabinplay.carlife.\(base)"
+    }
+
     static var savedSSID: String {
-        get { UserDefaults.standard.string(forKey: "cabinplay.wifiSSID") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.wifiSSID") }
+        get { UserDefaults.standard.string(forKey: scopedKey("wifiSSID", scope: .carLink)) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: scopedKey("wifiSSID", scope: .carLink)) }
     }
     static var savedPassword: String {
-        get { UserDefaults.standard.string(forKey: "cabinplay.wifiPassword") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.wifiPassword") }
+        get { UserDefaults.standard.string(forKey: scopedKey("wifiPassword", scope: .carLink)) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: scopedKey("wifiPassword", scope: .carLink)) }
+    }
+
+    static func savedSSID(scope: WiFiScope) -> String {
+        UserDefaults.standard.string(forKey: scopedKey("wifiSSID", scope: scope)) ?? ""
+    }
+    static func savedPassword(scope: WiFiScope) -> String {
+        UserDefaults.standard.string(forKey: scopedKey("wifiPassword", scope: scope)) ?? ""
     }
 
     /// 本进程的启动标识：凭据只有在本进程内、由本轮车机会话存入时才算
@@ -158,12 +179,21 @@ final class LocalCarPlaySession: ObservableObject {
     /// 读到过的「当前基础设施网络」名（非车机临时 DIRECT- 网络）：系统
     /// 读不到当前 SSID 时，用它当本机 CarPlay 的当前网络身份。
     private static var lastInfraSSID: String {
-        get { UserDefaults.standard.string(forKey: "cabinplay.lastInfraSSID") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.lastInfraSSID") }
+        get { lastInfraSSID(scope: .carLink) }
+        set { setLastInfraSSID(newValue, scope: .carLink) }
     }
 
-    /// 设置页展示记住的 Wi-Fi 名时读这个。
+    static func lastInfraSSID(scope: WiFiScope) -> String {
+        UserDefaults.standard.string(forKey: scopedKey("lastInfraSSID", scope: scope)) ?? ""
+    }
+
+    static func setLastInfraSSID(_ value: String, scope: WiFiScope) {
+        UserDefaults.standard.set(value, forKey: scopedKey("lastInfraSSID", scope: scope))
+    }
+
+    /// 页面展示记住的 Wi-Fi 名时读这个。
     static var rememberedInfraSSID: String { lastInfraSSID }
+    static func rememberedInfraSSID(scope: WiFiScope) -> String { lastInfraSSID(scope: scope) }
 
     // MARK: Wi-Fi 名字—密码成对存储（按 SSID 索引，照 CarWithin 成对存取口径）
 
@@ -174,79 +204,136 @@ final class LocalCarPlaySession: ObservableObject {
     /// STARTSESSION-DIFF）。旧口径里 lastInfraPassword 没有任何能写入
     /// 真实密码的路径、恒为空，就是那两轮卡死的根源，本轮起废除。
     private static var pairedPasswords: [String: String] {
-        get { UserDefaults.standard.dictionary(forKey: "cabinplay.wifiPasswordsBySSID") as? [String: String] ?? [:] }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.wifiPasswordsBySSID") }
+        get { pairedPasswords(scope: .carLink) }
+        set { setPairedPasswords(newValue, scope: .carLink) }
+    }
+
+    static func pairedPasswords(scope: WiFiScope) -> [String: String] {
+        UserDefaults.standard.dictionary(forKey: scopedKey("wifiPasswordsBySSID", scope: scope)) as? [String: String] ?? [:]
+    }
+
+    static func setPairedPasswords(_ value: [String: String], scope: WiFiScope) {
+        UserDefaults.standard.set(value, forKey: scopedKey("wifiPasswordsBySSID", scope: scope))
     }
 
     static func pairedPassword(for ssid: String) -> String? {
-        pairedPasswords[ssid]
+        pairedPassword(for: ssid, scope: .carLink)
+    }
+
+    static func pairedPassword(for ssid: String, scope: WiFiScope) -> String? {
+        pairedPasswords(scope: scope)[ssid]
     }
 
     static func storePairedPassword(ssid: String, password: String) {
-        guard !ssid.isEmpty, !password.isEmpty else { return }
-        var store = pairedPasswords
-        store[ssid] = password
-        pairedPasswords = store
+        storePairedPassword(ssid: ssid, password: password, scope: .carLink)
     }
 
-    /// 用户在设置页明确标成「无密码（开放网络）」的网络名集合：只有被
+    static func storePairedPassword(ssid: String, password: String, scope: WiFiScope) {
+        guard !ssid.isEmpty, !password.isEmpty else { return }
+        var store = pairedPasswords(scope: scope)
+        store[ssid] = password
+        setPairedPasswords(store, scope: scope)
+    }
+
+    /// 用户在页面上明确标成「无密码（开放网络）」的网络名集合：只有被
     /// 明确标过的网络才许用空密码启动——取不到密码绝不默认当开放网络。
     private static var openNetworkSSIDs: [String] {
-        get { UserDefaults.standard.stringArray(forKey: "cabinplay.wifiOpenNetworks") ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.wifiOpenNetworks") }
+        get { openNetworkSSIDs(scope: .carLink) }
+        set { setOpenNetworkSSIDs(newValue, scope: .carLink) }
+    }
+
+    static func openNetworkSSIDs(scope: WiFiScope) -> [String] {
+        UserDefaults.standard.stringArray(forKey: scopedKey("wifiOpenNetworks", scope: scope)) ?? []
+    }
+
+    static func setOpenNetworkSSIDs(_ value: [String], scope: WiFiScope) {
+        UserDefaults.standard.set(value, forKey: scopedKey("wifiOpenNetworks", scope: scope))
     }
 
     static func isOpenNetwork(_ ssid: String) -> Bool {
-        openNetworkSSIDs.contains(ssid)
+        isOpenNetwork(ssid, scope: .carLink)
+    }
+
+    static func isOpenNetwork(_ ssid: String, scope: WiFiScope) -> Bool {
+        openNetworkSSIDs(scope: scope).contains(ssid)
     }
 
     private static func setOpenNetwork(_ ssid: String, _ open: Bool) {
-        var list = openNetworkSSIDs
+        setOpenNetwork(ssid, open, scope: .carLink)
+    }
+
+    private static func setOpenNetwork(_ ssid: String, _ open: Bool, scope: WiFiScope) {
+        var list = openNetworkSSIDs(scope: scope)
         if open {
             if !list.contains(ssid) { list.append(ssid) }
         } else {
             list.removeAll { $0 == ssid }
         }
-        openNetworkSSIDs = list
+        setOpenNetworkSSIDs(list, scope: scope)
     }
 
     private static var pairMigrated: Bool {
-        get { UserDefaults.standard.bool(forKey: "cabinplay.wifiPairMigrated") }
-        set { UserDefaults.standard.set(newValue, forKey: "cabinplay.wifiPairMigrated") }
+        get { pairMigrated(scope: .carLink) }
+        set { setPairMigrated(newValue, scope: .carLink) }
+    }
+
+    static func pairMigrated(scope: WiFiScope) -> Bool {
+        UserDefaults.standard.bool(forKey: scopedKey("wifiPairMigrated", scope: scope))
+    }
+
+    static func setPairMigrated(_ value: Bool, scope: WiFiScope) {
+        UserDefaults.standard.set(value, forKey: scopedKey("wifiPairMigrated", scope: scope))
     }
 
     /// 一次性迁移种子：旧 savedSSID/savedPassword 里若存着一对真实凭据
     /// （手填表时代的 WDNMD/gb613121），迁入成对存储，老用户不丢已存的
     /// 密码。只跑一次，跑过就打标记。
     private func migrateLegacyPairIfNeeded() {
-        guard !Self.pairMigrated else { return }
-        Self.pairMigrated = true
-        guard !Self.savedSSID.isEmpty, !Self.savedPassword.isEmpty else { return }
-        Self.storePairedPassword(ssid: Self.savedSSID, password: Self.savedPassword)
-        onLog?("本机 CarPlay：已把以前存下的 Wi-Fi 凭据「\(Self.savedSSID)」迁入名字—密码成对存储（密码 \(Self.savedPassword.count) 位）")
+        guard !Self.pairMigrated(scope: wifiScope) else { return }
+        Self.setPairMigrated(true, scope: wifiScope)
+        let ssid = Self.savedSSID(scope: wifiScope)
+        let password = Self.savedPassword(scope: wifiScope)
+        guard !ssid.isEmpty, !password.isEmpty else { return }
+        Self.storePairedPassword(ssid: ssid, password: password, scope: wifiScope)
+        onLog?("本机 CarPlay：已把以前存下的 Wi-Fi 凭据「\(ssid)」迁入名字—密码成对存储（密码 \(password.count) 位）")
     }
 
-    /// 设置页成对兜底保存：名字＋密码一起入成对存储；明确标了无密码就
+    /// 页面成对兜底保存：名字＋密码一起入成对存储；明确标了无密码就
     /// 清掉该名的密码并记下开放标记。非 DIRECT- 名顺带记为基础设施名。
     static func rememberWiFiPairManually(ssid: String, password: String, isOpen: Bool) {
-        if !ssid.hasPrefix("DIRECT-") { lastInfraSSID = ssid }
+        rememberWiFiPairManually(ssid: ssid, password: password, isOpen: isOpen, scope: .carLink)
+    }
+
+    static func rememberWiFiPairManually(ssid: String, password: String, isOpen: Bool, scope: WiFiScope) {
+        if !ssid.hasPrefix("DIRECT-") { setLastInfraSSID(ssid, scope: scope) }
         if isOpen {
-            setOpenNetwork(ssid, true)
-            var store = pairedPasswords
+            setOpenNetwork(ssid, true, scope: scope)
+            var store = pairedPasswords(scope: scope)
             store.removeValue(forKey: ssid)
-            pairedPasswords = store
+            setPairedPasswords(store, scope: scope)
         } else {
-            setOpenNetwork(ssid, false)
-            storePairedPassword(ssid: ssid, password: password)
+            setOpenNetwork(ssid, false, scope: scope)
+            storePairedPassword(ssid: ssid, password: password, scope: scope)
         }
     }
 
-    /// 设置页展示某个网络的密码状态：只说存没存、几位，绝不露原文。
+    /// 页面展示某个网络的密码状态：只说存没存、几位，绝不露原文。
     static func passwordStateText(for ssid: String) -> String {
+        passwordStateText(for: ssid, scope: .carLink)
+    }
+
+    static func passwordStateText(for ssid: String, scope: WiFiScope) -> String {
         if ssid.isEmpty { return "—" }
-        if isOpenNetwork(ssid) { return "已标无密码" }
-        if let password = pairedPassword(for: ssid) { return "已存密码（\(password.count) 位）" }
+        if isOpenNetwork(ssid, scope: scope) { return "已标无密码" }
+        if let password = pairedPassword(for: ssid, scope: scope) { return "已存密码（\(password.count) 位）" }
         return "还没存密码"
+    }
+
+    /// 提示里「去哪填 Wi-Fi 名字密码」：两边各管各的，指各自页面的卡。
+    private var wifiPairLocation: String {
+        wifiScope == .carLink
+            ? "Carlink 页的「Wi-Fi 名称和密码（手填）」"
+            : "本页的「Wi-Fi 名称和密码（手填）」"
     }
 
     /// pickWiFiIdentity 的结果：选到成对身份／选到名字但缺密码／没名字。
@@ -267,28 +354,32 @@ final class LocalCarPlaySession: ObservableObject {
     /// 宁可不启动也不拿失效的 DIRECT- 名毒害。
     private func pickWiFiIdentity() -> WiFiIdentityPick {
         migrateLegacyPairIfNeeded()
-        if Self.carCredentialsFresh {
+        // 本轮车机会话带回的新鲜凭据是 CarLink 流程专属的：CarLife
+        // 那份存储里没有它，也不许串过来用。
+        if wifiScope == .carLink, Self.carCredentialsFresh {
             return .ready(ssid: Self.savedSSID, password: Self.savedPassword,
                           source: "本轮车机会话刚带回的凭据（新鲜）")
         }
         var candidates: [(ssid: String, source: String)] = []
         if let live = UCarNetworkJoiner.currentSSID(), !live.isEmpty {
-            if !live.hasPrefix("DIRECT-") { Self.lastInfraSSID = live }
+            if !live.hasPrefix("DIRECT-") { Self.setLastInfraSSID(live, scope: wifiScope) }
             candidates.append((live, "系统读到的当前网络"))
         }
-        if !Self.lastInfraSSID.isEmpty,
-           !candidates.contains(where: { $0.ssid == Self.lastInfraSSID }) {
-            candidates.append((Self.lastInfraSSID, "上次记下的当前网络（系统此刻读不到 SSID）"))
+        let remembered = Self.lastInfraSSID(scope: wifiScope)
+        if !remembered.isEmpty,
+           !candidates.contains(where: { $0.ssid == remembered }) {
+            candidates.append((remembered, "上次记下的当前网络（系统此刻读不到 SSID）"))
         }
-        if !Self.savedSSID.isEmpty, !Self.savedSSID.hasPrefix("DIRECT-"),
-           !candidates.contains(where: { $0.ssid == Self.savedSSID }) {
-            candidates.append((Self.savedSSID, "此前存下的网络凭据（非车机临时网络）"))
+        let saved = Self.savedSSID(scope: wifiScope)
+        if !saved.isEmpty, !saved.hasPrefix("DIRECT-"),
+           !candidates.contains(where: { $0.ssid == saved }) {
+            candidates.append((saved, "此前存下的网络凭据（非车机临时网络）"))
         }
         for candidate in candidates {
-            if let password = Self.pairedPassword(for: candidate.ssid) {
+            if let password = Self.pairedPassword(for: candidate.ssid, scope: wifiScope) {
                 return .ready(ssid: candidate.ssid, password: password, source: candidate.source)
             }
-            if Self.isOpenNetwork(candidate.ssid) {
+            if Self.isOpenNetwork(candidate.ssid, scope: wifiScope) {
                 return .ready(ssid: candidate.ssid, password: "",
                               source: candidate.source + "（已标无密码）")
             }
@@ -357,7 +448,7 @@ final class LocalCarPlaySession: ObservableObject {
                        wifi: (ssid, password, source))
         case .missingPassword(let ssid):
             phase = .failed("「\(ssid)」的密码还没存过")
-            onLog?("本机 CarPlay：启动中止——「\(ssid)」这个 Wi-Fi 的密码还没存过。去设置页把名字和密码成对填一次（设置 → Wi-Fi 名称），以后就能直接启动")
+            onLog?("本机 CarPlay：启动中止——「\(ssid)」这个 Wi-Fi 的密码还没存过。去\(wifiPairLocation)把名字和密码成对填一次，以后就能直接启动")
         case .none:
             // 一个可用名字都没有：多半是卡在「读当前网络名」这一步——
             // iOS 没有定位授权时 CNCopy/fetchCurrent 都读不到当前 SSID
@@ -422,7 +513,7 @@ final class LocalCarPlaySession: ObservableObject {
     /// - 未决定：先打一句大白话说明，再请求定位授权；授权通过后立刻
     ///   fetchCurrent 读名、记下（非 DIRECT- 才记），自动续启本次启动，
     ///   不让用户再点一次；
-    /// - 已拒绝/受限制：用一句话说清原因拒启，并指路设置页手填兜底；
+    /// - 已拒绝/受限制：用一句话说清原因拒启，并指路手填兜底；
     /// - 已授权却仍读不到：保留原拒启口径（多半是真没连 Wi-Fi）。
     private func resolveWiFiIdentityThenStart(address: String, identity loadedIdentity: AccessoryIdentity) {
         switch WiFiNameAccess.authorizationStatus {
@@ -435,10 +526,10 @@ final class LocalCarPlaySession: ObservableObject {
             }
         case .denied, .restricted:
             phase = .failed("没拿到定位授权，读不到当前 Wi-Fi 的名字")
-            onLog?("本机 CarPlay：启动中止——定位授权没开，读不到当前 Wi-Fi 的名字。可以去系统设置给 CabinPlay 开定位权限，或在设置页把当前 Wi-Fi 的名称和密码成对填一次，填了就能启动")
+            onLog?("本机 CarPlay：启动中止——定位授权没开，读不到当前 Wi-Fi 的名字。可以去系统设置给 CabinPlay 开定位权限，或在\(wifiPairLocation)把当前 Wi-Fi 的名称和密码成对填一次，填了就能启动")
         default:
             phase = .failed("没有可用的 Wi-Fi 名称")
-            onLog?("本机 CarPlay：启动中止——定位授权已拿到，但当前网络名还是读不到，存下的又只有已失效的车机临时网络名。先连上一个 Wi-Fi，或在设置页把当前 Wi-Fi 的名称和密码成对填一次")
+            onLog?("本机 CarPlay：启动中止——定位授权已拿到，但当前网络名还是读不到，存下的又只有已失效的车机临时网络名。先连上一个 Wi-Fi，或在\(wifiPairLocation)把当前 Wi-Fi 的名称和密码成对填一次")
         }
     }
 
@@ -455,7 +546,7 @@ final class LocalCarPlaySession: ObservableObject {
                 if let fetched {
                     self.onLog?("本机 CarPlay：读到当前 Wi-Fi 名「\(fetched)」")
                     if !fetched.hasPrefix("DIRECT-") {
-                        Self.lastInfraSSID = fetched
+                        Self.setLastInfraSSID(fetched, scope: self.wifiScope)
                     }
                 } else {
                     self.onLog?("本机 CarPlay：授权拿到了，但 fetchCurrent 还是没读到当前 Wi-Fi 名（可能暂时没连上 Wi-Fi）")
@@ -468,16 +559,16 @@ final class LocalCarPlaySession: ObservableObject {
                                     wifi: (ssid, password, source))
                 case .missingPassword(let ssid):
                     self.phase = .failed("「\(ssid)」的密码还没存过")
-                    self.onLog?("本机 CarPlay：启动中止——名字读到了（「\(ssid)」），但这个 Wi-Fi 的密码还没存过。去设置页把名字和密码成对填一次（设置 → Wi-Fi 名称），以后就能直接启动")
+                    self.onLog?("本机 CarPlay：启动中止——名字读到了（「\(ssid)」），但这个 Wi-Fi 的密码还没存过。去\(wifiPairLocation)把名字和密码成对填一次，以后就能直接启动")
                 case .none:
                     self.phase = .failed("没有可用的 Wi-Fi 名称")
-                    self.onLog?("本机 CarPlay：启动中止——授权后仍读不到当前 Wi-Fi 名，也没有别的可用名字。在设置页把当前 Wi-Fi 的名称和密码成对填一次就能启动")
+                    self.onLog?("本机 CarPlay：启动中止——授权后仍读不到当前 Wi-Fi 名，也没有别的可用名字。在\(wifiPairLocation)把当前 Wi-Fi 的名称和密码成对填一次就能启动")
                 }
             }
         default:
             pendingSSIDStart = nil
             phase = .failed("没拿到定位授权，读不到当前 Wi-Fi 的名字")
-            onLog?("本机 CarPlay：定位授权没给，读不到当前 Wi-Fi 的名字，本次启动中止。可以去系统设置给 CabinPlay 开定位权限，或在设置页把当前 Wi-Fi 的名称和密码成对填一次，填了就能启动")
+            onLog?("本机 CarPlay：定位授权没给，读不到当前 Wi-Fi 的名字，本次启动中止。可以去系统设置给 CabinPlay 开定位权限，或在\(wifiPairLocation)把当前 Wi-Fi 的名称和密码成对填一次，填了就能启动")
         }
     }
 

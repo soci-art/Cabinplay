@@ -57,6 +57,13 @@ final class CarLifeSession: ObservableObject {
     private var userStopped = false
     private var firstTouchLogged = false
 
+    init() {
+        // 本机 CarPlay 读 CarLife 自己那份 Wi-Fi 存储（两边各管各的，
+        // 车主 2026-11-28 定的）：CarLife 页填的只进 CarLife 这份，
+        // CarLink 那份它不读也不写。
+        local.wifiScope = .carLife
+    }
+
     // MARK: 日志（与 CarLink 同规格：时间戳、1200 行上限）
 
     private func append(_ line: String) {

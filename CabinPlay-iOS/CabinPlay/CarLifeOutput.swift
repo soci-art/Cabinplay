@@ -34,6 +34,13 @@ final class CarLifeOutput {
     private var queryReplies = 0
     private var discoveryErrorLogged = false
     private var discoveryLogged = false
+    /// 最近一轮发现通知的发送结果（给 15 秒检查和后续轮次日志用）：
+    /// 以前失败只记第一轮，后面每 2 秒重发是好是坏全是静默的，出问题
+    /// 时分不清「一直在发不出去」还是「发出去了车机不应」。
+    private var lastDiscoveryFailures = 0
+    private var lastDiscoveryTargets = 0
+    private var lastDiscoveryErrno: Int32 = 0
+    private var fullFailureLoggedAt: Date?
     private var timer: DispatchSourceTimer?
 
     var onLog: ((String) -> Void)?
@@ -65,7 +72,15 @@ final class CarLifeOutput {
                 self.session?.tick()
                 self.checkSession()
                 if ticks == 15, self.session == nil {
-                    self.log("CarLife: no TCP callback after 15 s; UDP 8999 ready replies: \(self.queryReplies). Verify receiver CarLife mode and hotspot connection.")
+                    if self.lastDiscoveryTargets > 0,
+                       self.lastDiscoveryFailures >= self.lastDiscoveryTargets {
+                        // 通知根本没出过手机：这时怪车机没回音是冤枉它，
+                        // 先把责任划回发送侧，并给本地网络权限的指引。
+                        self.log("CarLife: no TCP callback after 15 s; discovery notifications never got out (last round \(self.lastDiscoveryFailures)/\(self.lastDiscoveryTargets) sends failed, errno \(self.lastDiscoveryErrno)).")
+                        self.log("CarLife：发现通知一个都没发出去，车机收不到——先检查本地网络权限（系统设置 → CabinPlay → 本地网络要打开），再确认手机连的是车机的 Wi-Fi")
+                    } else {
+                        self.log("CarLife: no TCP callback after 15 s; UDP 8999 ready replies: \(self.queryReplies). Verify receiver CarLife mode and hotspot connection.")
+                    }
                 }
                 // Announce every 2 s until a head unit has authenticated.
                 if ticks % 2 == 0, self.session?.authenticated != true { self.discover() }
@@ -253,6 +268,18 @@ final class CarLifeOutput {
             discoveryErrorLogged = true
             log(CWL("CarLife 发现包有 {1}/{2} 个发送失败（errno {3}）；广播在 iOS 上可能被限制，仍会逐个地址发送。找不到车机时请填写车机 IP", [String(describing: failures), String(describing: targets.count), String(describing: lastError)]))
         }
+        lastDiscoveryFailures = failures
+        lastDiscoveryTargets = targets.count
+        if failures > 0 { lastDiscoveryErrno = lastError }
+        // 整轮全灭时隔一阵再记一笔（重发每 2 秒一轮、一直有）：日志要
+        // 能看出后面几轮还是发不出去，而不是只有开头那一笔。
+        if failures > 0, failures == targets.count {
+            let now = Date()
+            if fullFailureLoggedAt.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
+                fullFailureLoggedAt = now
+                log("CarLife 发现：这一轮通知仍全部发不出去（\(failures)/\(targets.count)，errno \(lastError)）")
+            }
+        }
     }
 
     // Some receivers query the phone on UDP 8999 instead of reacting to the 7999 beacon.
@@ -352,6 +379,10 @@ final class CarLifeOutput {
         if discoverySocket >= 0 { close(discoverySocket); discoverySocket = -1 }
         discoveryErrorLogged = false
         discoveryLogged = false
+        lastDiscoveryFailures = 0
+        lastDiscoveryTargets = 0
+        lastDiscoveryErrno = 0
+        fullFailureLoggedAt = nil
         if querySocket >= 0 { close(querySocket); querySocket = -1 }
         queryReplies = 0
     }
