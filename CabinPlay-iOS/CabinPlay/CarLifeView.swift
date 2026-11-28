@@ -102,7 +102,9 @@ struct CarLifeView: View {
 
                 Section {
                     // 启动/停止：CarLink「连接车机」同款橙色长条、文字
-                    // 居中；停止时字保持红色（车主定的样式，渲染图已定案）。
+                    // 居中；弧度照「开始探测」的系统按钮（胶囊形，车主
+                    // 2026-11-28 定的）；停止时字仍是白色（同日改定，
+                    // 此前定过的红字作废）。
                     Button {
                         Haptics.tap()
                         if session.running {
@@ -114,10 +116,10 @@ struct CarLifeView: View {
                     } label: {
                         Text(session.running ? "停止" : "启动")
                             .font(.body.weight(.semibold))
-                            .foregroundStyle(session.running ? Color.red : Color.white)
+                            .foregroundStyle(.white)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 12)
-                            .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 14))
+                            .background(Color.sunsetAccent, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .listRowBackground(Color.clear)
@@ -136,7 +138,7 @@ struct CarLifeView: View {
                                 .foregroundStyle(.white)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 12)
-                                .background(Color.sunsetAccent, in: RoundedRectangle(cornerRadius: 14))
+                                .background(Color.sunsetAccent, in: Capsule())
                         }
                         .buttonStyle(.plain)
                         .listRowBackground(Color.clear)
