@@ -1,39 +1,44 @@
 # CabinPlay
 
-**让原本不支持 CarPlay 的车机，也有机会使用无线 CarPlay。**
+**让原本不支持 Apple CarPlay 的车机，也能通过 iPhone 使用 CarLife 或 CarLink 连接方案。**
 
-CabinPlay 是一个开源的 iOS 项目，探索通过软件方式，让 iPhone 与原本不支持 Apple CarPlay 的车机建立连接，并提供无线 CarPlay 使用体验。
+CabinPlay 是一个开源 iOS 项目，目标是让 iPhone 与具备相应接收能力的车机建立无线连接，为原本没有原生 CarPlay 的车机提供另一种使用车载互联功能的方式。
 
-传统方案往往需要额外购买 CarPlay 转换盒，或对车机进行破解、刷机和改装。CabinPlay 的目标是尽量减少这些额外条件：
+与传统方案相比，CabinPlay 希望尽量减少额外硬件和车机改装：
 
-- **无需额外 CarPlay 盒子**：目标是不依赖外置 CarPlay 转换硬件。
+- **支持 CarLife 输出**：通过无线网络与车机 CarLife 接收端建立连接。
+- **支持 CarLink 输出**：通过设备发现、配对和无线网络连接车机 CarLink 服务。
+- **无需额外 CarPlay 盒子**：目标是不依赖外置 CarPlay 转换盒。
 - **无需破解车机**：不以 Root、越狱车机或修改车机系统为前提。
-- **无线连接**：通过 iPhone 与车机之间的无线连接流程完成通信。
-- **开源实现**：客户端与底层组件代码开放，便于开发者研究和改进。
+- **开源实现**：iOS 客户端及相关底层组件开放，便于开发者研究和改进。
 
-> **重要说明：** CabinPlay 并不保证所有原本不支持 CarPlay 的车机都能使用。实际兼容性取决于车机硬件、系统、无线网络能力及相关接口。请先确认目标车机是否满足项目当前实现所需的条件。
+> **兼容性说明：** 支持 CarLife 和 CarLink 两种连接方式，不代表所有车机都能使用。车机需要具备对应的 CarLife 或 CarLink 接收端能力，并满足网络、协议及系统环境要求。实际效果以设备测试为准。
 
 ## 项目介绍
 
-CabinPlay 希望提供一种不同于传统 CarPlay 盒子的实现思路：由 iPhone 端的软件负责设备发现、连接流程和数据通信，在兼容的车机环境中建立 CarPlay 连接。
+CabinPlay 在 iPhone 端实现连接、会话和媒体输出流程，并提供两种面向车机的连接方式：
 
-项目目前包含 iOS 客户端、本机 CarPlay 会话相关实现，以及基于 Rust 的 CarLink 连接与流媒体组件。
+| 连接方式 | 工作方式 | 说明 |
+| --- | --- | --- |
+| **CarLife** | iPhone 启动无线 CarLife 输出服务，车机通过 Wi-Fi 连接 | 支持车机发现，也可以填写车机 IP 地址进行定向连接 |
+| **CarLink** | iPhone 发现并配对车机，再通过 Wi-Fi 连接 CarLink 服务 | 支持配对认证、媒体输出以及车机触控等交互 |
+
+两种输出模式分别管理连接和会话，**不能同时运行**。请根据车机实际支持的协议选择对应模式。
 
 ## 功能与技术
 
 | 模块 | 说明 |
 | --- | --- |
-| iOS 客户端 | 使用 Swift 和 SwiftUI 构建应用界面及连接流程 |
-| 设备发现与配对 | 使用蓝牙相关能力发现车机并进行配对 |
-| 网络连接 | 处理连接所需的网络信息与连接配置 |
-| CarLink | 提供底层连接、视频流及交互数据通道 |
-| 视频解码 | 使用 Apple VideoToolbox 处理视频帧 |
-| 触控与按键 | 支持将触控或按键输入传递至连接端 |
-| 音频处理 | 使用 AVFoundation 相关能力处理音频路由；具体能力受当前实现及设备环境限制 |
-| 画中画 | 集成 iOS Picture in Picture 相关能力 |
-| 诊断日志 | 提供连接过程及运行状态的诊断信息 |
+| iOS 客户端 | 使用 Swift 和 SwiftUI 构建应用界面、连接流程及状态管理 |
+| CarLife | 无线发现、连接监听、协议认证、视频输出及触控交互 |
+| CarLink | 蓝牙设备发现与配对、Wi-Fi 连接、PIN/信任管理及媒体输出 |
+| 视频处理 | 使用 VideoToolbox 等系统能力处理视频帧 |
+| 触控与按键 | 将车机侧输入事件传递至 iPhone 会话 |
+| 音频 | 按连接模式和设备能力处理音频输出；CarLife 音频可通过 iPhone 的蓝牙音频链路输出 |
+| 画中画与保活 | 集成 iOS 画中画及会话保活相关逻辑 |
+| 诊断日志 | 分别记录 CarLife、CarLink 的连接状态、错误和运行信息 |
 
-具体功能是否可用，以当前代码实现和实际设备测试结果为准。
+具体功能和可用性以当前代码实现、iOS 系统限制及实际车机测试结果为准。
 
 ## 项目结构
 
@@ -41,10 +46,11 @@ CabinPlay 希望提供一种不同于传统 CarPlay 盒子的实现思路：由 
 Cabinplay/
 ├── CabinPlay-iOS/       # iOS 客户端工程、资源、脚本和测试
 ├── src/
-│   ├── CabinPlay-Relay/ # Relay 相关 Rust 组件
-│   └── CabinPlay-Stream/# Stream / CarLink 相关 Rust 组件
+│   ├── CabinPlay-Relay/ # Relay 及相关 Rust 组件
+│   └── CabinPlay-Stream/# CarLink / Stream 相关 Rust 组件
 ├── identity/            # 项目身份相关文件
-├── codemagic.yaml       # Codemagic 云构建配置
+├── .github/workflows/  # GitHub Actions 工作流
+├── codemagic.yaml       # Codemagic 云构建配置（如使用）
 └── README.md
 ```
 
@@ -86,30 +92,35 @@ xcodegen generate
 
 ## 云端构建
 
-仓库提供 `codemagic.yaml` 构建配置，可用于在 Codemagic 环境中执行 iOS 构建流程。当前配置涉及 Rust 组件构建、Xcode 工程生成及 IPA 打包。
+仓库包含 GitHub Actions 工作流配置，可用于执行 iOS 构建和 IPA 打包。请以工作流文件中的触发条件、签名配置和产物设置为准。
 
-构建产物是否可以直接安装，取决于所使用的签名方式和设备配置。未签名或签名不匹配的 IPA 不能直接安装到普通 iOS 设备。
+构建产物能否安装，取决于 IPA 的签名方式和设备配置。未签名或签名不匹配的 IPA 不能直接安装到普通 iOS 设备。
+
+## 使用前须知
+
+- 先确认车机支持 **CarLife** 还是 **CarLink** 接收方式，再选择 CabinPlay 中对应的连接模式。
+- iPhone 与车机需要满足对应模式的网络连接要求；部分模式还需要先完成蓝牙发现或配对。
+- CarLife 和 CarLink 是两套独立的输出流程，不能同时启动。
+- 首次连接或连接失败时，请查看应用内对应模式的诊断日志，并确认车机端已进入相应的连接/接收界面。
 
 ## 兼容性说明
 
-CabinPlay 的目标是让更多原本没有 CarPlay 功能的车机能够尝试使用无线 CarPlay，但这并不代表所有车机都可以通过安装应用实现这一目标。
+CabinPlay 并不是把任意车机变成通用 CarPlay 接收器。是否能够使用，取决于：
 
-兼容性可能受到以下因素影响：
-
-- 车机硬件与系统版本；
-- 车机是否具备项目连接流程所需的蓝牙和网络能力；
-- 车机对相关连接协议及数据通道的支持情况；
+- 车机是否具备可用的 CarLife 或 CarLink 接收端；
+- 车机系统、网络和协议实现是否与 CabinPlay 当前版本兼容；
 - iPhone 型号、iOS 版本及系统权限；
-- Apple CarPlay 相关授权和系统限制。
+- 车机与手机之间的 Wi-Fi、蓝牙连接环境；
+- 相关协议、授权和系统限制。
 
-**请勿仅凭“无需盒子、无需破解”的项目目标推断自己的车机一定兼容。** 建议先查阅项目代码、更新记录和实际测试反馈，再判断是否适用于自己的设备。
+**请勿仅凭车机支持 CarLife 或 CarLink 就推断一定能够连接。** 建议先查阅项目更新记录和实际测试反馈。
 
 ## 免责声明
 
-- CabinPlay 是独立开源项目，与 Apple Inc. 没有隶属、合作或官方认可关系。
-- Apple、CarPlay、iPhone 等名称和商标归其各自权利人所有。
-- 本项目不提供对所有车型、车机或 iOS 版本的兼容性保证。
-- 请遵守所在地法律法规、车辆制造商规定及相关软件许可要求。
+- CabinPlay 是独立开源项目，与 Apple、CarLife 或相关车机厂商没有隶属、合作或官方认可关系。
+- Apple、CarPlay、CarLife、CarLink、iPhone 等名称和商标归其各自权利人所有。
+- 本项目不保证兼容所有车型、车机或 iOS 版本。
+- 请遵守所在地法律法规、车辆制造商规定及相关软件许可要求。驾驶过程中请勿操作手机或车机。
 
 ## 许可证
 
@@ -117,4 +128,4 @@ CabinPlay 的目标是让更多原本没有 CarPlay 功能的车机能够尝试�
 
 ---
 
-**CabinPlay — 不依赖 CarPlay 盒子，不以破解车机为前提，探索无线 CarPlay 的另一种实现方式。**
+**CabinPlay — 同时探索 CarLife 与 CarLink 无线连接，让更多车机有机会接入 iPhone。**
