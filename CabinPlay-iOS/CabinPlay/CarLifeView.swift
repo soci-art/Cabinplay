@@ -11,15 +11,28 @@
 import SwiftUI
 
 struct CarLifeView: View {
-    @StateObject private var session = CarLifeSession()
+    /// 会话由根层（ContentView）持有：它的隐藏显示层要常驻窗口，画中画
+    /// 才不会随 tab 切换被摘掉。
+    @ObservedObject var session: CarLifeSession
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("cabinplay.carLifeAddress") private var carIP = ""
     // CarLife 自己的参数，和 CarLink 的设置互不影响：默认 720p30（这条
     // 协议的实际能力上限就是 1080p30），实际帧率仍以车机请求为准。
     @AppStorage("cabinplay.carLifeSize") private var sizeTag = "720"
+    /// 本页自己的画中画开关；与 Carlink 页的开关互不影响。
+    @AppStorage("cabinplay.pip.carLife") private var pipCarLife = true
     @AppStorage("cabinplay.carLifeFPS") private var fps = 30
 
-    private var videoSize: (Int, Int) { sizeTag == "1080" ? (1920, 1080) : (1280, 720) }
+    private var videoSize: (Int, Int) {
+        switch sizeTag {
+        case "1080": return (1920, 1080)
+        case "auto":
+            let key = "cabinplay.carLifeProvenSize.\(carIP.isEmpty ? "default" : carIP)"
+            if UserDefaults.standard.string(forKey: key) == "1920x1080" { return (1920, 1080) }
+            return (1280, 720)
+        default: return (1280, 720)
+        }
+    }
 
     private var startDisabled: Bool { session.running }
 
@@ -67,6 +80,7 @@ struct CarLifeView: View {
 
                 Section("输出") {
                     Picker("分辨率", selection: $sizeTag) {
+                        Text("自动（按车记忆）").tag("auto")
                         Text("1280×720").tag("720")
                         Text("1920×1080").tag("1080")
                     }
@@ -76,6 +90,8 @@ struct CarLifeView: View {
                         Text("60 fps（最多，实际听车机的）").tag(60)
                     }
                     .disabled(session.running)
+                    Toggle("画中画保活（CarLife）", isOn: $pipCarLife)
+                        .disabled(session.running)
                     HStack {
                         Text("声音")
                         Spacer()
@@ -138,11 +154,7 @@ struct CarLifeView: View {
             }
         .scrollContentBackground(.hidden)
         .background(Color.pageBackground)
-        .background {
-            VideoSurface(decoder: session.decoder)
-                .opacity(0)
-                .allowsHitTesting(false)
-        }
+        // 隐藏显示层已上移到 ContentView 根层（切 tab 不被摘掉）。
         // 标题与设置页同款：交给系统导航栏（高度三页齐平，2026-11-28
         // 车主定）；原来多套的一层 NavigationStack 一并去掉（外层
         // ContentView 已有一层）。日志入口在导航栏右上角，样子见

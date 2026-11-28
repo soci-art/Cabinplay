@@ -43,6 +43,9 @@ struct DashboardView: View {
     /// 后台保活状态（本机 CarPlay 会话运行期间自动生效）。
     let keepAliveActive: Bool
 
+    /// CarLink 的画中画保活开关（各页自己管自己的，不进设置页）。
+    @AppStorage("cabinplay.pip.carLink") private var pipCarLink = true
+
     @Binding var blePinField: String
 
     /// 当前生效的分辨率（自动协商的当前档，只展示、不可手选）。
@@ -255,6 +258,10 @@ struct DashboardView: View {
             }
             Divider()
             row {
+                Toggle("画中画保活（Carlink）", isOn: $pipCarLink)
+            }
+            Divider()
+            row {
                 HStack {
                     Text("分辨率")
                     Spacer()
@@ -270,7 +277,7 @@ struct DashboardView: View {
                 }
             }
             Divider()
-            Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。")
+            Text("手动档只决定起步档：协商失败仍会自动往下降。车机只解 30 帧时，把帧率切到 30 会更稳；想让画面更顺，先试 720p。画中画只是保活第二条腿，关掉不影响车机画面。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.vertical, 11)

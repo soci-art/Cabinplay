@@ -12,6 +12,7 @@
 // 热点凭据由 ServerInfo 带回后静默存下。
 
 import SwiftUI
+import Combine
 import AVFoundation
 import UIKit
 
@@ -131,6 +132,11 @@ struct ContentView: View {
     /// 画中画保活（与静音音频保活并存的第二条腿）：懒创建——控制器要在
     /// 预览托管层接管完成后（首帧时）建，建早了内容源会指着占位层。
     @State private var pictureInPicture: CarPlayPictureInPicture?
+    /// CarLife 的整套会话由根层持有：它的隐藏显示层要和 CarLink 一样
+    /// 常驻窗口，切 tab 才不会把画中画的源摘掉。
+    @StateObject private var carLifeSession = CarLifeSession()
+    /// CarLink 的画中画保活开关（Carlink 页里改，和 CarLife 各管各的）。
+    @AppStorage("cabinplay.pip.carLink") private var pipCarLink = true
     @Environment(\.scenePhase) private var scenePhase
 
     // clink 候选真连接试序＋被拒重试（流程内部行为，不受用户点按守卫影响）。
@@ -181,7 +187,7 @@ struct ContentView: View {
             .tag(0)
 
             NavigationStack {
-                CarLifeView()
+                CarLifeView(session: carLifeSession)
             }
             .tabItem {
                 Label {
@@ -205,9 +211,22 @@ struct ContentView: View {
         // 里：全尺寸、透明、不可点，层一直在窗口内正常入队渲染，只是不
         // 给人看。摘掉它帧路会断，勿删。
         .background {
-            VideoSurface(decoder: decoder)
-                .opacity(0)
-                .allowsHitTesting(false)
+            ZStack {
+                VideoSurface(decoder: decoder)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+                // CarLife 自己的显示层：只为画中画这条保活腿存在；放在根层
+                // 才能跟着窗口一直挂着（放在 tab 内容里切页就会被摘掉）。
+                VideoSurface(decoder: carLifeSession.decoder)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            // 内存告警：只让本机解码/画中画这条路让路，车机画面与会话不动。
+            appendLog("本机内存：系统告警——停画中画并清空解码积压，等下一个关键帧")
+            pictureInPicture?.stop()
+            decoder.reset()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -299,6 +318,10 @@ struct ContentView: View {
 
     /// 出画后主动拉起画中画，并打开系统自动拉起（离场时由系统接管）。
     private func startPictureInPicture() {
+        guard pipCarLink else {
+            appendLog("画中画保活：Carlink 页里关掉了，本轮不拉起（静音音频这条腿照常）")
+            return
+        }
         guard let pip = pipController() else { return }
         pip.setAutomatic(true)
         _ = pip.start()

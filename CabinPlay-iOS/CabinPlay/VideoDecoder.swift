@@ -15,6 +15,7 @@
 
 import AVFoundation
 import CoreMedia
+import Darwin
 import UIKit
 import VideoToolbox
 
@@ -66,6 +67,7 @@ final class VideoDecoder {
     private var statAppends = 0
     private var statEnqueues = 0
     private var statDrops = 0
+    private var heartbeatTicks = 0
     private var heartbeat: Timer?
     private var lastHostGeometryLog = ""
 
@@ -73,6 +75,32 @@ final class VideoDecoder {
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = UIColor.black.cgColor
         observe(layer)
+        // 内存告警让路：只清本机解码积压、只等新关键帧，会话与推流不动。
+        NotificationCenter.default.addObserver(self, selector: #selector(memoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+    }
+
+    /// 系统内存告警：打一次足迹，然后清积压、等下一个关键帧。
+    @objc private func memoryWarning() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.logFootprint(reason: "系统内存告警")
+            self.recover(reason: "系统内存告警")
+        }
+    }
+
+    /// 每 10 秒（心跳第 5 拍）记一次常驻内存与解码积压。
+    private func logFootprint(reason: String? = nil) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        let mb = result == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+        let line = reason.map { "本机内存：" + $0 + "——" } ?? "本机内存："
+        onLog?(line + "常驻 " + String(format: "%.1f", mb) + " MB，待入队 " + String(pending.count) + " 帧 / " + String(format: "%.1f", Double(pendingBytes) / 1_048_576) + " MB")
     }
 
     private func observe(_ target: AVSampleBufferDisplayLayer) {
@@ -134,10 +162,13 @@ final class VideoDecoder {
         statAppends = 0
         statEnqueues = 0
         statDrops = 0
+        heartbeatTicks = 0
     }
 
     private func heartbeatTick() {
         guard format != nil else { return }
+        heartbeatTicks += 1
+        if heartbeatTicks % 5 == 0 { logFootprint() }
         let appends = statAppends, enqueues = statEnqueues, drops = statDrops
         statAppends = 0
         statEnqueues = 0
@@ -153,7 +184,7 @@ final class VideoDecoder {
         }
         // 帧流全静默且层自认在显示时不打，避免日志刷屏；其余情况都打。
         guard appends > 0 || drops > 0 || !layerReady else { return }
-        onLog?("本机预览心跳：近 2 秒 append \(appends) 次、enqueue \(enqueues) 次、丢弃 \(drops) 次、待入队 \(pending.count) 帧；层状态 status=\(layer.status.rawValue)\(layer.error.map { " error=\($0.localizedDescription)" } ?? "") isReadyForDisplay=\(layerReady) isReadyForMoreMediaData=\(layer.isReadyForMoreMediaData) 层 frame \(Self.describe(layer.frame))")
+        onLog?("本机预览心跳：近 2 秒 append \(appends) 次、enqueue \(enqueues) 次、丢弃 \(drops) 次、待入队 \(pending.count) 帧 / \(String(format: "%.1f", Double(pendingBytes) / 1_048_576)) MB；层状态 status=\(layer.status.rawValue)\(layer.error.map { " error=\($0.localizedDescription)" } ?? "") isReadyForDisplay=\(layerReady) isReadyForMoreMediaData=\(layer.isReadyForMoreMediaData) 层 frame \(Self.describe(layer.frame))")
     }
 
     @objc private func decodeFailed(_ note: Notification) {

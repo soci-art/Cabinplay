@@ -39,6 +39,11 @@ final class CarLifeSession: ObservableObject {
     private let local = LocalCarPlaySession()
     private let output = CarLifeOutput()
     private var pip: CarPlayPictureInPicture?
+    /// 本页自己的画中画开关（cabinplay.pip.carLife，默认开），与 CarLink 各管各的。
+    private var pipEnabled: Bool {
+        UserDefaults.standard.object(forKey: "cabinplay.pip.carLife") as? Bool ?? true
+    }
+    private var lastRebuildAt = Date.distantPast
     private var cancellables = Set<AnyCancellable>()
     private var wired = false
     private var monitor: NWPathMonitor?
@@ -70,7 +75,13 @@ final class CarLifeSession: ObservableObject {
 
     /// 从日志里抓需要用户处理的情况：端口被占、本地网络权限。
     private func noteHint(in line: String) {
-        if line.contains("无法监听") || line.contains("监听失败") {
+        if line.contains("协议版本不受支持") {
+            hint = "车机 CarLife 协议版本不受支持（本实现支持 3.x/4.x）"
+        } else if line.contains("auth_rejected") || line.contains("认证被车机拒绝") {
+            hint = "认证被车机拒绝：检查车机是否停在配对/连接页，必要时重启车机 CarLife"
+        } else if line.contains("内容加密") && line.contains("失败") {
+            hint = "内容加密协商失败：车机要求加密但公钥/算法不匹配"
+        } else if line.contains("无法监听") || line.contains("监听失败") {
             hint = "有端口没能监听：可能被别的 App 占用，关掉占用端口的 App 或重启手机再试"
         } else if line.contains("本地网络") {
             hint = "本地网络权限没开：去 设置 → CabinPlay → 本地网络 打开后重启本页"
@@ -176,12 +187,15 @@ final class CarLifeSession: ObservableObject {
             .sink { [weak self] _ in self?.carPlayOn = self?.local.isRunning ?? false }
             .store(in: &cancellables)
         local.onPreviewConfig = { [weak self] record, codec in
-            self?.decoder.configure(codec: codec == .h265 ? 2 : 1, config: record)
+            guard let self, self.pipEnabled else { return }
+            self.decoder.configure(codec: codec == .h265 ? 2 : 1, config: record)
         }
         local.onPreviewFrame = { [weak self] data, codec in
             guard let self else { return }
-            // 主路径：原样发给车机；旁路：喂本机解码器，只为画中画保活。
+            // 主路径：原样发给车机，这一条与画中画无关、永远在走。
             self.output.append(data, codec: codec)
+            // 旁路：只有画中画开着才解码；关掉时连解码器都不启动（省一路 1080p）。
+            guard self.pipEnabled else { return }
             self.decoder.append(data, ptsNanos: UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000))
         }
         output.onLog = { [weak self] line in self?.append(line) }
@@ -201,11 +215,10 @@ final class CarLifeSession: ObservableObject {
         }
         output.onStreaming = { [weak self] in
             guard let self else { return }
-            DispatchQueue.main.async {
-                self.streaming = true
-                self.streamingStartedAt = Date()
-            }
-            self.rememberProvenSize()
+            // 画中画开着时，「已出画」以首帧真正进显示层为准（与 CarLink
+            // 同口径）；只有关掉画中画、没有显示层可等时，才用车机请求画面。
+            guard !self.pipEnabled else { return }
+            self.markStreaming()
         }
         output.onTouches = { [weak self] points in
             guard let self else { return }
@@ -233,13 +246,27 @@ final class CarLifeSession: ObservableObject {
             // 纯多余（验收时查出，已删）。
             self.local.previewDidDisplayFirstFrame()
             DispatchQueue.main.async { self.keepAliveActive = self.local.keepAliveActive }
+            self.markStreaming()
             self.startPictureInPicture()
         }
     }
 
     // MARK: 画中画保活腿
 
+    private func markStreaming() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.streaming else { return }
+            self.streaming = true
+            self.streamingStartedAt = Date()
+        }
+        rememberProvenSize()
+    }
+
     private func startPictureInPicture() {
+        guard pipEnabled else {
+            append("CarLife：本页画中画关着，不拉起（静音音频保活照常）")
+            return
+        }
         if pip == nil {
             let controller = CarPlayPictureInPicture(surface: decoder)
             controller.onLog = { [weak self] line in self?.append(line) }
@@ -281,6 +308,9 @@ final class CarLifeSession: ObservableObject {
             let recovering = !self.pathWasReady
             self.pathWasReady = true
             guard recovering, Date().timeIntervalSince(self.startedAt) > 3 else { return }
+            // 防抖 2 秒：切网时 path 会连续回调，重建一次就够。
+            guard Date().timeIntervalSince(self.lastRebuildAt) >= 2 else { return }
+            self.lastRebuildAt = Date()
             // 切网后旧监听绑在旧地址上，重建一遍并重新宣告。
             self.append("CarLife：网络恢复（Wi-Fi），重建监听与通知")
             self.output.start(targetAddress: self.address.isEmpty ? nil : self.address,
