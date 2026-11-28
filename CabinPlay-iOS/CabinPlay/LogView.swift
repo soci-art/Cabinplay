@@ -34,9 +34,16 @@ struct LogView: View {
     @State private var uploadSucceeded = false
     @State private var uploadMessage: String?
 
+    /// 上一轮（previous.log）的尾巴，导出/上传时一并带上——闪退排查必备。
+    private var previousSuffix: String {
+        guard let url = LogArchive.shared.previousIfExists,
+              let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else { return "" }
+        return "\n----- 上一轮（previous.log） -----\n" + text
+    }
+
     private func doUpload() {
         uploading = true
-        let text = (uploadTitle.map { "\($0)\n" } ?? "") + lines.joined(separator: "\n")
+        let text = (uploadTitle.map { "\($0)\n" } ?? "") + lines.joined(separator: "\n") + previousSuffix
         Task {
             let result = await LogUploader.upload(text: text)
             uploading = false
@@ -55,7 +62,8 @@ struct LogView: View {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(filePrefix)-\(formatter.string(from: Date())).txt")
         do {
-            try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            let text = lines.joined(separator: "\n") + previousSuffix
+            try text.write(to: url, atomically: true, encoding: .utf8)
             return url
         } catch {
             return nil
