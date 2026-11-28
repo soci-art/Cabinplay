@@ -2,12 +2,12 @@ name: CabinPlay
 options:
   bundleIdPrefix: top.cabinplay
   deploymentTarget:
-    iOS: "17.4"
+    iOS: "17.0"
   createIntermediateGroups: true
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.4"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     ENABLE_BITCODE: NO
     ONLY_ACTIVE_ARCH: YES
 targets:
