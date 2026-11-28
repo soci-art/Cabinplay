@@ -114,13 +114,13 @@ struct SettingsView: View {
                         Text("正在检查…").foregroundStyle(.secondary)
                     case .upToDate:
                         Text("已是最新").foregroundStyle(.secondary)
-                    case .available(let version, _, _):
-                        Text("有新版本 \(version)")
+                    case .available(let version, let build, _, _):
+                        Text(build.map { "有新版 \(version)（构建 \($0)）" } ?? "有新版本 \(version)")
                             .foregroundStyle(Color.sunsetAccent)
                     }
                 }
             }
-            if case .available(_, let pageURL, let asset) = updateChecker.status {
+            if case .available(_, _, let pageURL, let asset) = updateChecker.status {
                 Divider()
                 row { updateActionRow(pageURL: pageURL, asset: asset) }
             }

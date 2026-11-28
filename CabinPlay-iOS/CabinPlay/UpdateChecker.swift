@@ -8,6 +8,11 @@
 // 工具里走。检查与下载都走定死的加速顺序：自建代理 → gh-proxy.com
 // → 直连。前提：仓库是公开的、发行版里有正式发布；查不到时状态停
 // 在「检查失败」，不影响其他功能。
+//
+// 构建号也要能检出（2026-11-28 车主定）：附件名只带版本号，构建号
+// 记在发行版的小文件 app-update.json 里（{"version":…,"build":…}，
+// 每次发版/同版替换时同步更新）。检查时先读它，版本＋构建号一起
+// 比；没有这个文件的旧发行版退回只比版本号。
 
 import Foundation
 
@@ -22,7 +27,7 @@ final class UpdateChecker: ObservableObject {
         case idle
         case checking
         case upToDate
-        case available(version: String, pageURL: URL, asset: Asset?)
+        case available(version: String, build: Int?, pageURL: URL, asset: Asset?)
         case failed
     }
 
@@ -46,6 +51,10 @@ final class UpdateChecker: ObservableObject {
 
     var currentVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.1"
+    }
+
+    var currentBuild: Int {
+        Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "") ?? 0
     }
 
     /// 下好的包文件（Documents/Updates 下），分享时用。
@@ -82,19 +91,62 @@ final class UpdateChecker: ObservableObject {
                   let tag = object["tag_name"] as? String,
                   let page = object["html_url"] as? String,
                   let pageURL = URL(string: page) else { continue }
-            let remote = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            if Self.isNewer(remote, than: currentVersion) {
+            let tagVersion = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            // 构建号在 app-update.json 里；读不到就退回只比版本号。
+            let info = await Self.fetchUpdateInfo(from: object)
+            let remote = info?.version ?? tagVersion
+            let remoteBuild = info?.build
+            if Self.isNewer(remoteVersion: remote, remoteBuild: remoteBuild,
+                            localVersion: currentVersion, localBuild: currentBuild) {
                 let asset = Self.parseAsset(from: object)
-                status = .available(version: remote, pageURL: pageURL, asset: asset)
-                // 以前下好的就是这一版 → 直接显示已下载，不用重下。
+                status = .available(version: remote, build: remoteBuild, pageURL: pageURL, asset: asset)
+                // 以前下好的就是这一版（版本＋构建号都对上）→ 直接显示已下载。
                 let stored = UserDefaults.standard.string(forKey: Self.downloadedVersionKey)
-                downloadState = (stored == remote && downloadedFileURL != nil) ? .downloaded : .none
+                downloadState = (stored == Self.stamp(version: remote, build: remoteBuild)
+                                 && downloadedFileURL != nil) ? .downloaded : .none
             } else {
                 status = .upToDate
             }
             return
         }
         status = .failed
+    }
+
+    /// 已下载记录的标记：版本＋构建号（构建号未知时只记版本）。
+    private static func stamp(version: String, build: Int?) -> String {
+        build.map { "\(version)#\($0)" } ?? version
+    }
+
+    /// 读发行版里的 app-update.json（记版本号＋构建号）。走同一套
+    /// 三级加速顺序；读不到返回 nil，检查退回只比版本号。
+    private static func fetchUpdateInfo(from object: [String: Any]) async -> (version: String, build: Int)? {
+        guard let assets = object["assets"] as? [[String: Any]] else { return nil }
+        var link: String?
+        for entry in assets {
+            if (entry["name"] as? String) == "app-update.json" {
+                link = entry["browser_download_url"] as? String
+                break
+            }
+        }
+        guard let link else { return nil }
+        let candidates = [
+            "https://gh.86419753.xyz/\(link)",
+            "https://gh-proxy.com/\(link)",
+            link,
+        ]
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 8
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = json["version"] as? String else { continue }
+            let build = (json["build"] as? Int) ?? Int(json["build"] as? String ?? "")
+            guard let build else { continue }
+            return (version, build)
+        }
+        return nil
     }
 
     /// 发行版附件里挑 .ipa 那个（每版只有一个）。
@@ -113,7 +165,7 @@ final class UpdateChecker: ObservableObject {
     // MARK: 下载
 
     func startDownload() {
-        guard case .available(let version, _, let asset) = status, let asset else { return }
+        guard case .available(let version, let build, _, let asset) = status, let asset else { return }
         downloadTask?.cancel()
         downloadState = .downloading(fraction: nil)
         let raw = asset.url.absoluteString
@@ -135,7 +187,7 @@ final class UpdateChecker: ObservableObject {
                         }
                     }
                     try moveIntoPlace(staged: staged, name: name)
-                    UserDefaults.standard.set(version, forKey: Self.downloadedVersionKey)
+                    UserDefaults.standard.set(Self.stamp(version: version, build: build), forKey: Self.downloadedVersionKey)
                     downloadState = .downloaded
                     return
                 } catch is CancellationError {
@@ -179,6 +231,17 @@ final class UpdateChecker: ObservableObject {
         }
         let dest = dir.appendingPathComponent(name)
         try FileManager.default.moveItem(at: staged, to: dest)
+    }
+
+    /// 版本＋构建号一起比：版本更高算新；版本一样时构建号更高也算
+    /// 新（同版替换靠这个才检得出）。构建号未知（旧发行版没有
+    /// app-update.json）时退回只比版本号。
+    static func isNewer(remoteVersion: String, remoteBuild: Int?,
+                        localVersion: String, localBuild: Int) -> Bool {
+        if isNewer(remoteVersion, than: localVersion) { return true }
+        if isNewer(localVersion, than: remoteVersion) { return false }
+        guard let remoteBuild else { return false }
+        return remoteBuild > localBuild
     }
 
     /// 点分版本号比较：1.2.0 > 1.0.9；段数不够按 0 补。
