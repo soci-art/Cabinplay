@@ -62,9 +62,12 @@ final class CarLifeSession: ObservableObject {
     private func append(_ line: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let stamp = DateFormatter.logFormatter.string(from: Date())
-            self.logLines.append("[\(stamp)] \(line)")
-            if self.logLines.count > 1200 { self.logLines.removeFirst(self.logLines.count - 1200) }
+            let stamp = DateFormatter.logFormatterMillis.string(from: Date())
+            let formatted = "[\(stamp)] \(line)"
+            self.logLines.append(formatted)
+            // 与 CarLink 同口径：保头 300 + 保尾 900。
+            if self.logLines.count > 1200 { self.logLines.removeSubrange(300..<(self.logLines.count - 900)) }
+            LogArchive.shared.append(scope: "carlife", line: formatted)
             self.noteHint(in: line)
         }
     }
@@ -125,6 +128,7 @@ final class CarLifeSession: ObservableObject {
         status = address.isEmpty
             ? "正在启动：本机 CarPlay + CarLife 监听（靠 UDP 发现车机）"
             : "正在启动：本机 CarPlay + CarLife 监听（只通知车机 \(address)）"
+        append("CarLife 启动：\(size.w)×\(size.h) @ \(fps) fps，车机地址 \(address.isEmpty ? "（UDP 发现）" : address)，本机 IP \(ReceiverConfiguration.wifiIPv4Address() ?? "无")")
         if !bluetoothAudioLikely() {
             hint = "蓝牙可能没连：声音会从手机扬声器出，先在系统蓝牙里连上车机"
         }

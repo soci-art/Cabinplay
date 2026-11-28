@@ -12,6 +12,7 @@
 // 热点凭据由 ServerInfo 带回后静默存下。
 
 import SwiftUI
+import Foundation
 import Combine
 import AVFoundation
 import UIKit
@@ -241,6 +242,11 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            let kept = LogArchive.shared.beginSession()
+            if kept {
+                appendLog("上一轮日志已留存到 Documents/Logs/previous.log（闪退排查用）")
+            }
+            appendLog(bannerLine(scope: "Carlink"))
             bleProbe.onLog = { appendLog($0) }
             bleProbe.onServerInfo = { handleUCarServerInfo($0) }
             localSession.onLog = { appendLog($0) }
@@ -907,10 +913,33 @@ struct ContentView: View {
         startupWatchdog = nil
     }
 
+    /// 每轮启动的头部横幅：版本、系统、机型、热状态、低电量、网络。
+    private func bannerLine(scope: String) -> String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "-"
+        let build = info?["CFBundleVersion"] as? String ?? "-"
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = "正常"
+        case .fair: thermal = "偏热"
+        case .serious: thermal = "过热"
+        case .critical: thermal = "临界"
+        @unknown default: thermal = "未知"
+        }
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? "开" : "关"
+        let ip = ReceiverConfiguration.wifiIPv4Address() ?? "无"
+        return "\(scope) 启动：版本 \(version)(\(build))，iOS \(UIDevice.current.systemVersion)，机型 \(UIDevice.current.model)，热状态 \(thermal)，低电量模式 \(lowPower)，本机 IP \(ip)"
+    }
+
     private func appendLog(_ line: String) {
-        let stamp = DateFormatter.logFormatter.string(from: Date())
-        log.append("[\(stamp)] \(line)")
-        if log.count > 1200 { log.removeFirst(log.count - 1200) }
+        let stamp = DateFormatter.logFormatterMillis.string(from: Date())
+        let formatted = "[\(stamp)] \(line)"
+        log.append(formatted)
+        // 保头保尾：前 300 行（启动窗口：蓝牙→入网→回连→首帧）永远留着，
+        // 中间丢，尾部留最近 900 行。原来「超过 1200 就从头上删」会把最好
+        // 用的启动段先删掉。
+        if log.count > 1200 { log.removeSubrange(300..<(log.count - 900)) }
+        LogArchive.shared.append(scope: "carlink", line: formatted)
     }
 }
 
@@ -920,4 +949,80 @@ extension DateFormatter {
         formatter.dateFormat = "HH:mm:ss"
         return formatter
     }()
+
+    /// 日志统一用毫秒：join→control→首帧、音频首包、PiP 拉起这些都要毫秒级。
+    static let logFormatterMillis: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+}
+
+// MARK: - 日志落盘（与界面日志同源；单独放这里，避免再建新文件）
+
+
+final class LogArchive {
+    static let shared = LogArchive()
+
+    private let queue = DispatchQueue(label: "CabinPlay.logArchive")
+    private let directory: URL
+    private(set) var currentURL: URL
+    private(set) var previousURL: URL
+    private var handle: FileHandle?
+    private var formatter: DateFormatter
+
+    private init() {
+        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs", isDirectory: true)
+        directory = root
+        currentURL = root.appendingPathComponent("current.log")
+        previousURL = root.appendingPathComponent("previous.log")
+        formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    /// 每轮启动调一次：current 有内容就滚成 previous（只保留上一轮）。
+    /// 返回上一轮是否留存（供界面提示）。
+    @discardableResult
+    func beginSession() -> Bool {
+        var hadPrevious = false
+        queue.sync {
+            handle?.closeFile()
+            handle = nil
+            let fm = FileManager.default
+            let size = (try? fm.attributesOfItem(atPath: currentURL.path)[.size] as? Int) ?? 0
+            if size > 0 {
+                try? fm.removeItem(at: previousURL)
+                try? fm.moveItem(at: currentURL, to: previousURL)
+                hadPrevious = true
+            }
+            if !fm.fileExists(atPath: currentURL.path) {
+                fm.createFile(atPath: currentURL.path, contents: nil)
+            }
+        }
+        return hadPrevious
+    }
+
+    /// 追加一条日志。scope 用于区分 Carlink / CarLife 两套（同一个文件里）。
+    func append(scope: String, line: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.handle == nil {
+                if !FileManager.default.fileExists(atPath: self.currentURL.path) {
+                    FileManager.default.createFile(atPath: self.currentURL.path, contents: nil)
+                }
+                self.handle = try? FileHandle(forWritingTo: self.currentURL)
+            }
+            let text = "[\(scope)] \(line)\n"
+            if let data = text.data(using: .utf8) {
+                try? self.handle?.write(contentsOf: data)
+            }
+        }
+    }
+
+    /// 上一轮日志的路径（存在才返回），导出时可以把它一起带上。
+    var previousIfExists: URL? {
+        FileManager.default.fileExists(atPath: previousURL.path) ? previousURL : nil
+    }
 }
