@@ -54,9 +54,10 @@ struct CarLifeView: View {
                         LogEntryLabel()
                     }
                 }
-                .padding(.horizontal)
+                .padding(.horizontal, 16)
                 .padding(.top, 8)
-                .padding(.bottom, 4)
+                .padding(.bottom, 8)
+                .background(Color.pageBackground)
             Form {
                 Section("车机") {
                     TextField("车机 IP（可留空，靠 UDP 发现）", text: $carIP)
